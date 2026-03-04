@@ -15,6 +15,7 @@ extern crate self as skuld;
 pub mod fixture;
 pub mod fixtures;
 pub mod label;
+pub mod metadata;
 pub mod probe;
 pub mod runner;
 
@@ -28,9 +29,12 @@ pub use fixtures::temp_dir::TempDir;
 pub use fixtures::test_name::TestName;
 pub use label::ModuleLabels;
 pub use probe::{probe_executable, probe_path};
+pub use metadata::{FixtureMetadata, RequirementInfo, TestMetadata};
 pub use runner::{run_all, TestRunner};
 
 use std::cell::Cell;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 // Re-export proc macros for consumers.
 pub use skuld_macros::fixture;
@@ -39,9 +43,20 @@ pub use skuld_macros::test;
 // Re-export inventory so that macro-generated `inventory::submit!` calls resolve.
 pub use inventory;
 
-/// A precondition check function. Returns `Ok(())` if the requirement is met,
-/// or `Err(reason)` if not.
-pub type RequireFn = fn() -> Result<(), String>;
+/// A named precondition check. Carries both a human-readable name and the
+/// check function itself so that metadata can be serialized without losing
+/// identity.
+pub struct Requirement {
+    pub name: &'static str,
+    pub check: fn() -> Result<(), String>,
+}
+
+impl Requirement {
+    /// Evaluate the requirement, returning `Ok(())` or `Err(reason)`.
+    pub fn eval(&self) -> Result<(), String> {
+        (self.check)()
+    }
+}
 
 // Test context ========================================================================================
 
@@ -59,6 +74,17 @@ thread_local! {
 /// Get the current test context. Panics if called outside a test body.
 pub fn current_test() -> CurrentTest {
     CURRENT_TEST.get().expect("called outside of a test body")
+}
+
+/// Lazily-built index from `(name, module)` to [`TestDef`]. O(1) lookup for
+/// metadata construction.
+pub fn test_registry() -> &'static HashMap<(&'static str, &'static str), &'static TestDef> {
+    static REGISTRY: OnceLock<HashMap<(&str, &str), &TestDef>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        inventory::iter::<TestDef>()
+            .map(|def| ((def.name, def.module), def))
+            .collect()
+    })
 }
 
 // Ignore ==============================================================================================
@@ -80,7 +106,7 @@ pub struct TestDef {
     pub module: &'static str,
     /// Display name (custom name). `None` → use `name`.
     pub display_name: Option<&'static str>,
-    pub requires: &'static [RequireFn],
+    pub requires: &'static [Requirement],
     /// Names of fixtures used by this test (from `#[fixture]` params).
     /// Used for transitive requirement collection via [`collect_fixture_requires`].
     pub fixture_names: &'static [&'static str],

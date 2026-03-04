@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
-use crate::RequireFn;
+use crate::Requirement;
 
 // Scope =======================================================================================
 
@@ -108,7 +108,7 @@ pub struct FixtureDef {
     /// Lifetime scope.
     pub scope: FixtureScope,
     /// Runtime preconditions inherited by any test that uses this fixture.
-    pub requires: &'static [RequireFn],
+    pub requires: &'static [Requirement],
     /// Names of fixtures this one depends on (from `#[fixture]` params).
     pub deps: &'static [&'static str],
     /// Factory: create a new instance boxed as `dyn Any`.
@@ -479,9 +479,9 @@ pub fn cleanup_process_fixtures() {
 
 // Requirement collection ======================================================================
 
-/// Transitively collect all [`RequireFn`]s from a set of fixture names and
+/// Transitively collect all [`Requirement`]s from a set of fixture names and
 /// their dependencies. Used for precondition checks before running tests.
-pub fn collect_fixture_requires(names: &[&str]) -> Vec<RequireFn> {
+pub fn collect_fixture_requires(names: &[&str]) -> Vec<&'static Requirement> {
     let registry = fixture_registry();
     let mut result = Vec::new();
     let mut visited = HashSet::new();
@@ -494,14 +494,14 @@ pub fn collect_fixture_requires(names: &[&str]) -> Vec<RequireFn> {
 fn collect_requires_recursive(
     name: &str,
     registry: &HashMap<&str, &FixtureDef>,
-    result: &mut Vec<RequireFn>,
+    result: &mut Vec<&'static Requirement>,
     visited: &mut HashSet<String>,
 ) {
     if !visited.insert(name.to_string()) {
         return;
     }
     if let Some(def) = registry.get(name) {
-        result.extend_from_slice(def.requires);
+        result.extend(def.requires.iter());
         for &dep in def.deps {
             collect_requires_recursive(dep, registry, result, visited);
         }

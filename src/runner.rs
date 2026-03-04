@@ -164,8 +164,8 @@ impl TestRunner {
             let reasons: Vec<String> = def
                 .requires
                 .iter()
-                .chain(fixture_requires.iter())
-                .filter_map(|check| check().err())
+                .chain(fixture_requires.into_iter())
+                .filter_map(|req| req.eval().err())
                 .collect();
 
             if reasons.is_empty() {

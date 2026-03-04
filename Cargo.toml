@@ -13,6 +13,8 @@ libtest-mimic = "0.8"
 # Needed for clap::Parser trait (Arguments::parse_from); libtest-mimic doesn't re-export it.
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_yml = "0.0.12"
 
 [[test]]
 name = "integration"
