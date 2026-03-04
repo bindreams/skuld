@@ -1,0 +1,11 @@
+[project]
+name = "skuld-docs"
+version = "0.0.0"
+requires-python = ">=3.13"
+dependencies = [
+    "sphinx",
+    "myst-parser",
+    "furo",
+    "sphinx-design",
+    "sphinx-copybutton",
+]
