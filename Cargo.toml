@@ -1,0 +1,20 @@
+[workspace]
+members = [".", "macros"]
+
+[package]
+name = "skuld"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+skuld-macros = { path = "macros" }
+inventory = "0.3"
+libtest-mimic = "0.8"
+# Needed for clap::Parser trait (Arguments::parse_from); libtest-mimic doesn't re-export it.
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+harness = false
