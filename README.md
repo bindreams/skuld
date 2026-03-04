@@ -52,6 +52,9 @@ fn wip() { /* ... */ }
 
 #[skuld::test(ignore = "blocked on #123")]
 fn blocked_test() { /* ... */ }
+
+#[skuld::test(serial)]
+fn modifies_global_state() { /* ... */ }
 ```
 
 Every `#[skuld::test]` function is registered with the harness. Functions without `#[skuld::test]` are invisible to skuld.
@@ -80,11 +83,11 @@ fn my_test(#[fixture(temp_dir)] dir: &Path) {
 
 Each fixture has a lifetime scope:
 
-| Scope                | Behaviour                                                           |
+| Scope | Behaviour |
 | -------------------- | ------------------------------------------------------------------- |
 | `variable` (default) | Fresh instance per request. Dropped when the `FixtureHandle` drops. |
-| `test`               | Cached per test. Dropped when the test ends.                        |
-| `process`            | Cached globally. Dropped after all tests finish (LIFO).             |
+| `test` | Cached per test. Dropped when the test ends. |
+| `process` | Cached globally. Dropped after all tests finish (LIFO). |
 
 ```rust
 #[skuld::fixture(scope = process, requires = [docker_available])]
@@ -95,10 +98,12 @@ A fixture may only depend on fixtures of the **same or wider** scope. Dependency
 
 ### Built-in fixtures
 
-| Fixture     | Scope    | Type                         | Description                              |
-| ----------- | -------- | ---------------------------- | ---------------------------------------- |
-| `test_name` | test     | `TestName` (deref to `&str`) | Current test function name               |
-| `temp_dir`  | variable | `TempDir` (deref to `&Path`) | Temporary directory named after the test |
+| Fixture | Scope | Type | Serial | Description |
+| ----------- | -------- | ---------------------------- | ------ | ---------------------------------------- |
+| `test_name` | test | `TestName` (deref to `&str`) | no | Current test function name |
+| `temp_dir` | variable | `TempDir` (deref to `&Path`) | no | Temporary directory named after the test |
+| `env` | test | `EnvGuard` | yes | Set/remove env vars with automatic revert |
+| `cwd` | test | `CwdGuard` | yes | Change working directory with automatic revert |
 
 ### Deref coercion
 
@@ -141,6 +146,30 @@ fn test_b() { /* ... */ }
 fn test_c() { /* ... */ }
 ```
 
+## Serial tests
+
+Tests that modify process-global state (environment variables, current directory) must not run in parallel with other such tests. Mark them with `serial`:
+
+```rust
+#[skuld::test(serial)]
+fn test_with_global_state() { /* ... */ }
+```
+
+Fixtures can also declare `serial`. Any test using a serial fixture automatically inherits the flag:
+
+```rust
+#[skuld::fixture(scope = test, serial)]
+fn env() -> Result<EnvGuard, String> { /* ... */ }
+
+#[skuld::test]
+fn my_test(#[fixture] env: &EnvGuard) {
+    // Automatically serial — env fixture declares it.
+    env.set("MY_VAR", "value");
+}
+```
+
+All serial tests run under a single global mutex. Non-serial tests are unaffected and may still run in parallel.
+
 ## Dynamic tests
 
 Use `TestRunner` to mix inventory-registered and runtime-generated tests:
@@ -163,10 +192,10 @@ fn main() {
 
 ## Built-in probe helpers
 
-| Function                 | Checks                      |
+| Function | Checks |
 | ------------------------ | --------------------------- |
 | `probe_executable(name)` | `<name> --version` succeeds |
-| `probe_path(path)`       | File or directory exists    |
+| `probe_path(path)` | File or directory exists |
 
 ## Output
 

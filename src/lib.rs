@@ -19,14 +19,16 @@ pub mod probe;
 pub mod runner;
 
 pub use fixture::{
-    cleanup_process_fixtures, collect_fixture_requires, enter_test_scope, fixture, fixture_get, fixture_registry,
-    warm_up, FixtureDef, FixtureHandle, FixtureRef, FixtureScope, TestScope,
+    cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope, fixture, fixture_get,
+    fixture_registry, warm_up, FixtureDef, FixtureHandle, FixtureRef, FixtureScope, TestScope,
 };
+pub use fixtures::cwd::CwdGuard;
+pub use fixtures::env::EnvGuard;
+pub use fixtures::temp_dir::TempDir;
+pub use fixtures::test_name::TestName;
 pub use label::ModuleLabels;
 pub use probe::{probe_executable, probe_path};
 pub use runner::{run_all, TestRunner};
-pub use fixtures::temp_dir::TempDir;
-pub use fixtures::test_name::TestName;
 
 use std::cell::Cell;
 
@@ -88,6 +90,9 @@ pub struct TestDef {
     /// Whether `labels = [...]` was explicitly written (even if empty).
     /// When false, module-level defaults from `default_labels!` apply.
     pub labels_explicit: bool,
+    /// Whether this test must run under the global serial lock.
+    /// Propagated transitively from fixtures via [`collect_fixture_serial`].
+    pub serial: bool,
     pub body: fn(),
 }
 

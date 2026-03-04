@@ -118,6 +118,8 @@ pub struct FixtureDef {
     pub cast: fn(&(dyn Any + Send + Sync), TypeId) -> Option<FixtureRef>,
     /// Human-readable type name for error messages.
     pub type_name: &'static str,
+    /// Whether tests using this fixture must run under the global serial lock.
+    pub serial: bool,
 }
 
 inventory::collect!(FixtureDef);
@@ -504,4 +506,30 @@ fn collect_requires_recursive(
             collect_requires_recursive(dep, registry, result, visited);
         }
     }
+}
+
+/// Check whether any fixture in the transitive closure of `names` has `serial = true`.
+pub fn collect_fixture_serial(names: &[&str]) -> bool {
+    let registry = fixture_registry();
+    let mut visited = HashSet::new();
+    names
+        .iter()
+        .any(|&name| is_serial_recursive(name, registry, &mut visited))
+}
+
+fn is_serial_recursive(name: &str, registry: &HashMap<&str, &FixtureDef>, visited: &mut HashSet<String>) -> bool {
+    if !visited.insert(name.to_string()) {
+        return false;
+    }
+    if let Some(def) = registry.get(name) {
+        if def.serial {
+            return true;
+        }
+        for &dep in def.deps {
+            if is_serial_recursive(dep, registry, visited) {
+                return true;
+            }
+        }
+    }
+    false
 }

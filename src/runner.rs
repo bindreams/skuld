@@ -4,12 +4,29 @@
 //! - `#[skuld::test]` attribute (inventory-registered [`TestDef`](crate::TestDef))
 //! - [`TestRunner::add`] (runtime-generated tests)
 
+use std::sync::Mutex;
+
 use clap::Parser;
 use libtest_mimic::{Arguments, Trial};
 
-use crate::fixture::{cleanup_process_fixtures, collect_fixture_requires, enter_test_scope};
+use crate::fixture::{cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope};
 use crate::label::{extract_label_filters, label_matches, resolve_labels, LabelSelector, ModuleLabels};
 use crate::{Ignore, TestDef};
+
+// Serial lock =========================================================================================
+
+/// Global mutex for tests marked `serial`. Ensures only one serial test runs at a time.
+static SERIAL_LOCK: Mutex<()> = Mutex::new(());
+
+/// Run `body` under the serial lock if `serial` is true, or directly otherwise.
+fn run_maybe_serial(serial: bool, body: impl FnOnce()) {
+    if serial {
+        let _guard = SERIAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        body();
+    } else {
+        body();
+    }
+}
 
 // Test runner =====================================================================================
 
@@ -17,6 +34,7 @@ use crate::{Ignore, TestDef};
 struct DynTest {
     name: String,
     ignored: bool,
+    serial: bool,
     labels: Vec<String>,
     body: Box<dyn FnOnce() + Send + 'static>,
 }
@@ -57,6 +75,24 @@ impl TestRunner {
         self.dynamic.push(DynTest {
             name: name.into(),
             ignored,
+            serial: false,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            body: Box::new(body),
+        });
+    }
+
+    /// Add a test that was generated at runtime, with serial execution.
+    pub fn add_serial(
+        &mut self,
+        name: impl Into<String>,
+        labels: &[&str],
+        ignored: bool,
+        body: impl FnOnce() + Send + 'static,
+    ) {
+        self.dynamic.push(DynTest {
+            name: name.into(),
+            ignored,
+            serial: true,
             labels: labels.iter().map(|s| s.to_string()).collect(),
             body: Box::new(body),
         });
@@ -134,8 +170,9 @@ impl TestRunner {
 
             if reasons.is_empty() {
                 let body = def.body;
+                let is_serial = def.serial || collect_fixture_serial(def.fixture_names);
                 let trial = Trial::test(trial_name, move || {
-                    body();
+                    run_maybe_serial(is_serial, body);
                     Ok(())
                 });
                 let trial = if kind.is_empty() { trial } else { trial.with_kind(kind) };
@@ -159,13 +196,14 @@ impl TestRunner {
 
             let kind = dyn_test.labels.join(":");
             let body = dyn_test.body;
+            let is_serial = dyn_test.serial;
             // Intentional leak: dynamic test names need 'static lifetime for enter_test_scope.
             // Acceptable because the harness runs once per process.
             let name_static: &'static str = Box::leak(dyn_test.name.into_boxed_str());
             let trial = Trial::test(name_static, move || {
                 // Auto-wrap dynamic tests in a test scope so fixtures are available.
                 let _scope = enter_test_scope(name_static, "");
-                body();
+                run_maybe_serial(is_serial, body);
                 Ok(())
             })
             .with_ignored_flag(dyn_test.ignored);

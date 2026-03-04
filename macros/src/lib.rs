@@ -14,6 +14,7 @@ struct TestArgs {
     name: Option<String>,
     labels: Option<Vec<Ident>>,
     ignore: IgnoreArg,
+    serial: bool,
 }
 
 #[derive(Default)]
@@ -67,10 +68,13 @@ impl Parse for TestArgs {
                         args.ignore = IgnoreArg::Yes;
                     }
                 }
+                "serial" => {
+                    args.serial = true;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
-                        format!("unknown argument `{other}`; expected requires, name, labels, or ignore"),
+                        format!("unknown argument `{other}`; expected requires, name, labels, ignore, or serial"),
                     ));
                 }
             }
@@ -97,6 +101,7 @@ struct FixtureArgs {
     scope: Option<Ident>,
     name: Option<String>,
     deref: bool,
+    serial: bool,
 }
 
 impl Parse for FixtureArgs {
@@ -138,10 +143,13 @@ impl Parse for FixtureArgs {
                 "deref" => {
                     args.deref = true;
                 }
+                "serial" => {
+                    args.serial = true;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
-                        format!("unknown argument `{other}`; expected requires, scope, name, or deref"),
+                        format!("unknown argument `{other}`; expected requires, scope, name, deref, or serial"),
                     ));
                 }
             }
@@ -327,6 +335,8 @@ fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
         }
     };
 
+    let serial = args.serial;
+
     let expanded = quote! {
         #(#attrs)*
         #vis #fn_token #name(#(#clean_params),*) #ret #block
@@ -340,6 +350,7 @@ fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
             ignore: #ignore_expr,
             labels: &[#(#label_strs),*],
             labels_explicit: #labels_explicit,
+            serial: #serial,
             body: #body_expr,
         });
     };
@@ -485,6 +496,7 @@ fn expand_fixture_def(args: FixtureArgs, func: &mut ItemFn) -> TokenStream {
     };
 
     let fixture_ty_str = quote!(#fixture_ty).to_string();
+    let serial = args.serial;
 
     let expanded = quote! {
         #func
@@ -505,6 +517,7 @@ fn expand_fixture_def(args: FixtureArgs, func: &mut ItemFn) -> TokenStream {
             },
             cast: #cast_fn,
             type_name: #fixture_ty_str,
+            serial: #serial,
         });
     };
     expanded.into()
