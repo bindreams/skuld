@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use skuld::CwdGuard;
+use skuld::{cwd, temp_dir, CwdGuard};
 
 static CWD_SET_RAN: AtomicU32 = AtomicU32::new(0);
 static CWD_BACK_RAN: AtomicU32 = AtomicU32::new(0);

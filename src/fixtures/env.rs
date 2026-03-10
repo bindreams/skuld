@@ -66,6 +66,6 @@ impl Drop for EnvGuard {
 }
 
 #[skuld::fixture(scope = test, serial)]
-fn env() -> Result<EnvGuard, String> {
+pub fn env() -> Result<EnvGuard, String> {
     Ok(EnvGuard::new())
 }

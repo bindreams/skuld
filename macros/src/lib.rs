@@ -292,16 +292,21 @@ fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
     let fixture_name_strs: Vec<&str> = fixture_params.iter().map(|p| p.fixture_name.as_str()).collect();
 
     // Build fixture injection code using fixture_get().
+    // Each block references the fixture function as an identifier, which:
+    // 1. Forces the crate containing the fixture to be linked (for inventory discovery)
+    // 2. Gives a compile-time error if the fixture function is not in scope
     let fixture_setup: Vec<_> = fixture_params
         .iter()
         .enumerate()
         .map(|(i, fp)| {
             let handle_name = format_ident!("__fixture_handle_{}", i);
+            let fixture_ident = format_ident!("{}", fp.fixture_name);
             let binding = &fp.binding;
             let target_ty = &fp.target_ty;
             let param_ty = &fp.param_ty;
             let fixture_name = &fp.fixture_name;
             quote! {
+                let _ = &#fixture_ident;
                 let #handle_name = ::skuld::fixture_get(
                     #fixture_name,
                     ::std::any::TypeId::of::<#target_ty>(),
@@ -381,7 +386,10 @@ pub fn fixture(attr: TokenStream, item: TokenStream) -> TokenStream {
 fn expand_fixture_def(args: FixtureArgs, func: &mut ItemFn) -> TokenStream {
     let req_exprs: Vec<_> = args.requires.iter().collect();
 
-    // Determine fixture name.
+    // Determine fixture name. If a custom name is provided, we also generate
+    // a public const anchor so that `#[fixture(custom_name)]` in tests can
+    // reference the identifier and force the containing crate to be linked.
+    let has_custom_name = args.name.is_some();
     let fixture_name = args.name.unwrap_or_else(|| func.sig.ident.to_string());
 
     // Determine scope.
@@ -432,11 +440,13 @@ fn expand_fixture_def(args: FixtureArgs, func: &mut ItemFn) -> TokenStream {
             .enumerate()
             .map(|(i, fp)| {
                 let handle_name = format_ident!("__fixture_dep_handle_{}", i);
+                let dep_ident = format_ident!("{}", fp.fixture_name);
                 let binding = &fp.binding;
                 let target_ty = &fp.target_ty;
                 let param_ty = &fp.param_ty;
                 let dep_name = &fp.fixture_name;
                 quote! {
+                    let _ = &#dep_ident;
                     let #handle_name = ::skuld::fixture_get(
                         #dep_name,
                         ::std::any::TypeId::of::<#target_ty>(),
@@ -498,8 +508,24 @@ fn expand_fixture_def(args: FixtureArgs, func: &mut ItemFn) -> TokenStream {
     let fixture_ty_str = quote!(#fixture_ty).to_string();
     let serial = args.serial;
 
+    // When a custom name is used (name = "..."), the fixture name differs from
+    // the function name. Generate a public const anchor so that tests using
+    // `#[fixture(custom_name)]` can reference the identifier for linkage.
+    let anchor = if has_custom_name {
+        let anchor_ident = format_ident!("{}", fixture_name);
+        quote! {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals, dead_code)]
+            pub const #anchor_ident: () = ();
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         #func
+
+        #anchor
 
         ::skuld::inventory::submit!(::skuld::FixtureDef {
             name: #fixture_name,

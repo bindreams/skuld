@@ -21,6 +21,6 @@ impl fmt::Display for TestName {
 }
 
 #[skuld::fixture(scope = test, deref)]
-fn test_name() -> Result<TestName, String> {
+pub fn test_name() -> Result<TestName, String> {
     Ok(TestName(crate::current_test().name.to_owned()))
 }

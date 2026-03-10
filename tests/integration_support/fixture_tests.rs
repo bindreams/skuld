@@ -3,6 +3,8 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use skuld::{temp_dir, test_name};
+
 // Fixtures ========================================================================================
 
 // Variable-scoped counter (default scope). Tracks setup/drop calls.

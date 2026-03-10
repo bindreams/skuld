@@ -19,8 +19,10 @@ impl Deref for TempDir {
     }
 }
 
+use crate::fixtures::test_name::test_name;
+
 #[skuld::fixture(deref)]
-fn temp_dir(#[fixture(test_name)] name: &str) -> Result<TempDir, String> {
+pub fn temp_dir(#[fixture(test_name)] name: &str) -> Result<TempDir, String> {
     tempfile::Builder::new()
         .prefix(&format!("{name}-"))
         .tempdir()
