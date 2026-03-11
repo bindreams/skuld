@@ -73,6 +73,6 @@ impl Drop for CwdGuard {
 }
 
 #[skuld::fixture(scope = test, serial)]
-fn cwd() -> Result<CwdGuard, String> {
+pub fn cwd() -> Result<CwdGuard, String> {
     CwdGuard::new()
 }

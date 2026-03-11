@@ -23,10 +23,10 @@ pub use fixture::{
     cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope, fixture, fixture_get,
     fixture_registry, warm_up, FixtureDef, FixtureHandle, FixtureRef, FixtureScope, TestScope,
 };
-pub use fixtures::cwd::CwdGuard;
-pub use fixtures::env::EnvGuard;
-pub use fixtures::temp_dir::TempDir;
-pub use fixtures::test_name::TestName;
+pub use fixtures::cwd::{cwd, CwdGuard};
+pub use fixtures::env::{env, EnvGuard};
+pub use fixtures::temp_dir::{temp_dir, TempDir};
+pub use fixtures::test_name::{test_name, TestName};
 pub use label::ModuleLabels;
 pub use probe::{probe_executable, probe_path};
 pub use metadata::{FixtureMetadata, RequirementInfo, TestMetadata};

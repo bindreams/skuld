@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use skuld::EnvGuard;
+use skuld::{env, EnvGuard};
 
 const SENTINEL_VAR: &str = "SKULD_ENV_TEST_SENTINEL";
 
