@@ -1,5 +1,6 @@
 //! Tests for the `metadata` fixture and the `TestMetadata` / `FixtureMetadata` types.
 
+use skuld::fixtures::metadata::metadata;
 use skuld::metadata::{FixtureMetadata, TestMetadata};
 
 #[skuld::test]

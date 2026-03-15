@@ -58,6 +58,14 @@ impl Requirement {
     }
 }
 
+/// Whether a test expects a panic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShouldPanic {
+    No,
+    Yes,
+    WithMessage(&'static str),
+}
+
 // Test context ========================================================================================
 
 /// Metadata about the currently executing test, set by [`enter_test_scope`].
@@ -119,6 +127,7 @@ pub struct TestDef {
     /// Whether this test must run under the global serial lock.
     /// Propagated transitively from fixtures via [`collect_fixture_serial`].
     pub serial: bool,
+    pub should_panic: ShouldPanic,
     pub body: fn(),
 }
 

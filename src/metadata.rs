@@ -5,7 +5,7 @@ use std::fmt;
 use serde::Serialize;
 
 use crate::fixture::{collect_fixture_serial, fixture_registry, FixtureDef, FixtureScope};
-use crate::{Ignore, Requirement, TestDef};
+use crate::{Ignore, Requirement, ShouldPanic, TestDef};
 
 // RequirementInfo =================================================================================
 
@@ -80,6 +80,7 @@ pub struct TestMetadata {
     pub serial: bool,
     pub labels: Vec<String>,
     pub ignore: String,
+    pub should_panic: String,
     pub fixtures: Vec<FixtureMetadata>,
     pub requires: Vec<RequirementInfo>,
 }
@@ -128,6 +129,12 @@ impl TestMetadata {
             Ignore::WithReason(r) => format!("yes: {r}"),
         };
 
+        let should_panic = match def.should_panic {
+            ShouldPanic::No => "no".to_owned(),
+            ShouldPanic::Yes => "yes".to_owned(),
+            ShouldPanic::WithMessage(m) => format!("yes: {m}"),
+        };
+
         Self {
             name: def.name.to_owned(),
             module: def.module.to_owned(),
@@ -135,6 +142,7 @@ impl TestMetadata {
             serial: is_serial,
             labels: def.labels.iter().map(|s| s.to_string()).collect(),
             ignore,
+            should_panic,
             fixtures: fixture_metas,
             requires,
         }

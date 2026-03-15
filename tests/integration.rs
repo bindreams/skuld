@@ -15,6 +15,7 @@ fn main() {
     support::serial_tests::assert_all_ran();
     support::env_tests::assert_all_ran_and_reverted();
     support::cwd_tests::assert_all_ran_and_reverted(&original_cwd);
+    support::should_panic_tests::assert_all_ran();
 
     conclusion.exit();
 }

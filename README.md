@@ -30,6 +30,38 @@ fn main() {
 }
 ```
 
+## Unit tests
+
+To use `skuld` for tests inside `src/`, disable the default harness for the library target and add the entry point:
+
+```toml
+[lib]
+harness = false
+```
+
+```rust
+// lib.rs
+#[cfg(test)]
+fn main() {
+    skuld::run_all();
+}
+```
+
+Now `#[skuld::test]` works in any `#[cfg(test)]` module under `src/`:
+
+```rust
+// src/my_module.rs
+#[cfg(test)]
+mod tests {
+    #[skuld::test]
+    fn unit_test_example() {
+        assert_eq!(2 + 2, 4);
+    }
+}
+```
+
+> **Note:** Without `[lib] harness = false`, the default Rust test harness runs instead of skuld, silently reporting `running 0 tests` with no error.
+
 ## Writing tests
 
 Annotate test functions with `#[skuld::test]`. The attribute supports several options:
@@ -55,6 +87,16 @@ fn blocked_test() { /* ... */ }
 
 #[skuld::test(serial)]
 fn modifies_global_state() { /* ... */ }
+
+#[skuld::test(should_panic)]
+fn panics_on_bad_input() {
+    my_function(invalid_input);
+}
+
+#[skuld::test(should_panic = "out of range")]
+fn panics_with_message() {
+    my_function(too_large);
+}
 ```
 
 Every `#[skuld::test]` function is registered with the harness. Functions without `#[skuld::test]` are invisible to skuld.

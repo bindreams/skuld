@@ -15,6 +15,7 @@ struct TestArgs {
     labels: Option<Vec<Ident>>,
     ignore: IgnoreArg,
     serial: bool,
+    should_panic: ShouldPanicArg,
 }
 
 #[derive(Default)]
@@ -23,6 +24,14 @@ enum IgnoreArg {
     No,
     Yes,
     WithReason(String),
+}
+
+#[derive(Default)]
+enum ShouldPanicArg {
+    #[default]
+    No,
+    Yes,
+    WithMessage(String),
 }
 
 impl Parse for TestArgs {
@@ -71,10 +80,19 @@ impl Parse for TestArgs {
                 "serial" => {
                     args.serial = true;
                 }
+                "should_panic" => {
+                    if input.peek(Token![=]) {
+                        let _eq: Token![=] = input.parse()?;
+                        let lit: LitStr = input.parse()?;
+                        args.should_panic = ShouldPanicArg::WithMessage(lit.value());
+                    } else {
+                        args.should_panic = ShouldPanicArg::Yes;
+                    }
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
-                        format!("unknown argument `{other}`; expected requires, name, labels, ignore, or serial"),
+                        format!("unknown argument `{other}`; expected requires, name, labels, ignore, serial, or should_panic"),
                     ));
                 }
             }
@@ -326,21 +344,67 @@ fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
     let attrs: Vec<_> = func.attrs.iter().collect();
     let call_args: Vec<_> = fixture_params.iter().map(|fp| &fp.binding).collect();
 
-    let body_expr = if fixture_params.is_empty() {
+    let inner_body = if fixture_params.is_empty() {
         quote! {
-            || {
-                let __scope = ::skuld::enter_test_scope(#name_str, ::core::module_path!());
-                #name();
-            }
+            let __scope = ::skuld::enter_test_scope(#name_str, ::core::module_path!());
+            #name();
         }
     } else {
         quote! {
-            || {
-                let __scope = ::skuld::enter_test_scope(#name_str, ::core::module_path!());
-                #(#fixture_setup)*
-                #name(#(#call_args),*);
-            }
+            let __scope = ::skuld::enter_test_scope(#name_str, ::core::module_path!());
+            #(#fixture_setup)*
+            #name(#(#call_args),*);
         }
+    };
+
+    let body_expr = match &args.should_panic {
+        ShouldPanicArg::No => quote! { || { #inner_body } },
+        ShouldPanicArg::Yes => quote! {
+            || {
+                let __result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    #inner_body
+                }));
+                if __result.is_ok() {
+                    panic!("test did not panic as expected");
+                }
+            }
+        },
+        ShouldPanicArg::WithMessage(expected) => quote! {
+            || {
+                let __result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    #inner_body
+                }));
+                match __result {
+                    Ok(()) => panic!("test did not panic as expected"),
+                    Err(__payload) => {
+                        let __msg = if let Some(s) = __payload.downcast_ref::<String>() {
+                            s.as_str()
+                        } else if let Some(s) = __payload.downcast_ref::<&str>() {
+                            *s
+                        } else {
+                            panic!(
+                                "test panicked as expected, but the panic payload is not a string \
+                                 (expected message containing {:?})",
+                                #expected,
+                            );
+                        };
+                        if !__msg.contains(#expected) {
+                            panic!(
+                                "test panicked as expected, but the message {:?} \
+                                 does not contain {:?}",
+                                __msg, #expected,
+                            );
+                        }
+                    }
+                }
+            }
+        },
+    };
+
+    let should_panic_expr = match &args.should_panic {
+        ShouldPanicArg::No => quote! { ::skuld::ShouldPanic::No },
+        ShouldPanicArg::Yes => quote! { ::skuld::ShouldPanic::Yes },
+        ShouldPanicArg::WithMessage(msg) => quote! { ::skuld::ShouldPanic::WithMessage(#msg) },
     };
 
     let serial = args.serial;
@@ -359,6 +423,7 @@ fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
             labels: &[#(#label_strs),*],
             labels_explicit: #labels_explicit,
             serial: #serial,
+            should_panic: #should_panic_expr,
             body: #body_expr,
         });
     };
