@@ -12,6 +12,7 @@
 
 extern crate self as skuld;
 
+mod capture;
 pub mod fixture;
 pub mod fixtures;
 pub mod label;

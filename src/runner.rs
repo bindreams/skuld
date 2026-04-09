@@ -4,11 +4,16 @@
 //! - `#[skuld::test]` attribute (inventory-registered [`TestDef`](crate::TestDef))
 //! - [`TestRunner::add`] (runtime-generated tests)
 
+use std::io::Write;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use clap::Parser;
 use libtest_mimic::{Arguments, Trial};
+use tracing_subscriber::EnvFilter;
 
+use crate::capture::CaptureBuffer;
 use crate::fixture::{cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope};
 use crate::label::{extract_label_filters, label_matches, resolve_labels, LabelSelector, ModuleLabels};
 use crate::{Ignore, TestDef};
@@ -25,6 +30,79 @@ fn run_maybe_serial(serial: bool, body: impl FnOnce()) {
         body();
     } else {
         body();
+    }
+}
+
+// Per-test observability ==============================================================================
+
+/// Run one test body with per-test observability:
+///
+/// 1. **Runner events** — prints `[skuld] <name>: starting` and
+///    `[skuld] <name>: pass|fail (NN ms)` to stderr unconditionally. Always
+///    visible regardless of pass/fail so per-test durations land in the
+///    normal `cargo test` output.
+/// 2. **Library tracing capture** — installs a thread-local
+///    [`tracing_subscriber::fmt`] subscriber whose writer is an in-memory
+///    buffer. On pass, the buffer is discarded. On panic, the buffer is
+///    drained to stderr with a clear header/footer before the panic is
+///    re-raised so libtest-mimic still sees the failure.
+///
+/// The subscriber is installed via
+/// [`tracing::subscriber::set_default`] which is strictly thread-local —
+/// two concurrent tests on different libtest-mimic worker threads cannot
+/// see each other's events. See [`crate::capture`] for the capture
+/// buffer design and its known limitations.
+fn run_with_observability(name: &str, serial: bool, body: impl FnOnce()) {
+    // Runner-level "starting" line. Eprintln NOT tracing, so it's visible
+    // on every run regardless of whether a subscriber is installed.
+    eprintln!("[skuld] {name}: starting");
+    let started = Instant::now();
+
+    // Per-test capture buffer + subscriber. The subscriber lives only for
+    // the duration of `_guard`; dropping `_guard` restores whatever was
+    // default on this thread before (usually nothing).
+    let buffer = CaptureBuffer::new();
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buffer.make_writer())
+        .with_env_filter(env_filter)
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // Catch panics so we can drain the buffer before re-raising.
+    let result = catch_unwind(AssertUnwindSafe(|| run_maybe_serial(serial, body)));
+
+    let duration = started.elapsed();
+
+    // Detach the subscriber BEFORE printing runner events / capture dumps
+    // so our own eprintln output doesn't recurse into the buffer.
+    drop(_guard);
+
+    let outcome = if result.is_ok() { "pass" } else { "fail" };
+    eprintln!(
+        "[skuld] {name}: {outcome} ({} ms)",
+        duration.as_millis()
+    );
+
+    if result.is_err() {
+        let bytes = buffer.snapshot();
+        if !bytes.is_empty() {
+            eprintln!("[skuld] {name}: ---- captured tracing events ----");
+            // Best-effort raw write of the captured bytes. Errors here are
+            // themselves diagnostic noise, so we drop them.
+            let _ = std::io::stderr().write_all(&bytes);
+            // Make sure the dump ends with a newline before the footer.
+            if !bytes.ends_with(b"\n") {
+                let _ = std::io::stderr().write_all(b"\n");
+            }
+            eprintln!("[skuld] {name}: ---- end capture ----");
+        }
+    }
+
+    if let Err(payload) = result {
+        resume_unwind(payload);
     }
 }
 
@@ -171,8 +249,9 @@ impl TestRunner {
             if reasons.is_empty() {
                 let body = def.body;
                 let is_serial = def.serial || collect_fixture_serial(def.fixture_names);
+                let observed_name = trial_name.to_string();
                 let trial = Trial::test(trial_name, move || {
-                    run_maybe_serial(is_serial, body);
+                    run_with_observability(&observed_name, is_serial, body);
                     Ok(())
                 });
                 let trial = if kind.is_empty() { trial } else { trial.with_kind(kind) };
@@ -201,9 +280,11 @@ impl TestRunner {
             // Acceptable because the harness runs once per process.
             let name_static: &'static str = Box::leak(dyn_test.name.into_boxed_str());
             let trial = Trial::test(name_static, move || {
-                // Auto-wrap dynamic tests in a test scope so fixtures are available.
-                let _scope = enter_test_scope(name_static, "");
-                run_maybe_serial(is_serial, body);
+                run_with_observability(name_static, is_serial, move || {
+                    // Auto-wrap dynamic tests in a test scope so fixtures are available.
+                    let _scope = enter_test_scope(name_static, "");
+                    body();
+                });
                 Ok(())
             })
             .with_ignored_flag(dyn_test.ignored);

@@ -15,6 +15,13 @@ clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_yml = "0.0.12"
+tracing = "0.1"
+# CRITICAL: DO NOT enable the "tracing-log" feature. It auto-installs a
+# LogTracer on the first subscriber init, which mutates log::max_level
+# globally. Downstream projects (bindreams/hole#147) have hit timeout
+# regressions on Windows CI because of that mutation. We only want the
+# env-filter + fmt layers.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 
 [[test]]
 name = "integration"
