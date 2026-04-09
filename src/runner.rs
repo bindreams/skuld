@@ -61,9 +61,16 @@ fn run_with_observability(name: &str, serial: bool, body: impl FnOnce()) {
     // Per-test capture buffer + subscriber. The subscriber lives only for
     // the duration of `_guard`; dropping `_guard` restores whatever was
     // default on this thread before (usually nothing).
+    //
+    // Default filter is `off` so passing runs pay ~zero subscriber cost
+    // (tracing filters events before formatting). Set `RUST_LOG=info`
+    // (or `hole_bridge=debug`, etc.) to activate capture during an
+    // investigation. This matches the industry-standard Rust test log
+    // pattern and avoids tipping the #147/#165 cumulative-overhead
+    // threshold on marginal CI runners.
     let buffer = CaptureBuffer::new();
     let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("off"));
     let subscriber = tracing_subscriber::fmt()
         .with_writer(buffer.make_writer())
         .with_env_filter(env_filter)
