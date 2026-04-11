@@ -6,6 +6,9 @@ name = "skuld"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+tokio = ["dep:tokio"]
+
 [dependencies]
 skuld-macros = { path = "macros" }
 inventory = "0.3"
@@ -22,6 +25,11 @@ tracing = "0.1"
 # regressions on Windows CI because of that mutation. We only want the
 # env-filter + fmt layers.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+tokio = { version = "1", features = ["rt"], optional = true }
+
+[dev-dependencies]
+skuld = { path = ".", features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "time", "net", "io-util"] }
 
 [[test]]
 name = "integration"

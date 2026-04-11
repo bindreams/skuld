@@ -9,7 +9,9 @@ fn main() {
     let conclusion = skuld::TestRunner::new().run_tests();
 
     // Post-run assertions: verify test bodies and teardowns actually ran.
+    support::async_tests::assert_all_ran();
     support::harness_tests::assert_satisfied_test_ran();
+    support::harness_tests::assert_result_tests_ran();
     support::fixture_tests::assert_fixture_drop_called();
     support::label_tests::assert_all_ran();
     support::serial_tests::assert_all_ran();

@@ -133,3 +133,40 @@ pub struct TestDef {
 }
 
 inventory::collect!(TestDef);
+
+// Private helpers for macro-generated code ============================================================
+
+#[doc(hidden)]
+pub mod __private {
+    /// Build a single-threaded tokio runtime for async test execution.
+    ///
+    /// This is a separate function (rather than combined with `block_on`) so that
+    /// `should_panic` tests can construct the runtime *outside* their `catch_unwind`
+    /// boundary. A runtime build failure is an infrastructure error, not a test panic.
+    #[cfg(feature = "tokio")]
+    pub fn build_async_runtime() -> ::tokio::runtime::Runtime {
+        ::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime for async test")
+    }
+
+    /// Trait for converting test return values into `()`.
+    ///
+    /// `()` passes through; `Result<(), E>` panics on `Err`. The proc macro wraps
+    /// every test function call in `IntoTestResult::into_test_result(...)` so that
+    /// returning `Err` from a test is a failure, not a silent pass.
+    pub trait IntoTestResult {
+        fn into_test_result(self);
+    }
+
+    impl IntoTestResult for () {
+        fn into_test_result(self) {}
+    }
+
+    impl<E: std::fmt::Debug> IntoTestResult for Result<(), E> {
+        fn into_test_result(self) {
+            self.unwrap_or_else(|e| panic!("test returned an error: {e:?}"));
+        }
+    }
+}

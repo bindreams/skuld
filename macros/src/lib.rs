@@ -341,28 +341,55 @@ fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
     let block = &func.block;
     let ret = &func.sig.output;
     let fn_token = &func.sig.fn_token;
+    let asyncness = &func.sig.asyncness;
     let attrs: Vec<_> = func.attrs.iter().collect();
     let call_args: Vec<_> = fixture_params.iter().map(|fp| &fp.binding).collect();
 
-    let inner_body = if fixture_params.is_empty() {
+    let is_async = func.sig.asyncness.is_some();
+    let await_suffix = if is_async { quote!(.await) } else { quote!() };
+
+    // The core test body: enter scope, inject fixtures, call the test function.
+    // IntoTestResult handles both `()` and `Result<(), E>` return types.
+    let inner_body_core = if fixture_params.is_empty() {
         quote! {
             let __scope = ::skuld::enter_test_scope(#name_str, ::core::module_path!());
-            #name();
+            ::skuld::__private::IntoTestResult::into_test_result(#name()#await_suffix)
         }
     } else {
         quote! {
             let __scope = ::skuld::enter_test_scope(#name_str, ::core::module_path!());
             #(#fixture_setup)*
-            #name(#(#call_args),*);
+            ::skuld::__private::IntoTestResult::into_test_result(#name(#(#call_args),*)#await_suffix)
         }
     };
 
+    // For async tests, build the runtime outside catch_unwind (a runtime build
+    // failure is an infrastructure error, not a test panic that should satisfy
+    // should_panic). The block_on call goes inside catch_unwind.
+    let runtime_preamble = if is_async {
+        quote! { let __rt = ::skuld::__private::build_async_runtime(); }
+    } else {
+        quote! {}
+    };
+
+    let execute_core = if is_async {
+        quote! { __rt.block_on(async { #inner_body_core }) }
+    } else {
+        quote! { #inner_body_core }
+    };
+
     let body_expr = match &args.should_panic {
-        ShouldPanicArg::No => quote! { || { #inner_body } },
+        ShouldPanicArg::No => quote! {
+            || {
+                #runtime_preamble
+                #execute_core
+            }
+        },
         ShouldPanicArg::Yes => quote! {
             || {
+                #runtime_preamble
                 let __result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    #inner_body
+                    #execute_core
                 }));
                 if __result.is_ok() {
                     panic!("test did not panic as expected");
@@ -371,8 +398,9 @@ fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
         },
         ShouldPanicArg::WithMessage(expected) => quote! {
             || {
+                #runtime_preamble
                 let __result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    #inner_body
+                    #execute_core
                 }));
                 match __result {
                     Ok(()) => panic!("test did not panic as expected"),
@@ -411,7 +439,7 @@ fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
 
     let expanded = quote! {
         #(#attrs)*
-        #vis #fn_token #name(#(#clean_params),*) #ret #block
+        #vis #asyncness #fn_token #name(#(#clean_params),*) #ret #block
 
         ::skuld::inventory::submit!(::skuld::TestDef {
             name: #name_str,

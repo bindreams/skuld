@@ -101,6 +101,36 @@ fn panics_with_message() {
 
 Every `#[skuld::test]` function is registered with the harness. Functions without `#[skuld::test]` are invisible to skuld.
 
+## Async tests
+
+Enable the `tokio` feature to use `async fn` test bodies:
+
+```toml
+[dev-dependencies]
+skuld = { path = "skuld", features = ["tokio"] }
+```
+
+```rust
+#[skuld::test]
+async fn connects_to_server() {
+    let stream = tokio::net::TcpStream::connect("127.0.0.1:8080").await.unwrap();
+    // ...
+}
+```
+
+Async tests run on a single-threaded tokio runtime (`current_thread` with `enable_all()`). All existing features — fixtures, `requires`, `should_panic`, `serial`, labels — work with async tests.
+
+Tests may also return `Result<(), E>` where `E: Debug`. An `Err` return fails the test:
+
+```rust
+#[skuld::test]
+async fn parses_config() -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config().await?;
+    assert_eq!(config.port, 8080);
+    Ok(())
+}
+```
+
 ## Fixtures
 
 Fixtures provide dependency-injected values to test functions. Define a fixture with `#[skuld::fixture]` and inject it with `#[fixture]` on a test parameter:
