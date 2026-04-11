@@ -22,8 +22,16 @@ impl RequirementInfo {
     /// Evaluate a requirement and capture the result.
     pub fn from_requirement(req: &Requirement) -> Self {
         match req.eval() {
-            Ok(()) => Self { name: req.name.to_owned(), met: true, reason: None },
-            Err(e) => Self { name: req.name.to_owned(), met: false, reason: Some(e) },
+            Ok(()) => Self {
+                name: req.name.to_owned(),
+                met: true,
+                reason: None,
+            },
+            Err(e) => Self {
+                name: req.name.to_owned(),
+                met: false,
+                reason: Some(e),
+            },
         }
     }
 }
@@ -117,11 +125,7 @@ impl TestMetadata {
 
         let is_serial = def.serial || collect_fixture_serial(def.fixture_names);
 
-        let requires: Vec<RequirementInfo> = def
-            .requires
-            .iter()
-            .map(RequirementInfo::from_requirement)
-            .collect();
+        let requires: Vec<RequirementInfo> = def.requires.iter().map(RequirementInfo::from_requirement).collect();
 
         let ignore = match def.ignore {
             Ignore::No => "no".to_owned(),

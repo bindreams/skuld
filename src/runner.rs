@@ -69,8 +69,7 @@ fn run_with_observability(name: &str, serial: bool, body: impl FnOnce()) {
     // pattern and avoids tipping the #147/#165 cumulative-overhead
     // threshold on marginal CI runners.
     let buffer = CaptureBuffer::new();
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("off"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("off"));
     let subscriber = tracing_subscriber::fmt()
         .with_writer(buffer.make_writer())
         .with_env_filter(env_filter)
@@ -88,10 +87,7 @@ fn run_with_observability(name: &str, serial: bool, body: impl FnOnce()) {
     drop(_guard);
 
     let outcome = if result.is_ok() { "pass" } else { "fail" };
-    eprintln!(
-        "[skuld] {name}: {outcome} ({} ms)",
-        duration.as_millis()
-    );
+    eprintln!("[skuld] {name}: {outcome} ({} ms)", duration.as_millis());
 
     if result.is_err() {
         let bytes = buffer.snapshot();

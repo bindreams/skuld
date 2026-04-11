@@ -33,6 +33,12 @@ fn metadata_reports_should_panic_message(#[fixture(metadata)] meta: &TestMetadat
 }
 
 pub fn assert_all_ran() {
-    assert!(BARE_RAN.load(Ordering::Relaxed), "bare_should_panic should have executed");
-    assert!(SUBSTRING_RAN.load(Ordering::Relaxed), "should_panic_with_message should have executed");
+    assert!(
+        BARE_RAN.load(Ordering::Relaxed),
+        "bare_should_panic should have executed"
+    );
+    assert!(
+        SUBSTRING_RAN.load(Ordering::Relaxed),
+        "should_panic_with_message should have executed"
+    );
 }

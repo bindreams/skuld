@@ -283,10 +283,14 @@ fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
         IgnoreArg::Yes => quote! { ::skuld::Ignore::Yes },
         IgnoreArg::WithReason(reason) => quote! { ::skuld::Ignore::WithReason(#reason) },
     };
-    let req_exprs: Vec<_> = args.requires.iter().map(|path| {
-        let name_str = quote!(#path).to_string();
-        quote! { ::skuld::Requirement { name: #name_str, check: #path } }
-    }).collect();
+    let req_exprs: Vec<_> = args
+        .requires
+        .iter()
+        .map(|path| {
+            let name_str = quote!(#path).to_string();
+            quote! { ::skuld::Requirement { name: #name_str, check: #path } }
+        })
+        .collect();
 
     // Collect #[fixture] / #[fixture(name)] parameters.
     let mut fixture_params: Vec<FixtureParam> = Vec::new();
@@ -480,10 +484,14 @@ pub fn fixture(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 fn expand_fixture_def(args: FixtureArgs, func: &mut ItemFn) -> TokenStream {
-    let req_exprs: Vec<_> = args.requires.iter().map(|path| {
-        let name_str = quote!(#path).to_string();
-        quote! { ::skuld::Requirement { name: #name_str, check: #path } }
-    }).collect();
+    let req_exprs: Vec<_> = args
+        .requires
+        .iter()
+        .map(|path| {
+            let name_str = quote!(#path).to_string();
+            quote! { ::skuld::Requirement { name: #name_str, check: #path } }
+        })
+        .collect();
 
     // Determine fixture name. If a custom name is provided, we also generate
     // a public const anchor so that `#[fixture(custom_name)]` in tests can

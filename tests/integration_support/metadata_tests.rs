@@ -16,7 +16,10 @@ fn metadata_has_module(#[fixture(metadata)] meta: &TestMetadata) {
 #[skuld::test]
 fn metadata_lists_own_fixture(#[fixture(metadata)] meta: &TestMetadata) {
     let names: Vec<&str> = meta.fixtures.iter().map(|f| f.name.as_str()).collect();
-    assert!(names.contains(&"metadata"), "fixtures should include 'metadata', got {names:?}");
+    assert!(
+        names.contains(&"metadata"),
+        "fixtures should include 'metadata', got {names:?}"
+    );
 }
 
 #[skuld::test(serial)]
@@ -50,6 +53,6 @@ fn always_ok() -> Result<(), String> {
 #[skuld::test(requires = [always_ok])]
 fn metadata_has_requirements(#[fixture(metadata)] meta: &TestMetadata) {
     assert!(!meta.requires.is_empty(), "should have at least one requirement");
-    assert_eq!(meta.requires[0].met, true);
+    assert!(meta.requires[0].met);
     assert!(meta.requires[0].name.contains("always_ok"));
 }

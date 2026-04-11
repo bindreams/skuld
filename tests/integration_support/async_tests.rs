@@ -54,10 +54,28 @@ async fn async_result_err_fails() -> Result<(), String> {
 }
 
 pub fn assert_all_ran() {
-    assert!(BASIC_ASYNC_RAN.load(Ordering::Relaxed), "basic_async_test should have executed");
-    assert!(ASYNC_FIXTURE_RAN.load(Ordering::Relaxed), "async_with_fixture should have executed");
-    assert!(ASYNC_SHOULD_PANIC_RAN.load(Ordering::Relaxed), "async_should_panic should have executed");
-    assert!(ASYNC_SHOULD_PANIC_MSG_RAN.load(Ordering::Relaxed), "async_should_panic_with_message should have executed");
-    assert!(ASYNC_RESULT_OK_RAN.load(Ordering::Relaxed), "async_result_ok should have executed");
-    assert!(ASYNC_RESULT_ERR_RAN.load(Ordering::Relaxed), "async_result_err_fails should have executed");
+    assert!(
+        BASIC_ASYNC_RAN.load(Ordering::Relaxed),
+        "basic_async_test should have executed"
+    );
+    assert!(
+        ASYNC_FIXTURE_RAN.load(Ordering::Relaxed),
+        "async_with_fixture should have executed"
+    );
+    assert!(
+        ASYNC_SHOULD_PANIC_RAN.load(Ordering::Relaxed),
+        "async_should_panic should have executed"
+    );
+    assert!(
+        ASYNC_SHOULD_PANIC_MSG_RAN.load(Ordering::Relaxed),
+        "async_should_panic_with_message should have executed"
+    );
+    assert!(
+        ASYNC_RESULT_OK_RAN.load(Ordering::Relaxed),
+        "async_result_ok should have executed"
+    );
+    assert!(
+        ASYNC_RESULT_ERR_RAN.load(Ordering::Relaxed),
+        "async_result_err_fails should have executed"
+    );
 }
