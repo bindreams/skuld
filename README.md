@@ -155,11 +155,11 @@ fn my_test(#[fixture(temp_dir)] dir: &Path) {
 
 Each fixture has a lifetime scope:
 
-| Scope | Behaviour |
+| Scope                | Behaviour                                                           |
 | -------------------- | ------------------------------------------------------------------- |
 | `variable` (default) | Fresh instance per request. Dropped when the `FixtureHandle` drops. |
-| `test` | Cached per test. Dropped when the test ends. |
-| `process` | Cached globally. Dropped after all tests finish (LIFO). |
+| `test`               | Cached per test. Dropped when the test ends.                        |
+| `process`            | Cached globally. Dropped after all tests finish (LIFO).             |
 
 ```rust
 #[skuld::fixture(scope = process, requires = [docker_available])]
@@ -170,12 +170,12 @@ A fixture may only depend on fixtures of the **same or wider** scope. Dependency
 
 ### Built-in fixtures
 
-| Fixture | Scope | Type | Serial | Description |
-| ----------- | -------- | ---------------------------- | ------ | ---------------------------------------- |
-| `test_name` | test | `TestName` (deref to `&str`) | no | Current test function name |
-| `temp_dir` | variable | `TempDir` (deref to `&Path`) | no | Temporary directory named after the test |
-| `env` | test | `EnvGuard` | yes | Set/remove env vars with automatic revert |
-| `cwd` | test | `CwdGuard` | yes | Change working directory with automatic revert |
+| Fixture     | Scope    | Type                         | Serial | Description                                    |
+| ----------- | -------- | ---------------------------- | ------ | ---------------------------------------------- |
+| `test_name` | test     | `TestName` (deref to `&str`) | no     | Current test function name                     |
+| `temp_dir`  | variable | `TempDir` (deref to `&Path`) | no     | Temporary directory named after the test       |
+| `env`       | test     | `EnvGuard`                   | yes    | Set/remove env vars with automatic revert      |
+| `cwd`       | test     | `CwdGuard`                   | yes    | Change working directory with automatic revert |
 
 ### Deref coercion
 
@@ -262,12 +262,44 @@ fn main() {
 }
 ```
 
+## Running tests
+
+### Capture model
+
+Under `cargo test`, skuld captures each test's `stdout` and `stderr` via a file-descriptor redirect (`dup2` on Unix; `SetStdHandle` + `_dup2` on Windows). On pass the captured bytes are discarded; on failure they are dumped to the real `stderr` between `---- captured ----` markers, followed by the panic. The capture intercepts at the FD level, so every write — `println!`, `eprintln!`, raw `io::stdout().write_all`, FFI output, tracing subscribers installed by the test body, and even output from spawned child processes — is captured. Tests are free to install their own `tracing_subscriber::registry().try_init()` and skuld stays out of the dispatch path entirely.
+
+Because FD redirect is a process-wide operation, capture mode forces `--test-threads=1`. For parallel execution, either run with `--nocapture` or use `cargo nextest run` (recommended for large suites — nextest runs each test in its own subprocess and captures via OS pipes externally, so skuld's in-process redirect is unnecessary and disabled automatically).
+
+```bash
+cargo test                      # default: FD capture, serial, silent on pass
+cargo test -- --nocapture       # no capture, default parallelism, all output visible
+cargo nextest run               # process-per-test parallelism via nextest
+```
+
+### `SKULD_DEBUG=1`
+
+Set `SKULD_DEBUG=1` to get diagnostic lines around each test's execution, useful for debugging capture setup or runner behavior:
+
+```bash
+SKULD_DEBUG=1 cargo test
+# ...
+# [skuld] my_test: starting
+# [skuld-debug] my_test: entering test scope
+# [skuld-debug] my_test: capture enabled (fd redirect)
+# [skuld-debug] my_test: capture disabled
+# [skuld] my_test: pass (3 ms)
+```
+
+### A note on `tracing-subscriber`'s `tracing-log` feature
+
+If your test code or code under test pulls in `tracing-subscriber` directly, **do not enable its `tracing-log` feature**. The feature auto-installs a `log::Log` shim on the first subscriber `init`, which mutates `log::max_level` globally. Downstream projects have hit Windows CI timeout regressions from this — see bindreams/hole#147. If you need the `log`→`tracing` bridge, call `tracing_log::LogTracer::init()` yourself in the test that needs it, and accept that doing so is a process-wide, one-time operation.
+
 ## Built-in probe helpers
 
-| Function | Checks |
+| Function                 | Checks                      |
 | ------------------------ | --------------------------- |
 | `probe_executable(name)` | `<name> --version` succeeds |
-| `probe_path(path)` | File or directory exists |
+| `probe_path(path)`       | File or directory exists    |
 
 ## Output
 

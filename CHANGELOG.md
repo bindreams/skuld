@@ -1,0 +1,36 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Changed
+
+- **Per-test output capture now happens at the file-descriptor level instead of
+  through a tracing subscriber.** Skuld no longer installs any `tracing`
+  dispatcher during test execution, so tests are free to install their own
+  `tracing_subscriber::registry().try_init()` (or any other subscriber setup)
+  without competing with the harness. Capture is keyed on libtest-mimic's
+  `--nocapture` flag:
+
+  - default (`cargo test`): FD-level capture via `dup2` / `SetStdHandle`,
+    forced `--test-threads=1`, silent on pass, dumped on failure;
+  - `--nocapture` or `cargo nextest run`: capture disabled, default parallelism.
+
+  Fixes bindreams/hole#196, where a test installing its own
+  `tracing_subscriber::registry().try_init()` saw its events silently
+  swallowed by skuld's thread-local `set_default` subscriber.
+
+- `SKULD_DEBUG=1` environment variable emits diagnostic lines around each
+  test's execution (scope entry, capture enable/disable, body enter/exit).
+
+### Removed
+
+- `tracing` and `tracing-subscriber` are no longer runtime dependencies of the
+  skuld crate. They remain as dev-dependencies for regression tests.
+
+- The private `CaptureBuffer` / `CaptureWriter` types in `src/capture.rs` are
+  gone. No public API is affected; the module was never re-exported.

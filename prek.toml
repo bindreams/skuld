@@ -12,7 +12,12 @@ name = "no stray #[test] attribute"
 entry = '^\s*#\[test\]'
 language = "pygrep"
 types = ["rust"]
-exclude = '(_tests\.rs|/tests/)'
+# Exclude files whose purpose is specifically to use the standard libtest
+# harness:
+#   * anything matching `_tests.rs` (the project convention for
+#     skuld-harnessed unit tests — skuld itself would exclude those too)
+#   * anything under a top-level or nested `tests/` directory
+exclude = '(_tests\.rs|(^|/)tests/)'
 
 [[repos.hooks]]
 id = "cargo-fmt"

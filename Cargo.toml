@@ -18,20 +18,57 @@ clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_yml = "0.0.12"
-tracing = "0.1"
-# CRITICAL: DO NOT enable the "tracing-log" feature. It auto-installs a
-# LogTracer on the first subscriber init, which mutates log::max_level
-# globally. Downstream projects (bindreams/hole#147) have hit timeout
-# regressions on Windows CI because of that mutation. We only want the
-# env-filter + fmt layers.
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+# Cross-platform anonymous pipe primitive, used by the per-test FD capture in
+# src/capture.rs. Avoids reimplementing pipe()/CreatePipe() ourselves.
+os_pipe = "1.2"
 tokio = { version = "1", features = ["rt"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# dup/dup2/close for swapping stdout/stderr fds during per-test capture.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Two parallel fd namespaces exist on Windows:
+#   * CRT (libc::_dup/_dup2) — used by C libraries and FFI that write via stdio.
+#   * Win32 console handles (GetStdHandle/SetStdHandle) — used by Rust's own
+#     io::stdout()/io::stderr(), which bypass the CRT fd table entirely.
+# We must swap both during capture or one stream silently escapes.
+libc = "0.2"
+windows = { version = "0.62", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 skuld = { path = ".", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "time", "net", "io-util"] }
+# Regression tests install their own tracing subscribers and assert that
+# events reach them (proving skuld no longer competes). Not used by skuld
+# runtime code.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+tracing-log = "0.2"
+log = "0.4"
 
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
 harness = false
+
+# Out-of-harness subprocess tests for the FD capture CLI behavior. Uses
+# the standard libtest harness (not skuld) because skuld is the subject
+# under test. Spawns the `capture_fixture` binary and asserts on its
+# captured output.
+[[test]]
+name = "capture_cli"
+path = "tests/capture_cli.rs"
+
+# Minimal skuld-powered binary spawned by capture_cli.rs subprocess
+# tests. Not a real product binary; only exists so CARGO_BIN_EXE_*
+# resolves to a path we can feed to Command::new.
+#
+# Source lives under tests/support_bins/ (not directly in tests/) to
+# keep Cargo from auto-detecting it as an integration-test target,
+# which would collide with this [[bin]] declaration.
+[[bin]]
+name = "capture_fixture"
+path = "tests/support_bins/capture_fixture/main.rs"
+test = false
+doc = false

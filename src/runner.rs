@@ -6,21 +6,25 @@
 
 use std::io::Write;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use clap::Parser;
 use libtest_mimic::{Arguments, Trial};
-use tracing_subscriber::EnvFilter;
 
-use crate::capture::CaptureBuffer;
+use crate::capture::FdCapture;
 use crate::fixture::{cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope};
 use crate::label::{extract_label_filters, label_matches, resolve_labels, LabelSelector, ModuleLabels};
 use crate::{Ignore, TestDef};
 
 // Serial lock =========================================================================================
 
-/// Global mutex for tests marked `serial`. Ensures only one serial test runs at a time.
+/// Global mutex for tests marked `serial`. Only one serial test runs at a time.
+///
+/// Under default (capture) mode the runner forces `--test-threads=1`, so
+/// this lock is trivially uncontended. It stays because `--nocapture` with
+/// `--test-threads > 1` is still a supported mode, and serial tests must
+/// hold the invariant across parallel workers in that mode.
 static SERIAL_LOCK: Mutex<()> = Mutex::new(());
 
 /// Run `body` under the serial lock if `serial` is true, or directly otherwise.
@@ -33,75 +37,112 @@ fn run_maybe_serial(serial: bool, body: impl FnOnce()) {
     }
 }
 
+// Debug env var =======================================================================================
+
+/// Returns `true` if `SKULD_DEBUG` is set to a non-empty, non-falsy
+/// value. Cached on first call.
+///
+/// Truthy: any value other than `""`, `"0"`, `"false"`, `"no"`, `"off"`
+/// (case-insensitive). This avoids the surprise of `SKULD_DEBUG=0`
+/// enabling debug output.
+fn skuld_debug() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("SKULD_DEBUG") {
+        Ok(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            !t.is_empty() && t != "0" && t != "false" && t != "no" && t != "off"
+        }
+        Err(_) => false,
+    })
+}
+
+/// Emit a `[skuld-debug]` line when `SKULD_DEBUG=1` is set. Always writes
+/// to `io::stderr()` — which is the real stderr as long as the call
+/// happens outside an [`FdCapture`] window. Callers must arrange for that.
+macro_rules! skuld_debug_eprintln {
+    ($($arg:tt)*) => {
+        if skuld_debug() {
+            eprintln!("[skuld-debug] {}", format_args!($($arg)*));
+        }
+    };
+}
+
 // Per-test observability ==============================================================================
 
-/// Run one test body with per-test observability:
+/// Run one test body with per-test observability.
 ///
-/// 1. **Runner events** — prints `[skuld] <name>: starting` and
-///    `[skuld] <name>: pass|fail (NN ms)` to stderr unconditionally. Always
-///    visible regardless of pass/fail so per-test durations land in the
-///    normal `cargo test` output.
-/// 2. **Library tracing capture** — installs a thread-local
-///    [`tracing_subscriber::fmt`] subscriber whose writer is an in-memory
-///    buffer. On pass, the buffer is discarded. On panic, the buffer is
-///    drained to stderr with a clear header/footer before the panic is
-///    re-raised so libtest-mimic still sees the failure.
-///
-/// The subscriber is installed via
-/// [`tracing::subscriber::set_default`] which is strictly thread-local —
-/// two concurrent tests on different libtest-mimic worker threads cannot
-/// see each other's events. See [`crate::capture`] for the capture
-/// buffer design and its known limitations.
-fn run_with_observability(name: &str, serial: bool, body: impl FnOnce()) {
-    // Runner-level "starting" line. Eprintln NOT tracing, so it's visible
-    // on every run regardless of whether a subscriber is installed.
+/// Emits `[skuld] <name>: starting` and `[skuld] <name>: pass|fail (NN ms)`
+/// around the body. When `capture` is true, wraps the body in an
+/// [`FdCapture`] that redirects stdout/stderr to an in-process pipe and
+/// dumps the captured bytes to stderr on failure. When `capture` is false
+/// (user passed `--nocapture`, or running under `cargo nextest run`),
+/// the body runs with unmodified stdio and nothing intercepts its output.
+fn run_with_observability(name: &str, capture: bool, serial: bool, body: impl FnOnce()) {
+    // Runner-level "starting" line. Printed BEFORE FdCapture::begin so it
+    // lands on the real terminal stderr, not in the capture buffer.
     eprintln!("[skuld] {name}: starting");
+    skuld_debug_eprintln!("{name}: entering test scope");
     let started = Instant::now();
 
-    // Per-test capture buffer + subscriber. The subscriber lives only for
-    // the duration of `_guard`; dropping `_guard` restores whatever was
-    // default on this thread before (usually nothing).
+    // Set up capture if requested. Failure to begin a capture is
+    // fatal: the process state may be partially corrupted (especially
+    // on Windows, though `FdCapture::begin` is transactional so this
+    // should never actually leak) and running the test body with
+    // unknown stdio is worse than terminating the test run.
     //
-    // Default filter is `off` so passing runs pay ~zero subscriber cost
-    // (tracing filters events before formatting). Set `RUST_LOG=info`
-    // (or `hole_bridge=debug`, etc.) to activate capture during an
-    // investigation. This matches the industry-standard Rust test log
-    // pattern and avoids tipping the #147/#165 cumulative-overhead
-    // threshold on marginal CI runners.
-    let buffer = CaptureBuffer::new();
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("off"));
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(buffer.make_writer())
-        .with_env_filter(env_filter)
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    // The "capture enabled" debug print happens BEFORE `begin()`
+    // because after `begin()` our eprintln goes into the capture
+    // pipe, not the real stderr, and would be discarded on pass.
+    let mut capture_guard: Option<FdCapture> = None;
+    if capture {
+        skuld_debug_eprintln!("{name}: capture enabled (fd redirect)");
+        match FdCapture::begin() {
+            Ok(c) => {
+                capture_guard = Some(c);
+            }
+            Err(e) => {
+                eprintln!("[skuld] {name}: FATAL: capture setup failed: {e}");
+                eprintln!("[skuld] {name}: refusing to run test with unknown stdio state; aborting.");
+                std::process::abort();
+            }
+        }
+    }
 
-    // Catch panics so we can drain the buffer before re-raising.
+    // NOTE: between here and `capture_guard.take().end()`, writes from
+    // this thread to stdout/stderr go into the pipe. Do NOT eprintln!
+    // debug output in this window — it would land in the capture buffer.
+
     let result = catch_unwind(AssertUnwindSafe(|| run_maybe_serial(serial, body)));
 
     let duration = started.elapsed();
 
-    // Detach the subscriber BEFORE printing runner events / capture dumps
-    // so our own eprintln output doesn't recurse into the buffer.
-    drop(_guard);
+    // Restore stdio before any further diagnostic output so we print to
+    // the real terminal, not the capture buffer.
+    let captured_bytes: Vec<u8> = match capture_guard.take() {
+        Some(c) => match c.end() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("[skuld] {name}: warning: capture teardown failed: {e}");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+
+    skuld_debug_eprintln!("{name}: capture disabled");
 
     let outcome = if result.is_ok() { "pass" } else { "fail" };
     eprintln!("[skuld] {name}: {outcome} ({} ms)", duration.as_millis());
 
-    if result.is_err() {
-        let bytes = buffer.snapshot();
-        if !bytes.is_empty() {
-            eprintln!("[skuld] {name}: ---- captured tracing events ----");
-            // Best-effort raw write of the captured bytes. Errors here are
-            // themselves diagnostic noise, so we drop them.
-            let _ = std::io::stderr().write_all(&bytes);
-            // Make sure the dump ends with a newline before the footer.
-            if !bytes.ends_with(b"\n") {
-                let _ = std::io::stderr().write_all(b"\n");
-            }
-            eprintln!("[skuld] {name}: ---- end capture ----");
+    if result.is_err() && !captured_bytes.is_empty() {
+        eprintln!("[skuld] {name}: ---- captured ----");
+        // Best-effort raw write; errors here are themselves diagnostic
+        // noise and we cannot do anything useful with them.
+        let _ = std::io::stderr().write_all(&captured_bytes);
+        if !captured_bytes.ends_with(b"\n") {
+            let _ = std::io::stderr().write_all(b"\n");
         }
+        eprintln!("[skuld] {name}: ---- end capture ----");
     }
 
     if let Err(payload) = result {
@@ -188,15 +229,36 @@ impl TestRunner {
     pub fn run_tests(self) -> libtest_mimic::Conclusion {
         let (label_selectors, mut remaining_args) = extract_label_filters();
         remaining_args.retain(|a| !self.strip.contains(a));
-        let args = Arguments::parse_from(remaining_args);
+        let mut args = Arguments::parse_from(remaining_args);
+
+        // Repurpose libtest-mimic's --nocapture as the on/off switch for
+        // skuld's FD-level capture:
+        //   * default (flag unset) — capture, force single-threaded
+        //   * --nocapture (user flag or nextest) — no capture, respect
+        //     the user's test_threads setting
+        let capture = !args.nocapture;
+        if capture {
+            // FD redirect is process-wide; running tests in parallel
+            // would interleave their output into one buffer. Force
+            // single-threaded for the duration of this run.
+            args.test_threads = Some(1);
+        }
+        skuld_debug_eprintln!("run_tests: capture={} test_threads={:?}", capture, args.test_threads);
+
         let mut trials = Vec::new();
         let mut unavailable: Vec<(String, String)> = Vec::new();
 
         // Collect module-level default labels.
         let module_defaults: Vec<&ModuleLabels> = inventory::iter::<ModuleLabels>.into_iter().collect();
 
-        self.collect_inventory_tests(&label_selectors, &module_defaults, &mut trials, &mut unavailable);
-        self.collect_dynamic_tests(&label_selectors, &mut trials);
+        self.collect_inventory_tests(
+            &label_selectors,
+            &module_defaults,
+            capture,
+            &mut trials,
+            &mut unavailable,
+        );
+        self.collect_dynamic_tests(&label_selectors, capture, &mut trials);
 
         let conclusion = libtest_mimic::run(&args, trials);
 
@@ -217,6 +279,7 @@ impl TestRunner {
         &self,
         label_selectors: &[LabelSelector],
         module_defaults: &[&ModuleLabels],
+        capture: bool,
         trials: &mut Vec<Trial>,
         unavailable: &mut Vec<(String, String)>,
     ) {
@@ -254,7 +317,7 @@ impl TestRunner {
                 let is_serial = def.serial || collect_fixture_serial(def.fixture_names);
                 let observed_name = trial_name.to_string();
                 let trial = Trial::test(trial_name, move || {
-                    run_with_observability(&observed_name, is_serial, body);
+                    run_with_observability(&observed_name, capture, is_serial, body);
                     Ok(())
                 });
                 let trial = if kind.is_empty() { trial } else { trial.with_kind(kind) };
@@ -269,7 +332,7 @@ impl TestRunner {
         }
     }
 
-    fn collect_dynamic_tests(self, label_selectors: &[LabelSelector], trials: &mut Vec<Trial>) {
+    fn collect_dynamic_tests(self, label_selectors: &[LabelSelector], capture: bool, trials: &mut Vec<Trial>) {
         for dyn_test in self.dynamic {
             let dyn_labels: Vec<&str> = dyn_test.labels.iter().map(|s| s.as_str()).collect();
             if !label_selectors.is_empty() && !label_matches(&dyn_labels, label_selectors) {
@@ -283,7 +346,7 @@ impl TestRunner {
             // Acceptable because the harness runs once per process.
             let name_static: &'static str = Box::leak(dyn_test.name.into_boxed_str());
             let trial = Trial::test(name_static, move || {
-                run_with_observability(name_static, is_serial, move || {
+                run_with_observability(name_static, capture, is_serial, move || {
                     // Auto-wrap dynamic tests in a test scope so fixtures are available.
                     let _scope = enter_test_scope(name_static, "");
                     body();
