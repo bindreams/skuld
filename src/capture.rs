@@ -205,8 +205,13 @@ mod sys {
     /// Placeholder for Windows `LiveWriters`. Unix doesn't need to
     /// retain any writer clones post-swap, so this is a zero-sized
     /// type that keeps the cross-platform API symmetric.
-    #[derive(Default)]
     pub(super) struct LiveWriters;
+
+    impl LiveWriters {
+        pub(super) fn new() -> Self {
+            Self
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -439,10 +444,18 @@ mod sys {
     /// Writers that must stay alive as long as the Win32 stdio HANDLEs
     /// point at them. Dropped after `restore` reassigns the HANDLEs to
     /// the saved values.
-    #[derive(Default)]
     pub(super) struct LiveWriters {
         pub stdout_handle_writer: Option<PipeWriter>,
         pub stderr_handle_writer: Option<PipeWriter>,
+    }
+
+    impl LiveWriters {
+        pub(super) fn new() -> Self {
+            Self {
+                stdout_handle_writer: None,
+                stderr_handle_writer: None,
+            }
+        }
     }
 }
 
@@ -487,7 +500,7 @@ impl FdCapture {
         let saved = sys::save()?;
         let (reader, writer) = os_pipe::pipe()?;
 
-        let mut live = sys::LiveWriters::default();
+        let mut live = sys::LiveWriters::new();
 
         if let Err(e) = sys::redirect_to_pipe(writer, &mut live, &saved) {
             // `redirect_to_pipe` is transactional: on Err the process
@@ -556,7 +569,7 @@ impl FdCapture {
 
         // Restore succeeded. It is now safe to drop the Win32-stdio-
         // backing pipe writers (on Unix this is a no-op ZST).
-        self.live = sys::LiveWriters::default();
+        self.live = sys::LiveWriters::new();
 
         // The reader thread is still draining. Now that no one holds a
         // pipe write reference in this process, the reader will see
@@ -593,7 +606,7 @@ impl Drop for FdCapture {
 
         // Restore succeeded. On Windows, drop the live writer handles
         // (on Unix this is a no-op).
-        self.live = sys::LiveWriters::default();
+        self.live = sys::LiveWriters::new();
 
         // Reader thread: drop its JoinHandle without joining. Detaching
         // avoids blocking the unwind path on a slow reader. If the
