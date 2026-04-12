@@ -240,7 +240,7 @@ fn my_test(#[fixture] env: &EnvGuard) {
 }
 ```
 
-All serial tests run under a single global mutex. Non-serial tests are unaffected and may still run in parallel.
+All serial tests run under a cross-process file lock (`target/{profile}/.skuld-serial.lock`). Under `cargo test` the lock is trivially uncontended; under `cargo nextest run` (process-per-test) it serializes across processes automatically. Non-serial tests are unaffected and may still run in parallel.
 
 ## Dynamic tests
 
@@ -268,7 +268,7 @@ fn main() {
 
 Under `cargo test`, skuld captures each test's `stdout` and `stderr` via a file-descriptor redirect (`dup2` on Unix; `SetStdHandle` + `_dup2` on Windows). On pass the captured bytes are discarded; on failure they are dumped to the real `stderr` between `---- captured ----` markers, followed by the panic. The capture intercepts at the FD level, so every write — `println!`, `eprintln!`, raw `io::stdout().write_all`, FFI output, tracing subscribers installed by the test body, and even output from spawned child processes — is captured. Tests are free to install their own `tracing_subscriber::registry().try_init()` and skuld stays out of the dispatch path entirely.
 
-Because FD redirect is a process-wide operation, capture mode forces `--test-threads=1`. For parallel execution, either run with `--nocapture` or use `cargo nextest run` (recommended for large suites — nextest runs each test in its own subprocess and captures via OS pipes externally, so skuld's in-process redirect is unnecessary and disabled automatically).
+Because FD redirect is a process-wide operation, capture mode forces `--test-threads=1`. For parallel execution, either run with `--nocapture` or use `cargo nextest run` (recommended for large suites — nextest runs each test in its own subprocess and captures via OS pipes externally, so skuld's in-process redirect is unnecessary and disabled automatically). Serial tests are safe under nextest: the `serial` lock uses a cross-process file lock, so `#[skuld::test(serial)]` correctly serializes even when nextest spawns separate processes.
 
 ```bash
 cargo test                      # default: FD capture, serial, silent on pass
