@@ -6,7 +6,7 @@
 
 use std::io::Write;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use clap::Parser;
@@ -17,20 +17,108 @@ use crate::fixture::{cleanup_process_fixtures, collect_fixture_requires, collect
 use crate::label::{extract_label_filters, label_matches, resolve_labels, LabelSelector, ModuleLabels};
 use crate::{Ignore, TestDef};
 
-// Serial lock =========================================================================================
+// Serial lock =====
 
-/// Global mutex for tests marked `serial`. Only one serial test runs at a time.
+/// Acquire an exclusive, blocking, cross-process file lock.
 ///
-/// Under default (capture) mode the runner forces `--test-threads=1`, so
-/// this lock is trivially uncontended. It stays because `--nocapture` with
-/// `--test-threads > 1` is still a supported mode, and serial tests must
-/// hold the invariant across parallel workers in that mode.
-static SERIAL_LOCK: Mutex<()> = Mutex::new(());
+/// Uses `flock(LOCK_EX)` on Unix and `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK)`
+/// on Windows. The OS automatically releases the lock when the process exits
+/// (including crashes), so no manual cleanup is needed.
+fn lock_exclusive(file: &std::fs::File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        assert!(ret == 0, "skuld: flock failed: {}", std::io::Error::last_os_error());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+        use windows::Win32::System::IO::OVERLAPPED;
+
+        let handle = HANDLE(file.as_raw_handle() as _);
+        let mut overlapped = OVERLAPPED::default();
+        unsafe {
+            LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, None, !0, !0, &mut overlapped)
+                .expect("skuld: LockFileEx failed");
+        }
+    }
+}
+
+/// Release a file lock previously acquired by [`lock_exclusive`].
+fn unlock(file: &std::fs::File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        assert!(
+            ret == 0,
+            "skuld: flock(LOCK_UN) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::UnlockFile;
+
+        let handle = HANDLE(file.as_raw_handle() as _);
+        unsafe {
+            UnlockFile(handle, 0, 0, !0, !0).expect("skuld: UnlockFile failed");
+        }
+    }
+}
+
+/// RAII guard that holds both the in-process [`Mutex`] and the cross-process
+/// file lock. Dropping it releases the file lock first, then the mutex.
+struct SerialGuard {
+    // Option so we can take the MutexGuard in drop without moving out of self.
+    inner: Option<std::sync::MutexGuard<'static, std::fs::File>>,
+}
+
+impl Drop for SerialGuard {
+    fn drop(&mut self) {
+        if let Some(guard) = self.inner.take() {
+            unlock(&guard);
+            // MutexGuard drops here, releasing the in-process lock.
+        }
+    }
+}
+
+/// File-backed serial lock shared across all test processes in this build
+/// profile.
+///
+/// The lock file lives at `target/{profile}/.skuld-serial.lock`, resolved
+/// at compile time from `OUT_DIR` so it works correctly with custom target
+/// dirs. Under `cargo test` (single process, `--test-threads=1`), the lock
+/// is trivially uncontended. Under `cargo nextest run` (process-per-test),
+/// the file lock serializes across processes.
+fn acquire_serial_lock() -> SerialGuard {
+    use std::sync::Mutex;
+
+    static LOCK: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+    let mtx = LOCK.get_or_init(|| {
+        let lock_path = std::path::Path::new(env!("SKULD_TARGET_PROFILE_DIR")).join(".skuld-serial.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap_or_else(|e| panic!("skuld: failed to open serial lock at {lock_path:?}: {e}"));
+        Mutex::new(file)
+    });
+    let guard = mtx.lock().unwrap_or_else(|e| e.into_inner());
+    lock_exclusive(&guard);
+    SerialGuard { inner: Some(guard) }
+}
 
 /// Run `body` under the serial lock if `serial` is true, or directly otherwise.
 fn run_maybe_serial(serial: bool, body: impl FnOnce()) {
     if serial {
-        let _guard = SERIAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = acquire_serial_lock();
         body();
     } else {
         body();
