@@ -17,6 +17,36 @@ use crate::fixture::{cleanup_process_fixtures, collect_fixture_requires, collect
 use crate::label::{label_matches, read_label_filter, resolve_labels, validate_labels, Label, ModuleLabels};
 use crate::{Ignore, TestDef};
 
+// Debug env var =====
+
+/// Returns `true` if `SKULD_DEBUG` is set to a non-empty, non-falsy
+/// value. Cached on first call.
+///
+/// Truthy: any value other than `""`, `"0"`, `"false"`, `"no"`, `"off"`
+/// (case-insensitive). This avoids the surprise of `SKULD_DEBUG=0`
+/// enabling debug output.
+fn skuld_debug() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("SKULD_DEBUG") {
+        Ok(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            !t.is_empty() && t != "0" && t != "false" && t != "no" && t != "off"
+        }
+        Err(_) => false,
+    })
+}
+
+/// Emit a `[skuld-debug]` line when `SKULD_DEBUG=1` is set. Always writes
+/// to `io::stderr()` — which is the real stderr as long as the call
+/// happens outside an [`FdCapture`] window. Callers must arrange for that.
+macro_rules! skuld_debug_eprintln {
+    ($($arg:tt)*) => {
+        if skuld_debug() {
+            eprintln!("[skuld-debug] {}", format_args!($($arg)*));
+        }
+    };
+}
+
 // Serial lock =====
 
 /// Acquire an exclusive, blocking, cross-process file lock.
@@ -82,6 +112,7 @@ struct SerialGuard {
 impl Drop for SerialGuard {
     fn drop(&mut self) {
         if let Some(guard) = self.inner.take() {
+            skuld_debug_eprintln!("serial: releasing file lock");
             unlock(&guard);
             // MutexGuard drops here, releasing the in-process lock.
         }
@@ -99,19 +130,30 @@ impl Drop for SerialGuard {
 fn acquire_serial_lock() -> SerialGuard {
     use std::sync::Mutex;
 
-    static LOCK: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
-    let mtx = LOCK.get_or_init(|| {
-        let lock_path = std::path::Path::new(env!("SKULD_TARGET_PROFILE_DIR")).join(".skuld-serial.lock");
+    struct LockState {
+        mtx: Mutex<std::fs::File>,
+        path: std::path::PathBuf,
+    }
+
+    static STATE: OnceLock<LockState> = OnceLock::new();
+    let state = STATE.get_or_init(|| {
+        let path = std::path::Path::new(env!("SKULD_TARGET_PROFILE_DIR")).join(".skuld-serial.lock");
+        skuld_debug_eprintln!("serial: lock file at {path:?}");
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(&lock_path)
-            .unwrap_or_else(|e| panic!("skuld: failed to open serial lock at {lock_path:?}: {e}"));
-        Mutex::new(file)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("skuld: failed to open serial lock at {path:?}: {e}"));
+        LockState {
+            mtx: Mutex::new(file),
+            path,
+        }
     });
-    let guard = mtx.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = state.mtx.lock().unwrap_or_else(|e| e.into_inner());
+    skuld_debug_eprintln!("serial: acquiring file lock at {:?}...", state.path);
     lock_exclusive(&guard);
+    skuld_debug_eprintln!("serial: lock acquired at {:?}", state.path);
     SerialGuard { inner: Some(guard) }
 }
 
@@ -123,36 +165,6 @@ pub(crate) fn run_maybe_serial(serial: bool, body: impl FnOnce()) {
     } else {
         body();
     }
-}
-
-// Debug env var =======================================================================================
-
-/// Returns `true` if `SKULD_DEBUG` is set to a non-empty, non-falsy
-/// value. Cached on first call.
-///
-/// Truthy: any value other than `""`, `"0"`, `"false"`, `"no"`, `"off"`
-/// (case-insensitive). This avoids the surprise of `SKULD_DEBUG=0`
-/// enabling debug output.
-fn skuld_debug() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("SKULD_DEBUG") {
-        Ok(v) => {
-            let t = v.trim().to_ascii_lowercase();
-            !t.is_empty() && t != "0" && t != "false" && t != "no" && t != "off"
-        }
-        Err(_) => false,
-    })
-}
-
-/// Emit a `[skuld-debug]` line when `SKULD_DEBUG=1` is set. Always writes
-/// to `io::stderr()` — which is the real stderr as long as the call
-/// happens outside an [`FdCapture`] window. Callers must arrange for that.
-macro_rules! skuld_debug_eprintln {
-    ($($arg:tt)*) => {
-        if skuld_debug() {
-            eprintln!("[skuld-debug] {}", format_args!($($arg)*));
-        }
-    };
 }
 
 // Per-test observability ==============================================================================
