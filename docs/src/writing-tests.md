@@ -8,7 +8,7 @@ Every test function must be annotated with `#[skuld::test]`. The attribute regis
 #[skuld::test]                                     // no options
 #[skuld::test(requires = [valgrind, my_binary])]   // runtime preconditions
 #[skuld::test(name = "custom display name")]        // custom name in output
-#[skuld::test(labels = [docker, slow])]             // labels for filtering
+#[skuld::test(labels = [DOCKER, SLOW])]             // labels for filtering
 #[skuld::test(ignore)]                              // statically ignored
 #[skuld::test(ignore = "blocked on #123")]          // ignored with reason
 #[skuld::test(serial)]                              // run under global mutex
@@ -17,7 +17,7 @@ Every test function must be annotated with `#[skuld::test]`. The attribute regis
 Options can be combined:
 
 ```rust
-#[skuld::test(requires = [docker], labels = [integration], serial)]
+#[skuld::test(requires = [docker], labels = [INTEGRATION], serial)]
 fn heavy_test() { /* ... */ }
 ```
 

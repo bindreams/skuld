@@ -2,8 +2,15 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+skuld::new_label!(SMOKE, "smoke");
+skuld::new_label!(UNIT, "unit");
+skuld::new_label!(CUSTOM, "custom");
+
+// Exercise get_label! — references "smoke" defined above.
+skuld::get_label!(SMOKE_ALIAS, "smoke");
+
 // Set default labels for this module.
-skuld::default_labels!(smoke, unit);
+skuld::default_labels!(SMOKE, UNIT);
 
 static INHERITED_RAN: AtomicU32 = AtomicU32::new(0);
 static EXPLICIT_RAN: AtomicU32 = AtomicU32::new(0);
@@ -16,7 +23,7 @@ fn label_inherited() {
 }
 
 /// Explicit labels → gets [custom], NOT [smoke, unit, custom].
-#[skuld::test(labels = [custom])]
+#[skuld::test(labels = [CUSTOM])]
 fn label_explicit() {
     EXPLICIT_RAN.fetch_add(1, Ordering::Relaxed);
 }
@@ -25,6 +32,13 @@ fn label_explicit() {
 #[skuld::test(labels = [])]
 fn label_optout() {
     OPTOUT_RAN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Verify that get_label! produces a Label equal to the new_label! original.
+#[skuld::test]
+fn get_label_equals_new_label() {
+    assert_eq!(SMOKE_ALIAS, SMOKE);
+    assert_eq!(SMOKE_ALIAS.name(), "smoke");
 }
 
 pub fn assert_all_ran() {

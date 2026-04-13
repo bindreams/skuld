@@ -14,7 +14,7 @@ use libtest_mimic::{Arguments, Trial};
 
 use crate::capture::FdCapture;
 use crate::fixture::{cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope};
-use crate::label::{extract_label_filters, label_matches, resolve_labels, LabelSelector, ModuleLabels};
+use crate::label::{label_matches, read_label_filter, resolve_labels, validate_labels, Label, ModuleLabels};
 use crate::{Ignore, TestDef};
 
 // Serial lock =====
@@ -245,7 +245,7 @@ struct DynTest {
     name: String,
     ignored: bool,
     serial: bool,
-    labels: Vec<String>,
+    labels: Vec<Label>,
     body: Box<dyn FnOnce() + Send + 'static>,
 }
 
@@ -278,7 +278,7 @@ impl TestRunner {
     pub fn add(
         &mut self,
         name: impl Into<String>,
-        labels: &[&str],
+        labels: &[Label],
         ignored: bool,
         body: impl FnOnce() + Send + 'static,
     ) {
@@ -286,7 +286,7 @@ impl TestRunner {
             name: name.into(),
             ignored,
             serial: false,
-            labels: labels.iter().map(|s| s.to_string()).collect(),
+            labels: labels.to_vec(),
             body: Box::new(body),
         });
     }
@@ -295,7 +295,7 @@ impl TestRunner {
     pub fn add_serial(
         &mut self,
         name: impl Into<String>,
-        labels: &[&str],
+        labels: &[Label],
         ignored: bool,
         body: impl FnOnce() + Send + 'static,
     ) {
@@ -303,7 +303,7 @@ impl TestRunner {
             name: name.into(),
             ignored,
             serial: true,
-            labels: labels.iter().map(|s| s.to_string()).collect(),
+            labels: labels.to_vec(),
             body: Box::new(body),
         });
     }
@@ -315,7 +315,9 @@ impl TestRunner {
 
     /// Run all tests and return the conclusion for post-run assertions.
     pub fn run_tests(self) -> libtest_mimic::Conclusion {
-        let (label_selectors, mut remaining_args) = extract_label_filters();
+        validate_labels();
+        let label_filter = read_label_filter();
+        let mut remaining_args: Vec<String> = std::env::args().collect();
         remaining_args.retain(|a| !self.strip.contains(a));
         let mut args = Arguments::parse_from(remaining_args);
 
@@ -340,13 +342,13 @@ impl TestRunner {
         let module_defaults: Vec<&ModuleLabels> = inventory::iter::<ModuleLabels>.into_iter().collect();
 
         self.collect_inventory_tests(
-            &label_selectors,
+            label_filter.as_deref(),
             &module_defaults,
             capture,
             &mut trials,
             &mut unavailable,
         );
-        self.collect_dynamic_tests(&label_selectors, capture, &mut trials);
+        self.collect_dynamic_tests(label_filter.as_deref(), capture, &mut trials);
 
         let conclusion = libtest_mimic::run(&args, trials);
 
@@ -365,7 +367,7 @@ impl TestRunner {
 
     fn collect_inventory_tests(
         &self,
-        label_selectors: &[LabelSelector],
+        label_filter: Option<&[String]>,
         module_defaults: &[&ModuleLabels],
         capture: bool,
         trials: &mut Vec<Trial>,
@@ -373,21 +375,17 @@ impl TestRunner {
     ) {
         for def in inventory::iter::<TestDef> {
             let resolved = resolve_labels(def, module_defaults);
-            let resolved_refs: Vec<&str> = resolved.iter().map(|s| s.as_str()).collect();
 
             // Label filtering — skip entirely (not ignored, just absent).
-            if !label_selectors.is_empty() && !label_matches(&resolved_refs, label_selectors) {
+            if !label_matches(&resolved, label_filter) {
                 continue;
             }
 
             let trial_name = def.display_name.unwrap_or(def.name);
-            let kind = resolved.join(":");
 
             // Static ignore — don't check preconditions, don't report as unavailable.
             if !matches!(def.ignore, Ignore::No) {
-                let trial = Trial::test(trial_name, || Ok(())).with_ignored_flag(true);
-                let trial = if kind.is_empty() { trial } else { trial.with_kind(kind) };
-                trials.push(trial);
+                trials.push(Trial::test(trial_name, || Ok(())).with_ignored_flag(true));
                 continue;
             }
 
@@ -404,46 +402,40 @@ impl TestRunner {
                 let body = def.body;
                 let is_serial = def.serial || collect_fixture_serial(def.fixture_names);
                 let observed_name = trial_name.to_string();
-                let trial = Trial::test(trial_name, move || {
+                trials.push(Trial::test(trial_name, move || {
                     run_with_observability(&observed_name, capture, is_serial, body);
                     Ok(())
-                });
-                let trial = if kind.is_empty() { trial } else { trial.with_kind(kind) };
-                trials.push(trial);
+                }));
             } else {
                 let reason = reasons.join("; ");
                 unavailable.push((trial_name.to_string(), reason));
-                let trial = Trial::test(trial_name, || Ok(())).with_ignored_flag(true);
-                let trial = if kind.is_empty() { trial } else { trial.with_kind(kind) };
-                trials.push(trial);
+                trials.push(Trial::test(trial_name, || Ok(())).with_ignored_flag(true));
             }
         }
     }
 
-    fn collect_dynamic_tests(self, label_selectors: &[LabelSelector], capture: bool, trials: &mut Vec<Trial>) {
+    fn collect_dynamic_tests(self, label_filter: Option<&[String]>, capture: bool, trials: &mut Vec<Trial>) {
         for dyn_test in self.dynamic {
-            let dyn_labels: Vec<&str> = dyn_test.labels.iter().map(|s| s.as_str()).collect();
-            if !label_selectors.is_empty() && !label_matches(&dyn_labels, label_selectors) {
+            if !label_matches(&dyn_test.labels, label_filter) {
                 continue;
             }
 
-            let kind = dyn_test.labels.join(":");
             let body = dyn_test.body;
             let is_serial = dyn_test.serial;
             // Intentional leak: dynamic test names need 'static lifetime for enter_test_scope.
             // Acceptable because the harness runs once per process.
             let name_static: &'static str = Box::leak(dyn_test.name.into_boxed_str());
-            let trial = Trial::test(name_static, move || {
-                run_with_observability(name_static, capture, is_serial, move || {
-                    // Auto-wrap dynamic tests in a test scope so fixtures are available.
-                    let _scope = enter_test_scope(name_static, "");
-                    body();
-                });
-                Ok(())
-            })
-            .with_ignored_flag(dyn_test.ignored);
-            let trial = if kind.is_empty() { trial } else { trial.with_kind(kind) };
-            trials.push(trial);
+            trials.push(
+                Trial::test(name_static, move || {
+                    run_with_observability(name_static, capture, is_serial, move || {
+                        // Auto-wrap dynamic tests in a test scope so fixtures are available.
+                        let _scope = enter_test_scope(name_static, "");
+                        body();
+                    });
+                    Ok(())
+                })
+                .with_ignored_flag(dyn_test.ignored),
+            );
         }
     }
 }

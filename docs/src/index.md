@@ -1,12 +1,12 @@
 :::{toctree}
 :hidden:
 getting-started.md
-Writing Tests <writing-tests.md>
-Fixtures <fixtures.md>
-Labels <labels.md>
-Serial Tests <serial.md>
-Dynamic Tests <dynamic-tests.md>
-License <license.md>
+Writing Tests \<writing-tests.md>
+Fixtures \<fixtures.md>
+Labels \<labels.md>
+Serial Tests \<serial.md>
+Dynamic Tests \<dynamic-tests.md>
+License \<license.md>
 GitHub Repository <https://github.com/AZhukova/skuld>
 :::
 
@@ -22,7 +22,7 @@ Get started with the [Getting Started](getting-started.md) guide.
 
 - **Runtime preconditions** — declare what a test needs; unmet preconditions produce `ignored`, not failures.
 - **Fixture injection** — dependency-injected test resources with three lifetime scopes.
-- **Label filtering** — tag tests and filter from the command line with `--label`.
+- **Label filtering** — tag tests with sentinel `Label` values and filter via the `SKULD_LABELS` environment variable.
 - **Serial tests** — tests that touch process-global state run under a mutex.
 - **Dynamic tests** — generate tests at runtime from data files or other sources.
 - **Unavailability reporting** — a summary after the test run shows exactly what's missing.
@@ -30,8 +30,8 @@ Get started with the [Getting Started](getting-started.md) guide.
 ## How it works
 
 1. `#[skuld::test]` is a proc macro that preserves the original function and appends an `inventory::submit!` call to register it with the harness.
-2. `run_all()` (or `TestRunner::run_tests()`) iterates all registered tests, checks preconditions and fixture requirements at runtime, and builds `libtest-mimic::Trial`s — marking unmet tests as ignored.
-3. After `libtest-mimic::run()` completes, the unavailability summary is printed to stderr.
+1. `run_all()` (or `TestRunner::run_tests()`) iterates all registered tests, checks preconditions and fixture requirements at runtime, and builds `libtest-mimic::Trial`s — marking unmet tests as ignored.
+1. After `libtest-mimic::run()` completes, the unavailability summary is printed to stderr.
 
 ## License
 

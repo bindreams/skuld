@@ -12,7 +12,7 @@ use syn::{
 struct TestArgs {
     requires: Vec<Path>,
     name: Option<String>,
-    labels: Option<Vec<Ident>>,
+    labels: Option<Vec<Path>>,
     ignore: IgnoreArg,
     serial: bool,
     should_panic: ShouldPanicArg,
@@ -63,7 +63,7 @@ impl Parse for TestArgs {
                     let content;
                     bracketed!(content in input);
                     args.labels = Some(
-                        Punctuated::<Ident, Token![,]>::parse_terminated(&content)?
+                        Punctuated::<Path, Token![,]>::parse_terminated(&content)?
                             .into_iter()
                             .collect(),
                     );
@@ -247,7 +247,7 @@ fn binding_to_name(pat: &syn::Pat) -> String {
 /// or the explicit name in `#[fixture(name)]`.
 ///
 /// ```ignore
-/// #[skuld::test(requires = [preconditions::valgrind], labels = [slow])]
+/// #[skuld::test(requires = [preconditions::valgrind], labels = [SLOW])]
 /// fn my_test(#[fixture(temp_dir)] dir: &Path) { /* ... */ }
 /// ```
 #[proc_macro_attribute]
@@ -272,12 +272,7 @@ fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
 
     let display_name_expr = build_display_name(&args.name);
     let labels_explicit = args.labels.is_some();
-    let label_strs: Vec<String> = args
-        .labels
-        .unwrap_or_default()
-        .iter()
-        .map(|id| id.to_string())
-        .collect();
+    let label_paths: Vec<Path> = args.labels.unwrap_or_default();
     let ignore_expr = match &args.ignore {
         IgnoreArg::No => quote! { ::skuld::Ignore::No },
         IgnoreArg::Yes => quote! { ::skuld::Ignore::Yes },
@@ -452,7 +447,7 @@ fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
             requires: &[#(#req_exprs),*],
             fixture_names: &[#(#fixture_name_strs),*],
             ignore: #ignore_expr,
-            labels: &[#(#label_strs),*],
+            labels: &[#(#label_paths),*],
             labels_explicit: #labels_explicit,
             serial: #serial,
             should_panic: #should_panic_expr,

@@ -28,7 +28,7 @@ pub use fixtures::cwd::{cwd, CwdGuard};
 pub use fixtures::env::{env, EnvGuard};
 pub use fixtures::temp_dir::{temp_dir, TempDir};
 pub use fixtures::test_name::{test_name, TestName};
-pub use label::ModuleLabels;
+pub use label::{Label, LabelEntry, LabelEntryKind, ModuleLabels};
 pub use metadata::{FixtureMetadata, RequirementInfo, TestMetadata};
 pub use probe::{probe_executable, probe_path};
 pub use runner::{run_all, TestRunner};
@@ -120,8 +120,8 @@ pub struct TestDef {
     /// Used for transitive requirement collection via [`collect_fixture_requires`].
     pub fixture_names: &'static [&'static str],
     pub ignore: Ignore,
-    /// Labels for filtering. Stored in libtest-mimic's `kind` field joined by `:`.
-    pub labels: &'static [&'static str],
+    /// Labels for filtering.
+    pub labels: &'static [Label],
     /// Whether `labels = [...]` was explicitly written (even if empty).
     /// When false, module-level defaults from `default_labels!` apply.
     pub labels_explicit: bool,

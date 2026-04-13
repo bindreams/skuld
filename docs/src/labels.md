@@ -1,52 +1,69 @@
 # Labels
 
-Tests can be labeled for selective execution from the command line.
+Labels are sentinel values for tagging and filtering tests.
+
+## Defining labels
+
+Use `new_label!` to define a label constant:
+
+```rust
+skuld::new_label!(pub DOCKER, "docker");
+skuld::new_label!(pub SLOW, "slow");
+skuld::new_label!(pub UNIT, "unit");
+```
+
+To reference a label defined elsewhere (e.g. in another crate), use `get_label!`:
+
+```rust
+skuld::get_label!(pub DOCKER, "docker"); // must have a new_label!("docker") somewhere
+```
+
+At startup, skuld validates that:
+
+- No two `new_label!` calls share the same name (panics with both source locations).
+- Every `get_label!` has a matching `new_label!` (panics with the orphan's location).
 
 ## Labeling tests
 
-Add labels with the `labels` option:
+Pass label constants to the `labels` option:
 
 ```rust
-#[skuld::test(labels = [docker, slow])]
+#[skuld::test(labels = [DOCKER, SLOW])]
 fn heavy_test() { /* ... */ }
 
-#[skuld::test(labels = [unit])]
+#[skuld::test(labels = [UNIT])]
 fn fast_test() { /* ... */ }
 ```
 
-## Filtering from the command line
+## Filtering with `SKULD_LABELS`
 
-Use `--label` to filter tests. Arguments after `--` are passed to the test binary:
-
-```bash
-cargo test -- --label docker          # run only tests labeled "docker"
-cargo test -- --label=docker,!slow    # docker tests, excluding slow ones
-cargo test -- --label unit            # only unit tests
-```
-
-**Filtering rules:**
-- **Includes** form a union: the test must match **any** include.
-- **Excludes** subtract: the test must not match **any** exclude (prefix with `!`).
-- **No includes** → all tests are included by default.
-- **No selectors** → all tests pass the filter.
-
-Multiple `--label` flags are supported:
+Set the `SKULD_LABELS` environment variable to filter tests at collection time. Tests not matching the filter do not appear at all (not ignored — absent):
 
 ```bash
-cargo test -- --label docker --label integration    # union of both
+SKULD_LABELS=docker cargo test           # only tests labeled "docker"
+SKULD_LABELS=docker,slow cargo test      # tests labeled "docker" OR "slow"
 ```
+
+**Semantics:**
+
+- **Unset** → no filtering, all tests run.
+- **Empty (`""`)** → empty filter, no tests match.
+- **Comma-separated** → include-only, union: test must have at least one matching label.
 
 ## Module-level defaults
 
 Use `default_labels!` to set default labels for all `#[skuld::test]` functions in a module:
 
 ```rust
-skuld::default_labels!(smoke, unit);
+skuld::new_label!(pub SMOKE, "smoke");
+skuld::new_label!(pub UNIT, "unit");
+skuld::new_label!(pub SLOW, "slow");
+skuld::default_labels!(SMOKE, UNIT);
 
-#[skuld::test]                      // inherits [smoke, unit]
+#[skuld::test]                      // inherits [SMOKE, UNIT]
 fn test_a() { /* ... */ }
 
-#[skuld::test(labels = [slow])]     // gets [slow], NOT [smoke, unit, slow]
+#[skuld::test(labels = [SLOW])]     // gets [SLOW], NOT [SMOKE, UNIT, SLOW]
 fn test_b() { /* ... */ }
 
 #[skuld::test(labels = [])]         // gets nothing (explicit opt-out)

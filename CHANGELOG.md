@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Startup validation panics with source locations (`file:line:column`) if
+  duplicate `new_label!` definitions or orphan `get_label!` references exist.
+
 ### Changed
+
+- **Labels are now sentinel values (`Label` type) instead of plain strings.**
+  Use `new_label!` to define label constants, `get_label!` to reference labels
+  defined elsewhere. `#[skuld::test(labels = [...])]` now accepts `Label`
+  constant paths instead of bare identifiers. `default_labels!` likewise accepts
+  `Label` paths. `TestRunner::add`/`add_serial` take `&[Label]` instead of
+  `&[&str]`.
+
+- **Label filtering uses `SKULD_LABELS` env var instead of `--label` CLI flag.**
+  Unset = no filtering; empty = no tests match; comma-separated = union of
+  includes.
 
 - **Per-test output capture now happens at the file-descriptor level instead of
   through a tracing subscriber.** Skuld no longer installs any `tracing`
@@ -28,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test's execution (scope entry, capture enable/disable, body enter/exit).
 
 ### Removed
+
+- Labels no longer appear in test output names (the libtest-mimic `kind` field
+  is no longer set).
+
+- The `--label` CLI flag is removed. Use `SKULD_LABELS` env var instead.
 
 - `tracing` and `tracing-subscriber` are no longer runtime dependencies of the
   skuld crate. They remain as dev-dependencies for regression tests.
