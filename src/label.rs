@@ -28,6 +28,7 @@ pub struct Label {
 impl Label {
     #[doc(hidden)]
     pub const fn __new(name: &'static str) -> Self {
+        validate_label_name(name);
         Self { name }
     }
 
@@ -110,6 +111,30 @@ macro_rules! get_label {
 
 // Label validation =====
 
+/// Validate that a label name follows Rust identifier rules (ASCII subset).
+///
+/// Must start with `[a-zA-Z_]`, followed by `[a-zA-Z0-9_]`.
+/// Panics with a descriptive message. When called from a const context
+/// (e.g. `new_label!`), this becomes a compile-time error.
+pub(crate) const fn validate_label_name(name: &str) {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() {
+        panic!("invalid label name: must not be empty");
+    }
+    let first = bytes[0];
+    if !((first >= b'a' && first <= b'z') || (first >= b'A' && first <= b'Z') || first == b'_') {
+        panic!("invalid label name: must start with an ASCII letter or underscore");
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !((b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || (b >= b'0' && b <= b'9') || b == b'_') {
+            panic!("invalid label name: must contain only ASCII letters, digits, and underscores");
+        }
+        i += 1;
+    }
+}
+
 /// Validate all label registrations. Called at the start of
 /// [`TestRunner::run_tests()`](crate::runner::TestRunner::run_tests).
 ///
@@ -167,26 +192,6 @@ pub(crate) fn check_label_registry() -> Result<(), String> {
         if !definitions.contains_key(entry.name) {
             errors.push(format!(
                 "get_label!({:?}) at {}:{}:{} has no corresponding new_label! definition",
-                entry.name, entry.file, entry.line, entry.column
-            ));
-        }
-    }
-
-    // Validate that label names are filterable by the SKULD_LABELS expression grammar.
-    // The grammar's `label` rule accepts [A-Za-z0-9_-]+ only.
-    for entry in inventory::iter::<LabelEntry> {
-        if entry.kind != LabelEntryKind::New {
-            continue;
-        }
-        if entry.name.is_empty()
-            || !entry
-                .name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            errors.push(format!(
-                "label {:?} at {}:{}:{} contains characters not supported by SKULD_LABELS filtering \
-                 (only ASCII alphanumeric, '_', and '-' are allowed)",
                 entry.name, entry.file, entry.line, entry.column
             ));
         }

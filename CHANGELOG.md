@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Label` paths. `TestRunner::add`/`add_serial` take `&[Label]` instead of
   `&[&str]`.
 
+- **Label names are now restricted to Rust identifier syntax** (ASCII letters,
+  digits, underscore; must not start with a digit). Names with hyphens or
+  leading digits are no longer accepted. Invalid names in `new_label!` /
+  `get_label!` are caught at compile time; invalid names in `SKULD_LABELS` are
+  caught at parse time.
+
 - **Label filtering uses `SKULD_LABELS` env var with boolean expression syntax.**
   Supports `&` (AND), `|` (OR), `!` (NOT), and parenthesized grouping.
   Precedence: `!` > `&` > `|`. Unset = no filtering, all tests run.

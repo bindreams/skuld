@@ -1,0 +1,16 @@
+error[E0080]: evaluation panicked: invalid label name: must contain only ASCII letters, digits, and underscores
+ --> tests/compile_fail/get_label_invalid_name.rs:1:1
+  |
+1 | skuld::get_label!(pub BAD, "bad-name");
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `BAD` failed inside this call
+  |
+note: inside `Label::__new`
+ --> src/label.rs
+  |
+  |         validate_label_name(name);
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+note: inside `label::validate_label_name`
+ --> src/label.rs
+  |
+  |             panic!("invalid label name: must contain only ASCII letters, digits, and underscores");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
