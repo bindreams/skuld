@@ -19,6 +19,8 @@ pub mod label;
 pub mod metadata;
 pub mod probe;
 pub mod runner;
+#[cfg(test)]
+mod runner_tests;
 
 pub use fixture::{
     cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope, fixture, fixture_get,
