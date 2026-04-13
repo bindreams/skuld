@@ -59,13 +59,14 @@ hooks = [
 ]
 
 [[repos]]
-repo = "https://github.com/hukkin/mdformat"
-rev = "0.7.21"
+# Using prettier instead of mdformat because prettier preserves the
+# `  ` (two-space) trailing-whitespace line break style instead of
+# rewriting it to `\`. That matters for files like LICENSE.md whose
+# byte identity is conventional.
+repo = "https://github.com/rbubley/mirrors-prettier"
+rev = "v3.8.2"
 hooks = [
-  # Exclude LICENSE.md: license text is canonical and should not be
-  # reformatted (mdformat would convert asterisk bullets to hyphens and
-  # double-space line breaks to backslash line breaks).
-  { id = "mdformat", additional_dependencies = ["mdformat-gfm"], exclude = '^LICENSE\.md$' },
+  { id = "prettier", types = ["markdown"] },
 ]
 
 [[repos]]

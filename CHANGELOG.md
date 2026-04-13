@@ -61,7 +61,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tracing_subscriber::registry().try_init()` (or any other subscriber setup)
   without competing with the harness. Capture is keyed on libtest-mimic's
   `--nocapture` flag:
-
   - default (`cargo test`): FD-level capture via `dup2` / `SetStdHandle`,
     forced `--test-threads=1`, silent on pass, dumped on failure;
   - `--nocapture` or `cargo nextest run`: capture disabled, default parallelism.
