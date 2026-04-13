@@ -17,7 +17,6 @@ pub mod fixture;
 pub mod fixtures;
 pub mod label;
 pub mod metadata;
-pub mod probe;
 pub mod runner;
 #[cfg(test)]
 mod runner_tests;
@@ -32,7 +31,6 @@ pub use fixtures::temp_dir::{temp_dir, TempDir};
 pub use fixtures::test_name::{test_name, TestName};
 pub use label::{Label, LabelEntry, LabelEntryKind, ModuleLabels};
 pub use metadata::{FixtureMetadata, RequirementInfo, TestMetadata};
-pub use probe::{probe_executable, probe_path};
 pub use runner::{run_all, TestRunner};
 
 use std::cell::Cell;

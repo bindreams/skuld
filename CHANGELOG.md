@@ -55,3 +55,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The private `CaptureBuffer` / `CaptureWriter` types in `src/capture.rs` are
   gone. No public API is affected; the module was never re-exported.
+
+- `probe_executable` and `probe_path` helper functions. Inline the equivalent
+  logic directly in your requirement functions (see updated docs).

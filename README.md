@@ -68,7 +68,15 @@ Annotate test functions with `#[skuld::test]`. The attribute supports several op
 
 ```rust
 fn valgrind() -> Result<(), String> {
-    skuld::probe_executable("valgrind")
+    use std::process::{Command, Stdio};
+    Command::new("valgrind")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+        .then_some(())
+        .ok_or_else(|| "valgrind not installed".into())
 }
 
 #[skuld::test(requires = [valgrind], labels = [SLOW])]
@@ -303,13 +311,6 @@ SKULD_DEBUG=1 cargo test
 ### A note on `tracing-subscriber`'s `tracing-log` feature
 
 If your test code or code under test pulls in `tracing-subscriber` directly, **do not enable its `tracing-log` feature**. The feature auto-installs a `log::Log` shim on the first subscriber `init`, which mutates `log::max_level` globally. Downstream projects have hit Windows CI timeout regressions from this — see bindreams/hole#147. If you need the `log`→`tracing` bridge, call `tracing_log::LogTracer::init()` yourself in the test that needs it, and accept that doing so is a process-wide, one-time operation.
-
-## Built-in probe helpers
-
-| Function                 | Checks                      |
-| ------------------------ | --------------------------- |
-| `probe_executable(name)` | `<name> --version` succeeds |
-| `probe_path(path)`       | File or directory exists    |
 
 ## Output
 
