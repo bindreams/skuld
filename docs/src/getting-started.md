@@ -51,11 +51,22 @@ Declare runtime requirements with `requires`. Each requirement is a function `fn
 
 ```rust
 fn valgrind() -> Result<(), String> {
-    skuld::probe_executable("valgrind")
+    use std::process::{Command, Stdio};
+    Command::new("valgrind")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+        .then_some(())
+        .ok_or_else(|| "valgrind not installed".into())
 }
 
 fn my_binary() -> Result<(), String> {
-    skuld::probe_path("target/debug/my_binary")
+    std::path::Path::new("target/debug/my_binary")
+        .exists()
+        .then_some(())
+        .ok_or_else(|| "target/debug/my_binary not found".into())
 }
 
 #[skuld::test(requires = [valgrind, my_binary])]
@@ -77,13 +88,6 @@ test result: ok. 0 passed; 0 failed; 2 ignored
   smoke_test:     valgrind not installed
   full_pipeline:  valgrind not installed
 ```
-
-## Built-in probe helpers
-
-| Function                 | Checks                      |
-| ------------------------ | --------------------------- |
-| `probe_executable(name)` | `<name> --version` succeeds |
-| `probe_path(path)`       | File or directory exists    |
 
 ## Next steps
 

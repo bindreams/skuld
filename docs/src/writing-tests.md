@@ -31,11 +31,22 @@ Each entry in `requires = [...]` must be a function with signature `fn() -> Resu
 
 ```rust
 fn docker() -> Result<(), String> {
-    skuld::probe_executable("docker")
+    use std::process::{Command, Stdio};
+    Command::new("docker")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+        .then_some(())
+        .ok_or_else(|| "docker not installed".into())
 }
 
 fn corpus_exists() -> Result<(), String> {
-    skuld::probe_path("test_data/corpus")
+    std::path::Path::new("test_data/corpus")
+        .exists()
+        .then_some(())
+        .ok_or_else(|| "test_data/corpus not found".into())
 }
 
 #[skuld::test(requires = [docker, corpus_exists])]
