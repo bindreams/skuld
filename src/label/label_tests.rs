@@ -101,6 +101,11 @@ fn parse_hyphens_and_underscores() {
 }
 
 #[test]
+fn parse_numeric_label() {
+    assert_eq!(parse_label_expr("123").unwrap(), label("123"));
+}
+
+#[test]
 fn parse_complex_expression() {
     // (docker|integration)&!slow
     assert_eq!(
@@ -130,6 +135,12 @@ fn parse_left_associative_and() {
 #[test]
 fn parse_invalid_empty() {
     assert!(parse_label_expr("").is_err());
+}
+
+#[test]
+fn parse_invalid_whitespace_only() {
+    assert!(parse_label_expr("   ").is_err());
+    assert!(parse_label_expr(" \t ").is_err());
 }
 
 #[test]

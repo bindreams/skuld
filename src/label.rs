@@ -172,6 +172,26 @@ pub(crate) fn check_label_registry() -> Result<(), String> {
         }
     }
 
+    // Validate that label names are filterable by the SKULD_LABELS expression grammar.
+    // The grammar's `label` rule accepts [A-Za-z0-9_-]+ only.
+    for entry in inventory::iter::<LabelEntry> {
+        if entry.kind != LabelEntryKind::New {
+            continue;
+        }
+        if entry.name.is_empty()
+            || !entry
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            errors.push(format!(
+                "label {:?} at {}:{}:{} contains characters not supported by SKULD_LABELS filtering \
+                 (only ASCII alphanumeric, '_', and '-' are allowed)",
+                entry.name, entry.file, entry.line, entry.column
+            ));
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -228,9 +248,15 @@ pub(crate) fn parse_label_expr(input: &str) -> Result<LabelExpr, String> {
     let pairs =
         parser::LabelExprParser::parse(Rule::input, input).map_err(|e| format!("invalid label expression: {e}"))?;
 
-    let input_pair = pairs.into_iter().next().unwrap();
+    let input_pair = pairs
+        .into_iter()
+        .next()
+        .expect("pest grammar guarantees an input rule on successful parse");
     // input = { SOI ~ expr ~ EOI } — skip SOI, take expr, skip EOI.
-    let expr_pair = input_pair.into_inner().find(|p| p.as_rule() == Rule::expr).unwrap();
+    let expr_pair = input_pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::expr)
+        .expect("pest grammar guarantees input rule contains expr");
 
     build_expr(expr_pair)
 }
@@ -287,7 +313,7 @@ pub(crate) fn read_label_filter() -> Option<LabelExpr> {
     let val = std::env::var("SKULD_LABELS").ok()?;
     match parse_label_expr(&val) {
         Ok(expr) => Some(expr),
-        Err(e) => panic!("{e}"),
+        Err(e) => panic!("skuld: SKULD_LABELS: {e}"),
     }
 }
 
