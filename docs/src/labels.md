@@ -37,18 +37,31 @@ fn fast_test() { /* ... */ }
 
 ## Filtering with `SKULD_LABELS`
 
-Set the `SKULD_LABELS` environment variable to filter tests at collection time. Tests not matching the filter do not appear at all (not ignored — absent):
+Set the `SKULD_LABELS` environment variable to a boolean expression to filter tests at collection time. Tests not matching the filter do not appear at all (not ignored — absent):
 
 ```bash
-SKULD_LABELS=docker cargo test           # only tests labeled "docker"
-SKULD_LABELS=docker,slow cargo test      # tests labeled "docker" OR "slow"
+SKULD_LABELS=docker cargo test                         # only tests labeled "docker"
+SKULD_LABELS="docker | slow" cargo test                # tests labeled "docker" OR "slow"
+SKULD_LABELS="docker & slow" cargo test                # tests labeled "docker" AND "slow"
+SKULD_LABELS="!slow" cargo test                        # all tests except "slow"
+SKULD_LABELS="(docker | integration) & !slow" cargo test  # combined
 ```
 
-**Semantics:**
+### Expression syntax
 
-- **Unset** → no filtering, all tests run.
-- **Empty (`""`)** → empty filter, no tests match.
-- **Comma-separated** → include-only, union: test must have at least one matching label.
+| Operator | Meaning    | Example                           |
+| -------- | ---------- | --------------------------------- |
+| (none)   | bare label | `docker`                          |
+| `!`      | NOT        | `!slow`                           |
+| `&`      | AND        | `docker & slow`                   |
+| `\|`     | OR         | `docker \| slow`                  |
+| `()`     | grouping   | `(docker \| integration) & !slow` |
+
+**Precedence** (highest to lowest): `!` > `&` > `|`
+
+Whitespace between tokens is optional. Quote the value in shell when using `|`.
+
+**Unset** `SKULD_LABELS` → no filtering, all tests run.
 
 ## Module-level defaults
 

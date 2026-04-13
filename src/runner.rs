@@ -14,7 +14,7 @@ use libtest_mimic::{Arguments, Trial};
 
 use crate::capture::FdCapture;
 use crate::fixture::{cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope};
-use crate::label::{label_matches, read_label_filter, resolve_labels, validate_labels, Label, ModuleLabels};
+use crate::label::{read_label_filter, resolve_labels, validate_labels, Label, LabelExpr, ModuleLabels};
 use crate::{Ignore, TestDef};
 
 // Debug env var =====
@@ -354,13 +354,13 @@ impl TestRunner {
         let module_defaults: Vec<&ModuleLabels> = inventory::iter::<ModuleLabels>.into_iter().collect();
 
         self.collect_inventory_tests(
-            label_filter.as_deref(),
+            label_filter.as_ref(),
             &module_defaults,
             capture,
             &mut trials,
             &mut unavailable,
         );
-        self.collect_dynamic_tests(label_filter.as_deref(), capture, &mut trials);
+        self.collect_dynamic_tests(label_filter.as_ref(), capture, &mut trials);
 
         let conclusion = libtest_mimic::run(&args, trials);
 
@@ -379,7 +379,7 @@ impl TestRunner {
 
     fn collect_inventory_tests(
         &self,
-        label_filter: Option<&[String]>,
+        label_filter: Option<&LabelExpr>,
         module_defaults: &[&ModuleLabels],
         capture: bool,
         trials: &mut Vec<Trial>,
@@ -389,8 +389,10 @@ impl TestRunner {
             let resolved = resolve_labels(def, module_defaults);
 
             // Label filtering — skip entirely (not ignored, just absent).
-            if !label_matches(&resolved, label_filter) {
-                continue;
+            if let Some(filter) = label_filter {
+                if !filter.matches(&resolved) {
+                    continue;
+                }
             }
 
             let trial_name = def.display_name.unwrap_or(def.name);
@@ -426,10 +428,12 @@ impl TestRunner {
         }
     }
 
-    fn collect_dynamic_tests(self, label_filter: Option<&[String]>, capture: bool, trials: &mut Vec<Trial>) {
+    fn collect_dynamic_tests(self, label_filter: Option<&LabelExpr>, capture: bool, trials: &mut Vec<Trial>) {
         for dyn_test in self.dynamic {
-            if !label_matches(&dyn_test.labels, label_filter) {
-                continue;
+            if let Some(filter) = label_filter {
+                if !filter.matches(&dyn_test.labels) {
+                    continue;
+                }
             }
 
             let body = dyn_test.body;
