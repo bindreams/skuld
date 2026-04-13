@@ -1,0 +1,5 @@
+error: conflicting `should_panic`: remove either #[should_panic] or the `should_panic` argument from #[skuld::test(...)]
+ --> tests/compile_fail/should_panic_conflict.rs:2:1
+  |
+2 | #[should_panic]
+  | ^^^^^^^^^^^^^^^

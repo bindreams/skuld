@@ -93,6 +93,15 @@ fn wip() { /* ... */ }
 #[skuld::test(ignore = "blocked on #123")]
 fn blocked_test() { /* ... */ }
 
+// Standard outer attributes also work (must appear after #[skuld::test]):
+#[skuld::test]
+#[ignore]
+fn wip_outer() { /* ... */ }
+
+#[skuld::test]
+#[ignore = "blocked on #456"]
+fn blocked_outer() { /* ... */ }
+
 #[skuld::test(serial)]
 fn modifies_global_state() { /* ... */ }
 
@@ -103,6 +112,13 @@ fn panics_on_bad_input() {
 
 #[skuld::test(should_panic = "out of range")]
 fn panics_with_message() {
+    my_function(too_large);
+}
+
+// Standard outer attribute form (must appear after #[skuld::test]):
+#[skuld::test]
+#[should_panic(expected = "out of range")]
+fn panics_outer() {
     my_function(too_large);
 }
 ```

@@ -2,7 +2,8 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
-    bracketed, parse_macro_input, punctuated::Punctuated, FnArg, Ident, ItemFn, LitStr, Path, ReturnType, Token, Type,
+    bracketed, parse_macro_input, punctuated::Punctuated, Expr, FnArg, Ident, ItemFn, Lit, LitStr, Path, ReturnType,
+    Token, Type,
 };
 
 // #[skuld::test] argument parsing =================================================================
@@ -107,6 +108,67 @@ impl Parse for TestArgs {
         }
 
         Ok(args)
+    }
+}
+
+// Outer attribute absorption =====================================================================
+
+/// Parse `#[ignore]` or `#[ignore = "reason"]` from an outer attribute.
+fn absorb_ignore_attr(attr: &syn::Attribute) -> syn::Result<IgnoreArg> {
+    match &attr.meta {
+        syn::Meta::Path(_) => Ok(IgnoreArg::Yes),
+        syn::Meta::NameValue(nv) => match &nv.value {
+            Expr::Lit(expr_lit) => match &expr_lit.lit {
+                Lit::Str(s) => Ok(IgnoreArg::WithReason(s.value())),
+                _ => Err(syn::Error::new_spanned(
+                    &nv.value,
+                    "#[ignore = ...] expects a string literal",
+                )),
+            },
+            _ => Err(syn::Error::new_spanned(
+                &nv.value,
+                "#[ignore = ...] expects a string literal",
+            )),
+        },
+        _ => Err(syn::Error::new_spanned(
+            attr,
+            "expected #[ignore] or #[ignore = \"reason\"]",
+        )),
+    }
+}
+
+/// Helper for parsing the `expected = "msg"` inside `#[should_panic(expected = "msg")]`.
+struct ShouldPanicExpected {
+    value: String,
+}
+
+impl Parse for ShouldPanicExpected {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let key: Ident = input.parse()?;
+        if key != "expected" {
+            return Err(syn::Error::new(
+                key.span(),
+                format!("expected `expected`, found `{key}`"),
+            ));
+        }
+        let _eq: Token![=] = input.parse()?;
+        let lit: LitStr = input.parse()?;
+        Ok(ShouldPanicExpected { value: lit.value() })
+    }
+}
+
+/// Parse `#[should_panic]` or `#[should_panic(expected = "msg")]` from an outer attribute.
+fn absorb_should_panic_attr(attr: &syn::Attribute) -> syn::Result<ShouldPanicArg> {
+    match &attr.meta {
+        syn::Meta::Path(_) => Ok(ShouldPanicArg::Yes),
+        syn::Meta::List(list) => {
+            let parsed: ShouldPanicExpected = syn::parse2(list.tokens.clone())?;
+            Ok(ShouldPanicArg::WithMessage(parsed.value))
+        }
+        _ => Err(syn::Error::new_spanned(
+            attr,
+            "expected #[should_panic] or #[should_panic(expected = \"message\")]",
+        )),
     }
 }
 
@@ -246,24 +308,85 @@ fn binding_to_name(pat: &syn::Pat) -> String {
 /// from the name-based fixture registry. The fixture name is the parameter name
 /// or the explicit name in `#[fixture(name)]`.
 ///
+/// Standard `#[ignore]` and `#[should_panic]` outer attributes are also
+/// accepted and behave identically to their macro-argument equivalents.
+/// These must appear **after** `#[skuld::test]`, not before it.
+///
 /// ```ignore
 /// #[skuld::test(requires = [preconditions::valgrind], labels = [SLOW])]
 /// fn my_test(#[fixture(temp_dir)] dir: &Path) { /* ... */ }
+///
+/// #[skuld::test]
+/// #[ignore = "not yet implemented"]
+/// fn wip() { /* ... */ }
+///
+/// #[skuld::test]
+/// #[should_panic(expected = "out of range")]
+/// fn panics_with_message() { my_function(too_large); }
 /// ```
 #[proc_macro_attribute]
 pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(attr as TestArgs);
+    let mut args = parse_macro_input!(attr as TestArgs);
     let func = parse_macro_input!(item as ItemFn);
-    expand_test_def(args, func)
+    expand_test_def(&mut args, func)
 }
 
-fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
-    // Guard: reject #[test] on the same function.
+fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
+    // Absorb outer attributes: #[test], #[ignore], #[should_panic].
+    let mut outer_ignore: Option<&syn::Attribute> = None;
+    let mut outer_should_panic: Option<&syn::Attribute> = None;
+
     for attr in &func.attrs {
         if attr.path().is_ident("test") {
             return syn::Error::new_spanned(attr, "remove #[test] — #[skuld::test] already registers this function")
                 .to_compile_error()
                 .into();
+        } else if attr.path().is_ident("ignore") {
+            if outer_ignore.is_some() {
+                return syn::Error::new_spanned(attr, "duplicate #[ignore] attribute")
+                    .to_compile_error()
+                    .into();
+            }
+            outer_ignore = Some(attr);
+        } else if attr.path().is_ident("should_panic") {
+            if outer_should_panic.is_some() {
+                return syn::Error::new_spanned(attr, "duplicate #[should_panic] attribute")
+                    .to_compile_error()
+                    .into();
+            }
+            outer_should_panic = Some(attr);
+        }
+    }
+
+    // Merge outer #[ignore] with macro arguments.
+    if let Some(attr) = outer_ignore {
+        if !matches!(args.ignore, IgnoreArg::No) {
+            return syn::Error::new_spanned(
+                attr,
+                "conflicting `ignore`: remove either #[ignore] or the `ignore` argument from #[skuld::test(...)]",
+            )
+            .to_compile_error()
+            .into();
+        }
+        match absorb_ignore_attr(attr) {
+            Ok(val) => args.ignore = val,
+            Err(e) => return e.to_compile_error().into(),
+        }
+    }
+
+    // Merge outer #[should_panic] with macro arguments.
+    if let Some(attr) = outer_should_panic {
+        if !matches!(args.should_panic, ShouldPanicArg::No) {
+            return syn::Error::new_spanned(
+                attr,
+                "conflicting `should_panic`: remove either #[should_panic] or the `should_panic` argument from #[skuld::test(...)]",
+            )
+            .to_compile_error()
+            .into();
+        }
+        match absorb_should_panic_attr(attr) {
+            Ok(val) => args.should_panic = val,
+            Err(e) => return e.to_compile_error().into(),
         }
     }
 
@@ -272,7 +395,7 @@ fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
 
     let display_name_expr = build_display_name(&args.name);
     let labels_explicit = args.labels.is_some();
-    let label_paths: Vec<Path> = args.labels.unwrap_or_default();
+    let label_paths: Vec<Path> = args.labels.take().unwrap_or_default();
     let ignore_expr = match &args.ignore {
         IgnoreArg::No => quote! { ::skuld::Ignore::No },
         IgnoreArg::Yes => quote! { ::skuld::Ignore::Yes },
@@ -341,7 +464,11 @@ fn expand_test_def(args: TestArgs, func: ItemFn) -> TokenStream {
     let ret = &func.sig.output;
     let fn_token = &func.sig.fn_token;
     let asyncness = &func.sig.asyncness;
-    let attrs: Vec<_> = func.attrs.iter().collect();
+    let attrs: Vec<_> = func
+        .attrs
+        .iter()
+        .filter(|a| !a.path().is_ident("ignore") && !a.path().is_ident("should_panic"))
+        .collect();
     let call_args: Vec<_> = fixture_params.iter().map(|fp| &fp.binding).collect();
 
     let is_async = func.sig.asyncness.is_some();

@@ -46,6 +46,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 tracing-log = "0.2"
 log = "0.4"
+trybuild = "1"
 
 [[test]]
 name = "integration"
@@ -59,6 +60,10 @@ harness = false
 [[test]]
 name = "capture_cli"
 path = "tests/capture_cli.rs"
+
+[[test]]
+name = "compile_errors"
+path = "tests/compile_errors.rs"
 
 # Minimal skuld-powered binary spawned by capture_cli.rs subprocess
 # tests. Not a real product binary; only exists so CARGO_BIN_EXE_*

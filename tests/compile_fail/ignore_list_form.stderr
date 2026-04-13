@@ -1,0 +1,5 @@
+error: expected #[ignore] or #[ignore = "reason"]
+ --> tests/compile_fail/ignore_list_form.rs:2:1
+  |
+2 | #[ignore("reason")]
+  | ^^^^^^^^^^^^^^^^^^^
