@@ -35,6 +35,18 @@ language = "system"
 types = ["rust"]
 pass_filenames = false
 
+[[repos.hooks]]
+id = "cargo-xtask-version"
+name = "cargo xtask version"
+# Without --check: asserts workspace members agree on a strict
+# MAJOR.MINOR.PATCH version AND that skuld's skuld-macros dep pin matches.
+# Tag comparison is deferred to the Draft Release workflow.
+entry = "cargo xtask version"
+language = "system"
+# Only run when a Cargo.toml changes — the check reads manifests, not src.
+files = '(^|/)Cargo\.toml$'
+pass_filenames = false
+
 # External hooks =======================================================================================================
 
 [[repos]]
