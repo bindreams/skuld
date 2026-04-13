@@ -147,6 +147,38 @@ pub(crate) fn validate_labels() {
     }
 }
 
+/// Validate all serial filter expressions on registered tests and fixtures.
+/// Called at startup to catch malformed expressions before any test runs.
+pub(crate) fn validate_serial_filters() {
+    let mut errors: Vec<String> = Vec::new();
+
+    for def in inventory::iter::<crate::TestDef> {
+        if !def.serial.is_empty() && def.serial != crate::coordination::SERIAL_ALL {
+            if let Err(e) = LabelFilter::parse(def.serial) {
+                errors.push(format!(
+                    "test {:?}: invalid serial filter {:?}: {e}",
+                    def.name, def.serial
+                ));
+            }
+        }
+    }
+
+    for def in inventory::iter::<crate::fixture::FixtureDef> {
+        if !def.serial.is_empty() && def.serial != crate::coordination::SERIAL_ALL {
+            if let Err(e) = LabelFilter::parse(def.serial) {
+                errors.push(format!(
+                    "fixture {:?}: invalid serial filter {:?}: {e}",
+                    def.name, def.serial
+                ));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        panic!("skuld: serial filter validation failed:\n{}", errors.join("\n"));
+    }
+}
+
 /// Inner validation that returns all error messages instead of panicking,
 /// so unit tests can assert on specific failures.
 ///

@@ -16,7 +16,9 @@ use crate::capture::FdCapture;
 use crate::fixture::{
     cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope, merge_serial_filters,
 };
-use crate::label::{read_label_filter, resolve_labels, validate_labels, Label, LabelFilter, ModuleLabels};
+use crate::label::{
+    read_label_filter, resolve_labels, validate_labels, validate_serial_filters, Label, LabelFilter, ModuleLabels,
+};
 use crate::{Ignore, TestDef};
 
 // Debug env var =====
@@ -229,6 +231,7 @@ impl TestRunner {
     /// Run all tests and return the conclusion for post-run assertions.
     pub fn run_tests(self) -> libtest_mimic::Conclusion {
         validate_labels();
+        validate_serial_filters();
         let label_filter = read_label_filter();
         let mut remaining_args: Vec<String> = std::env::args().collect();
         remaining_args.retain(|a| !self.strip.contains(a));
