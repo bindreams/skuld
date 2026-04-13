@@ -29,7 +29,7 @@ use crate::{Ignore, TestDef};
 /// Truthy: any value other than `""`, `"0"`, `"false"`, `"no"`, `"off"`
 /// (case-insensitive). This avoids the surprise of `SKULD_DEBUG=0`
 /// enabling debug output.
-fn skuld_debug() -> bool {
+pub(crate) fn skuld_debug() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("SKULD_DEBUG") {
         Ok(v) => {

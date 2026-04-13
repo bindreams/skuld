@@ -105,14 +105,12 @@ fn is_pid_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn is_pid_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    // OpenProcess succeeds if the process exists and we have access.
-    // If it fails with ERROR_INVALID_PARAMETER, the process doesn't exist.
     let result = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
     match result {
         Ok(handle) => {
-            // We only needed to check existence — discard the handle.
-            let _ = handle;
+            let _ = unsafe { CloseHandle(handle) };
             true
         }
         Err(_) => false,
@@ -226,8 +224,15 @@ pub(crate) struct TestRegistration {
 
 impl Drop for TestRegistration {
     fn drop(&mut self) {
-        if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
-            let _ = conn.execute("DELETE FROM running WHERE id = ?1", [self.id]);
+        let cleanup = || -> Result<(), rusqlite::Error> {
+            let conn = rusqlite::Connection::open(&self.db_path)?;
+            conn.busy_timeout(Duration::from_secs(5))?;
+            conn.execute_batch("PRAGMA foreign_keys = ON")?;
+            conn.execute("DELETE FROM running WHERE id = ?1", [self.id])?;
+            Ok(())
+        };
+        if let Err(e) = cleanup() {
+            eprintln!("[skuld] warning: failed to unregister test from coordination DB: {e}");
         }
     }
 }
@@ -284,10 +289,9 @@ pub(crate) fn coordinate(
     }
 }
 
-/// Debug logging macro (re-imported from runner for consistency).
 macro_rules! skuld_debug_eprintln {
     ($($arg:tt)*) => {
-        if std::env::var("SKULD_DEBUG").is_ok() {
+        if crate::runner::skuld_debug() {
             eprintln!("[skuld-debug] {}", format_args!($($arg)*));
         }
     };
