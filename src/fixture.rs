@@ -118,8 +118,10 @@ pub struct FixtureDef {
     pub cast: fn(&(dyn Any + Send + Sync), TypeId) -> Option<FixtureRef>,
     /// Human-readable type name for error messages.
     pub type_name: &'static str,
-    /// Whether tests using this fixture must run under the global serial lock.
-    pub serial: bool,
+    /// Serial filter expression for this fixture.
+    /// Empty string means non-serial; `"*"` means serial with everything;
+    /// a label expression means serial only with tests matching that filter.
+    pub serial: &'static str,
 }
 
 inventory::collect!(FixtureDef);
@@ -508,28 +510,53 @@ fn collect_requires_recursive(
     }
 }
 
-/// Check whether any fixture in the transitive closure of `names` has `serial = true`.
-pub fn collect_fixture_serial(names: &[&str]) -> bool {
+/// Collect the merged serial filter from the transitive closure of fixture `names`.
+///
+/// Returns an empty string if no fixture is serial, `"*"` if any fixture is
+/// globally serial, or an OR-combination of individual fixture filters.
+pub fn collect_fixture_serial(names: &[&str]) -> String {
     let registry = fixture_registry();
     let mut visited = HashSet::new();
-    names
-        .iter()
-        .any(|&name| is_serial_recursive(name, registry, &mut visited))
+    let mut merged = String::new();
+    for &name in names {
+        collect_serial_recursive(name, registry, &mut visited, &mut merged);
+    }
+    merged
 }
 
-fn is_serial_recursive(name: &str, registry: &HashMap<&str, &FixtureDef>, visited: &mut HashSet<String>) -> bool {
+fn collect_serial_recursive(
+    name: &str,
+    registry: &HashMap<&str, &FixtureDef>,
+    visited: &mut HashSet<String>,
+    merged: &mut String,
+) {
     if !visited.insert(name.to_string()) {
-        return false;
+        return;
     }
     if let Some(def) = registry.get(name) {
-        if def.serial {
-            return true;
+        if !def.serial.is_empty() {
+            *merged = merge_serial_filters(merged, def.serial);
         }
         for &dep in def.deps {
-            if is_serial_recursive(dep, registry, visited) {
-                return true;
-            }
+            collect_serial_recursive(dep, registry, visited, merged);
         }
     }
-    false
+}
+
+/// Merge two serial filter strings.
+///
+/// - `""` + `""` = `""` (no serial)
+/// - `"*"` + anything = `"*"` (global serial dominates)
+/// - `"<a>"` + `"<b>"` = `"(<a>) | (<b>)"` (OR combination)
+pub fn merge_serial_filters(a: &str, b: &str) -> String {
+    if a.is_empty() {
+        return b.to_string();
+    }
+    if b.is_empty() {
+        return a.to_string();
+    }
+    if a == "*" || b == "*" {
+        return "*".to_string();
+    }
+    format!("({a}) | ({b})")
 }

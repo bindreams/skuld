@@ -9,10 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Serial filter expressions.** `serial = <expr>` restricts mutual exclusion
+  to tests whose labels match the boolean expression (e.g.
+  `serial = DATABASE & !FAST`). Supports `&` (AND), `|` (OR), `!` (NOT), and
+  parenthesized grouping. A bare `serial` now means "serial with everything" —
+  it blocks ALL other tests, not just other serial tests.
+
+- `LabelFilter` type with `From<Label>` conversion and `&`, `|`, `!` operator
+  overloads for building serial filters programmatically.
+
+- `TestRunner::add_serial_with` for adding dynamic tests with a `LabelFilter`.
+
+- SQLite-based cross-process serial coordination (replaces the previous
+  file-lock mechanism).
+
 - Startup validation panics with source locations (`file:line:column`) if
   duplicate `new_label!` definitions or orphan `get_label!` references exist.
 
 ### Changed
+
+- **`serial` semantics changed.** A bare `serial` now blocks ALL tests (serial
+  and non-serial), not just other serial tests. The `TestDef.serial` and
+  `FixtureDef.serial` fields changed from `bool` to `&'static str` (empty =
+  non-serial, `"*"` = serial with everything, expression = filtered serial).
+  `collect_fixture_serial` returns `String` instead of `bool`.
+
+- **`fd-lock` replaced by `rusqlite` (bundled).** Serial coordination now uses
+  a SQLite database instead of file locks, enabling filter-aware cross-process
+  mutual exclusion.
 
 - **Labels are now sentinel values (`Label` type) instead of plain strings.**
   Use `new_label!` to define label constants, `get_label!` to reference labels

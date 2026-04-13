@@ -13,8 +13,12 @@ use clap::Parser;
 use libtest_mimic::{Arguments, Trial};
 
 use crate::capture::FdCapture;
-use crate::fixture::{cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope};
-use crate::label::{read_label_filter, resolve_labels, validate_labels, Label, LabelExpr, ModuleLabels};
+use crate::fixture::{
+    cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope, merge_serial_filters,
+};
+use crate::label::{
+    read_label_filter, resolve_labels, validate_labels, validate_serial_filters, Label, LabelFilter, ModuleLabels,
+};
 use crate::{Ignore, TestDef};
 
 // Debug env var =====
@@ -25,7 +29,7 @@ use crate::{Ignore, TestDef};
 /// Truthy: any value other than `""`, `"0"`, `"false"`, `"no"`, `"off"`
 /// (case-insensitive). This avoids the surprise of `SKULD_DEBUG=0`
 /// enabling debug output.
-fn skuld_debug() -> bool {
+pub(crate) fn skuld_debug() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("SKULD_DEBUG") {
         Ok(v) => {
@@ -47,75 +51,30 @@ macro_rules! skuld_debug_eprintln {
     };
 }
 
-// Serial lock =====
-
-/// Path to the cross-process serial lock file, resolved at compile time.
-fn serial_lock_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("SKULD_TARGET_PROFILE_DIR")).join(".skuld-serial.lock")
-}
-
-/// Run `body` under a cross-process exclusive file lock.
-///
-/// Opens a fresh lock file on each call, so each caller gets its own file
-/// description and the OS (`flock` / `LockFileEx`) handles all contention
-/// — both cross-thread and cross-process — without an in-process Mutex.
-fn with_serial_lock(body: impl FnOnce()) {
-    let path = serial_lock_path();
-    skuld_debug_eprintln!("serial: acquiring file lock at {path:?}...");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .unwrap_or_else(|e| panic!("skuld: failed to open serial lock at {path:?}: {e}"));
-    let mut lock = fd_lock::RwLock::new(file);
-    let _guard = loop {
-        match lock.write() {
-            Ok(guard) => break guard,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => panic!("skuld: failed to acquire serial lock at {path:?}: {e}"),
-        }
-    };
-    skuld_debug_eprintln!("serial: lock acquired at {path:?}");
-    body();
-    skuld_debug_eprintln!("serial: releasing file lock");
-}
-
-/// Run `body` under the serial lock if `serial` is true, or directly otherwise.
-pub(crate) fn run_maybe_serial(serial: bool, body: impl FnOnce()) {
-    if serial {
-        with_serial_lock(body);
-    } else {
-        body();
-    }
-}
-
 // Per-test observability ==============================================================================
 
-/// Run one test body with per-test observability.
+/// Run one test body with per-test observability and serial coordination.
+///
+/// Every test (serial or not) registers in the coordination database before
+/// running and unregisters on completion. Serial tests block until their
+/// constraints are satisfied.
 ///
 /// Emits `[skuld] <name>: starting` and `[skuld] <name>: pass|fail (NN ms)`
 /// around the body. When `capture` is true, wraps the body in an
 /// [`FdCapture`] that redirects stdout/stderr to an in-process pipe and
-/// dumps the captured bytes to stderr on failure. When `capture` is false
-/// (user passed `--nocapture`, or running under `cargo nextest run`),
-/// the body runs with unmodified stdio and nothing intercepts its output.
-fn run_with_observability(name: &str, capture: bool, serial: bool, body: impl FnOnce()) {
+/// dumps the captured bytes to stderr on failure.
+fn run_with_observability(name: &str, capture: bool, serial_filter: &str, labels: &[Label], body: impl FnOnce()) {
+    use crate::coordination;
+
+    let db_path = coordination::db_path();
+
     // Runner-level "starting" line. Printed BEFORE FdCapture::begin so it
     // lands on the real terminal stderr, not in the capture buffer.
     eprintln!("[skuld] {name}: starting");
     skuld_debug_eprintln!("{name}: entering test scope");
     let started = Instant::now();
 
-    // Set up capture if requested. Failure to begin a capture is
-    // fatal: the process state may be partially corrupted (especially
-    // on Windows, though `FdCapture::begin` is transactional so this
-    // should never actually leak) and running the test body with
-    // unknown stdio is worse than terminating the test run.
-    //
-    // The "capture enabled" debug print happens BEFORE `begin()`
-    // because after `begin()` our eprintln goes into the capture
-    // pipe, not the real stderr, and would be discarded on pass.
+    // Set up capture if requested.
     let mut capture_guard: Option<FdCapture> = None;
     if capture {
         skuld_debug_eprintln!("{name}: capture enabled (fd redirect)");
@@ -135,7 +94,12 @@ fn run_with_observability(name: &str, capture: bool, serial: bool, body: impl Fn
     // this thread to stdout/stderr go into the pipe. Do NOT eprintln!
     // debug output in this window — it would land in the capture buffer.
 
-    let result = catch_unwind(AssertUnwindSafe(|| run_maybe_serial(serial, body)));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // Coordinate: register in DB, block if serial constraints aren't met.
+        // The registration guard unregisters on drop (including panic unwind).
+        let _reg = coordination::coordinate(&db_path, name, labels, serial_filter);
+        body();
+    }));
 
     let duration = started.elapsed();
 
@@ -159,8 +123,6 @@ fn run_with_observability(name: &str, capture: bool, serial: bool, body: impl Fn
 
     if result.is_err() && !captured_bytes.is_empty() {
         eprintln!("[skuld] {name}: ---- captured ----");
-        // Best-effort raw write; errors here are themselves diagnostic
-        // noise and we cannot do anything useful with them.
         let _ = std::io::stderr().write_all(&captured_bytes);
         if !captured_bytes.ends_with(b"\n") {
             let _ = std::io::stderr().write_all(b"\n");
@@ -179,7 +141,7 @@ fn run_with_observability(name: &str, capture: bool, serial: bool, body: impl Fn
 struct DynTest {
     name: String,
     ignored: bool,
-    serial: bool,
+    serial: String,
     labels: Vec<Label>,
     body: Box<dyn FnOnce() + Send + 'static>,
 }
@@ -220,7 +182,7 @@ impl TestRunner {
         self.dynamic.push(DynTest {
             name: name.into(),
             ignored,
-            serial: false,
+            serial: String::new(),
             labels: labels.to_vec(),
             body: Box::new(body),
         });
@@ -237,7 +199,25 @@ impl TestRunner {
         self.dynamic.push(DynTest {
             name: name.into(),
             ignored,
-            serial: true,
+            serial: "*".to_string(),
+            labels: labels.to_vec(),
+            body: Box::new(body),
+        });
+    }
+
+    /// Add a test with filtered serial execution.
+    pub fn add_serial_with(
+        &mut self,
+        name: impl Into<String>,
+        labels: &[Label],
+        ignored: bool,
+        filter: LabelFilter,
+        body: impl FnOnce() + Send + 'static,
+    ) {
+        self.dynamic.push(DynTest {
+            name: name.into(),
+            ignored,
+            serial: filter.to_string(),
             labels: labels.to_vec(),
             body: Box::new(body),
         });
@@ -251,6 +231,7 @@ impl TestRunner {
     /// Run all tests and return the conclusion for post-run assertions.
     pub fn run_tests(self) -> libtest_mimic::Conclusion {
         validate_labels();
+        validate_serial_filters();
         let label_filter = read_label_filter();
         let mut remaining_args: Vec<String> = std::env::args().collect();
         remaining_args.retain(|a| !self.strip.contains(a));
@@ -302,7 +283,7 @@ impl TestRunner {
 
     fn collect_inventory_tests(
         &self,
-        label_filter: Option<&LabelExpr>,
+        label_filter: Option<&LabelFilter>,
         module_defaults: &[&ModuleLabels],
         capture: bool,
         trials: &mut Vec<Trial>,
@@ -337,10 +318,12 @@ impl TestRunner {
 
             if reasons.is_empty() {
                 let body = def.body;
-                let is_serial = def.serial || collect_fixture_serial(def.fixture_names);
+                let fixture_serial = collect_fixture_serial(def.fixture_names);
+                let effective_serial = merge_serial_filters(def.serial, &fixture_serial);
                 let observed_name = trial_name.to_string();
+                let resolved_owned = resolved.clone();
                 trials.push(Trial::test(trial_name, move || {
-                    run_with_observability(&observed_name, capture, is_serial, body);
+                    run_with_observability(&observed_name, capture, &effective_serial, &resolved_owned, body);
                     Ok(())
                 }));
             } else {
@@ -351,7 +334,7 @@ impl TestRunner {
         }
     }
 
-    fn collect_dynamic_tests(self, label_filter: Option<&LabelExpr>, capture: bool, trials: &mut Vec<Trial>) {
+    fn collect_dynamic_tests(self, label_filter: Option<&LabelFilter>, capture: bool, trials: &mut Vec<Trial>) {
         for dyn_test in self.dynamic {
             if let Some(filter) = label_filter {
                 if !filter.matches(&dyn_test.labels) {
@@ -360,13 +343,14 @@ impl TestRunner {
             }
 
             let body = dyn_test.body;
-            let is_serial = dyn_test.serial;
+            let serial = dyn_test.serial;
+            let labels = dyn_test.labels;
             // Intentional leak: dynamic test names need 'static lifetime for enter_test_scope.
             // Acceptable because the harness runs once per process.
             let name_static: &'static str = Box::leak(dyn_test.name.into_boxed_str());
             trials.push(
                 Trial::test(name_static, move || {
-                    run_with_observability(name_static, capture, is_serial, move || {
+                    run_with_observability(name_static, capture, &serial, &labels, move || {
                         // Auto-wrap dynamic tests in a test scope so fixtures are available.
                         let _scope = enter_test_scope(name_static, "");
                         body();

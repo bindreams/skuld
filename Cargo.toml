@@ -21,7 +21,8 @@ serde_yml = "0.0.12"
 # Cross-platform anonymous pipe primitive, used by the per-test FD capture in
 # src/capture.rs. Avoids reimplementing pipe()/CreatePipe() ourselves.
 os_pipe = "1.2"
-fd-lock = "4"
+# Cross-process test coordination database for serial test scheduling.
+rusqlite = { version = "0.39", features = ["bundled"] }
 pest = "2"
 pest_derive = "2"
 tokio = { version = "1", features = ["rt"], optional = true }
@@ -37,7 +38,7 @@ libc = "0.2"
 #     io::stdout()/io::stderr(), which bypass the CRT fd table entirely.
 # We must swap both during capture or one stream silently escapes.
 libc = "0.2"
-windows = { version = "0.62", features = ["Win32_System_Console"] }
+windows = { version = "0.62", features = ["Win32_System_Console", "Win32_System_Threading"] }
 
 [dev-dependencies]
 skuld = { path = ".", features = ["tokio"] }

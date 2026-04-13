@@ -22,7 +22,7 @@ use std::sync::Mutex;
 /// ```
 pub struct EnvGuard {
     /// Stack of (key, original_value). `None` means the variable was not set.
-    /// Uses Mutex for Sync bound (never actually contended — serial lock ensures exclusivity).
+    /// Uses Mutex for Sync bound (never actually contended — serial coordination ensures exclusivity).
     original: Mutex<Vec<(String, Option<String>)>>,
 }
 
@@ -38,7 +38,7 @@ impl EnvGuard {
     pub fn set(&self, key: &str, value: &str) {
         let old = std::env::var(key).ok();
         self.original.lock().unwrap().push((key.to_owned(), old));
-        // SAFETY: we hold the serial lock, so no other test is touching env concurrently.
+        // SAFETY: we hold the serial coordination, so no other test is touching env concurrently.
         unsafe { std::env::set_var(key, value) };
     }
 
@@ -47,7 +47,7 @@ impl EnvGuard {
     pub fn remove(&self, key: &str) {
         let old = std::env::var(key).ok();
         self.original.lock().unwrap().push((key.to_owned(), old));
-        // SAFETY: we hold the serial lock, so no other test is touching env concurrently.
+        // SAFETY: we hold the serial coordination, so no other test is touching env concurrently.
         unsafe { std::env::remove_var(key) };
     }
 }
@@ -57,7 +57,7 @@ impl Drop for EnvGuard {
         let entries = self.original.get_mut().unwrap();
         for (key, old) in entries.iter().rev() {
             match old {
-                // SAFETY: we hold the serial lock, so no other test is touching env concurrently.
+                // SAFETY: we hold the serial coordination, so no other test is touching env concurrently.
                 Some(val) => unsafe { std::env::set_var(key, val) },
                 None => unsafe { std::env::remove_var(key) },
             }
