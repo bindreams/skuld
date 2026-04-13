@@ -13,8 +13,6 @@
 extern crate self as skuld;
 
 mod capture;
-// TODO(#21): remove allow(dead_code) once runner integration is complete.
-#[allow(dead_code)]
 pub(crate) mod coordination;
 pub mod fixture;
 pub mod fixtures;

@@ -215,12 +215,6 @@ fn register(conn: &rusqlite::Connection, name: &str, labels: &[Label], serial_fi
     id
 }
 
-/// Unregister a test from the coordination database.
-fn unregister(conn: &rusqlite::Connection, id: i64) {
-    // Labels are deleted via ON DELETE CASCADE.
-    conn.execute("DELETE FROM running WHERE id = ?1", [id]).unwrap();
-}
-
 // RAII guard =====
 
 /// RAII guard that unregisters the test from the coordination database on drop.

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::Barrier;
 use std::time::Duration;
 
-use crate::coordination::{can_start, coordinate, open_db, register, unregister, SERIAL_ALL, SERIAL_NONE};
+use crate::coordination::{can_start, coordinate, open_db, register, SERIAL_ALL, SERIAL_NONE};
 use crate::label::Label;
 
 /// Create a temporary database for testing.
@@ -117,10 +117,10 @@ fn filtered_serial_not_semantics() {
     assert!(!can_start(&conn, &[], "!a").unwrap());
 }
 
-// register / unregister =====
+// register / cleanup =====
 
 #[test]
-fn register_and_unregister() {
+fn register_and_delete() {
     let (_dir, path) = temp_db();
     let conn = open_db(&path);
     let docker = Label::__new("docker");
@@ -131,7 +131,8 @@ fn register_and_unregister() {
         .unwrap();
     assert_eq!(count, 1);
 
-    unregister(&conn, id);
+    // Direct DELETE (same as TestRegistration::drop)
+    conn.execute("DELETE FROM running WHERE id = ?1", [id]).unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
         .unwrap();
@@ -139,7 +140,7 @@ fn register_and_unregister() {
 }
 
 #[test]
-fn unregister_cascades_labels() {
+fn delete_cascades_labels() {
     let (_dir, path) = temp_db();
     let conn = open_db(&path);
     let a = Label::__new("a");
@@ -149,7 +150,7 @@ fn unregister_cascades_labels() {
     let label_count: i64 = conn.query_row("SELECT COUNT(*) FROM labels", [], |r| r.get(0)).unwrap();
     assert_eq!(label_count, 2);
 
-    unregister(&conn, id);
+    conn.execute("DELETE FROM running WHERE id = ?1", [id]).unwrap();
     let label_count: i64 = conn.query_row("SELECT COUNT(*) FROM labels", [], |r| r.get(0)).unwrap();
     assert_eq!(label_count, 0);
 }
