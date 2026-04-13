@@ -1,0 +1,11 @@
+WHITESPACE = _{ " " | "\t" | "\r" }
+
+label    = @{ (ASCII_ALPHANUMERIC | "_" | "-")+ }
+
+input    =  { SOI ~ expr ~ EOI }
+expr     =  { or_expr }
+or_expr  =  { and_expr ~ ("|" ~ and_expr)* }
+and_expr =  { not_expr ~ ("&" ~ not_expr)* }
+not_expr =  { neg | primary }
+neg      =  { "!" ~ not_expr }
+primary  =  { "(" ~ expr ~ ")" | label }

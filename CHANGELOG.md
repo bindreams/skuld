@@ -21,9 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Label` paths. `TestRunner::add`/`add_serial` take `&[Label]` instead of
   `&[&str]`.
 
-- **Label filtering uses `SKULD_LABELS` env var instead of `--label` CLI flag.**
-  Unset = no filtering; empty = no tests match; comma-separated = union of
-  includes.
+- **Label filtering uses `SKULD_LABELS` env var with boolean expression syntax.**
+  Supports `&` (AND), `|` (OR), `!` (NOT), and parenthesized grouping.
+  Precedence: `!` > `&` > `|`. Unset = no filtering, all tests run.
 
 - **Per-test output capture now happens at the file-descriptor level instead of
   through a tracing subscriber.** Skuld no longer installs any `tracing`
@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is no longer set).
 
 - The `--label` CLI flag is removed. Use `SKULD_LABELS` env var instead.
+
+- The comma-separated `SKULD_LABELS` syntax is replaced by boolean expressions.
+  `SKULD_LABELS=docker,slow` → `SKULD_LABELS="docker | slow"`.
 
 - `tracing` and `tracing-subscriber` are no longer runtime dependencies of the
   skuld crate. They remain as dev-dependencies for regression tests.

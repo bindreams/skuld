@@ -223,14 +223,15 @@ skuld::new_label!(pub SLOW, "slow");
 fn heavy_test() { /* ... */ }
 ```
 
-Filter with the `SKULD_LABELS` environment variable:
+Filter with the `SKULD_LABELS` environment variable using boolean expressions (`&` AND, `|` OR, `!` NOT, parentheses):
 
 ```bash
-SKULD_LABELS=docker cargo test           # only tests labeled "docker"
-SKULD_LABELS=docker,slow cargo test      # tests labeled "docker" OR "slow"
+SKULD_LABELS=docker cargo test                         # only "docker"
+SKULD_LABELS="docker | slow" cargo test                # "docker" OR "slow"
+SKULD_LABELS="(docker | integration) & !slow" cargo test  # combined
 ```
 
-Unset `SKULD_LABELS` runs all tests; `SKULD_LABELS=""` runs none.
+Unset `SKULD_LABELS` runs all tests. Precedence: `!` > `&` > `|`.
 
 ### Module-level defaults
 

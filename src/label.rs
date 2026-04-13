@@ -2,7 +2,7 @@
 //!
 //! Labels are sentinel values created with [`new_label!`] and optionally
 //! aliased with [`get_label!`]. Tests are filtered by the `SKULD_LABELS`
-//! environment variable (comma-separated, include-only, union semantics).
+//! environment variable (boolean expression with `&`, `|`, `!`, and grouping).
 
 #[cfg(test)]
 mod label_tests;
@@ -172,6 +172,26 @@ pub(crate) fn check_label_registry() -> Result<(), String> {
         }
     }
 
+    // Validate that label names are filterable by the SKULD_LABELS expression grammar.
+    // The grammar's `label` rule accepts [A-Za-z0-9_-]+ only.
+    for entry in inventory::iter::<LabelEntry> {
+        if entry.kind != LabelEntryKind::New {
+            continue;
+        }
+        if entry.name.is_empty()
+            || !entry
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            errors.push(format!(
+                "label {:?} at {}:{}:{} contains characters not supported by SKULD_LABELS filtering \
+                 (only ASCII alphanumeric, '_', and '-' are allowed)",
+                entry.name, entry.file, entry.line, entry.column
+            ));
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -181,36 +201,119 @@ pub(crate) fn check_label_registry() -> Result<(), String> {
 
 // Label filtering =====
 
+mod parser {
+    use pest_derive::Parser;
+
+    #[derive(Parser)]
+    #[grammar = "label.pest"]
+    pub(super) struct LabelExprParser;
+}
+
+use parser::Rule;
+
+/// A boolean expression over test labels.
+///
+/// Parsed from the `SKULD_LABELS` environment variable by [`parse_label_expr`].
+/// Supports `&` (AND), `|` (OR), `!` (NOT), and parenthesized grouping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LabelExpr {
+    /// Matches if the test has this label.
+    Label(String),
+    /// Logical NOT: matches if the inner expression does not match.
+    Not(Box<LabelExpr>),
+    /// Logical AND: matches if both sides match.
+    And(Box<LabelExpr>, Box<LabelExpr>),
+    /// Logical OR: matches if either side matches.
+    Or(Box<LabelExpr>, Box<LabelExpr>),
+}
+
+impl LabelExpr {
+    /// Evaluate this expression against a set of test labels.
+    pub(crate) fn matches(&self, test_labels: &[Label]) -> bool {
+        match self {
+            LabelExpr::Label(name) => test_labels.iter().any(|l| l.name() == name),
+            LabelExpr::Not(inner) => !inner.matches(test_labels),
+            LabelExpr::And(left, right) => left.matches(test_labels) && right.matches(test_labels),
+            LabelExpr::Or(left, right) => left.matches(test_labels) || right.matches(test_labels),
+        }
+    }
+}
+
+/// Parse a label filter expression string into an AST.
+///
+/// Returns `Err` with a human-readable message on malformed input.
+pub(crate) fn parse_label_expr(input: &str) -> Result<LabelExpr, String> {
+    use pest::Parser;
+
+    let pairs =
+        parser::LabelExprParser::parse(Rule::input, input).map_err(|e| format!("invalid label expression: {e}"))?;
+
+    let input_pair = pairs
+        .into_iter()
+        .next()
+        .expect("pest grammar guarantees an input rule on successful parse");
+    // input = { SOI ~ expr ~ EOI } — skip SOI, take expr, skip EOI.
+    let expr_pair = input_pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::expr)
+        .expect("pest grammar guarantees input rule contains expr");
+
+    build_expr(expr_pair)
+}
+
+fn build_expr(pair: pest::iterators::Pair<'_, Rule>) -> Result<LabelExpr, String> {
+    match pair.as_rule() {
+        Rule::expr => {
+            // expr = { or_expr }
+            build_expr(pair.into_inner().next().unwrap())
+        }
+        Rule::or_expr => {
+            // or_expr = { and_expr ~ ("|" ~ and_expr)* }
+            let mut inner = pair.into_inner();
+            let mut left = build_expr(inner.next().unwrap())?;
+            for right_pair in inner {
+                left = LabelExpr::Or(Box::new(left), Box::new(build_expr(right_pair)?));
+            }
+            Ok(left)
+        }
+        Rule::and_expr => {
+            // and_expr = { not_expr ~ ("&" ~ not_expr)* }
+            let mut inner = pair.into_inner();
+            let mut left = build_expr(inner.next().unwrap())?;
+            for right_pair in inner {
+                left = LabelExpr::And(Box::new(left), Box::new(build_expr(right_pair)?));
+            }
+            Ok(left)
+        }
+        Rule::not_expr => {
+            // not_expr = { neg | primary }
+            build_expr(pair.into_inner().next().unwrap())
+        }
+        Rule::neg => {
+            // neg = { "!" ~ not_expr }
+            let inner = pair.into_inner().next().unwrap();
+            Ok(LabelExpr::Not(Box::new(build_expr(inner)?)))
+        }
+        Rule::primary => {
+            // primary = { "(" ~ expr ~ ")" | label }
+            let child = pair.into_inner().next().unwrap();
+            build_expr(child)
+        }
+        Rule::label => Ok(LabelExpr::Label(pair.as_str().to_string())),
+        _ => Err(format!("unexpected rule: {:?}", pair.as_rule())),
+    }
+}
+
 /// Read label filter from the `SKULD_LABELS` environment variable.
 ///
-/// - Unset → `None` (no filtering, all tests run)
-/// - `""` → `Some(vec![])` (empty list, no tests match any label)
-/// - `"docker,slow"` → `Some(vec!["docker", "slow"])` (include-only, union)
-pub(crate) fn read_label_filter() -> Option<Vec<String>> {
-    parse_label_filter(std::env::var("SKULD_LABELS").ok())
-}
-
-/// Parse an optional label filter value into a filter list.
-///
-/// Pure function extracted from [`read_label_filter`] for testability.
-pub(crate) fn parse_label_filter(val: Option<String>) -> Option<Vec<String>> {
-    val.map(|v| {
-        v.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    })
-}
-
-/// Check whether a test with the given labels passes the label filter.
-///
-/// - `None` → all tests pass (no filtering active).
-/// - `Some(&[])` → no tests pass (empty filter).
-/// - `Some(&[..])` → test must have at least one label whose name is in the list.
-pub(crate) fn label_matches(test_labels: &[Label], filter: Option<&[String]>) -> bool {
-    match filter {
-        None => true,
-        Some(allowed) => test_labels.iter().any(|l| allowed.iter().any(|a| a == l.name())),
+/// - Unset → `None` (no filtering, all tests run).
+/// - `""` (empty / whitespace-only) → panics (invalid expression).
+/// - Non-empty → parses as a boolean expression; panics on malformed input.
+pub(crate) fn read_label_filter() -> Option<LabelExpr> {
+    let val = std::env::var("SKULD_LABELS").ok()?;
+    match parse_label_expr(&val) {
+        Ok(expr) => Some(expr),
+        Err(e) => panic!("skuld: SKULD_LABELS: {e}"),
     }
 }
 

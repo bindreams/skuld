@@ -21,6 +21,8 @@ serde_yml = "0.0.12"
 # Cross-platform anonymous pipe primitive, used by the per-test FD capture in
 # src/capture.rs. Avoids reimplementing pipe()/CreatePipe() ourselves.
 os_pipe = "1.2"
+pest = "2"
+pest_derive = "2"
 tokio = { version = "1", features = ["rt"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
