@@ -96,13 +96,18 @@ fn parse_double_negation() {
 }
 
 #[test]
-fn parse_hyphens_and_underscores() {
-    assert_eq!(parse_label_expr("my-label_2").unwrap(), label("my-label_2"));
+fn parse_underscores_and_digits() {
+    assert_eq!(parse_label_expr("my_label_2").unwrap(), label("my_label_2"));
 }
 
 #[test]
-fn parse_numeric_label() {
-    assert_eq!(parse_label_expr("123").unwrap(), label("123"));
+fn parse_rejects_numeric_label() {
+    assert!(parse_label_expr("123").is_err());
+}
+
+#[test]
+fn parse_rejects_hyphenated_label() {
+    assert!(parse_label_expr("my-label").is_err());
 }
 
 #[test]
@@ -222,4 +227,87 @@ fn eval_complex() {
 fn eval_empty_labels() {
     assert!(!matches("docker", &[]));
     assert!(matches("!docker", &[]));
+}
+
+// validate_label_name =====
+
+#[test]
+fn validate_accepts_simple_names() {
+    validate_label_name("foo");
+    validate_label_name("_bar");
+    validate_label_name("A1_b2");
+    validate_label_name("_");
+    validate_label_name("_123");
+    validate_label_name("a");
+}
+
+#[test]
+#[should_panic(expected = "invalid label name")]
+fn validate_rejects_empty() {
+    validate_label_name("");
+}
+
+#[test]
+#[should_panic(expected = "invalid label name")]
+fn validate_rejects_leading_digit() {
+    validate_label_name("1foo");
+}
+
+#[test]
+#[should_panic(expected = "invalid label name")]
+fn validate_rejects_hyphen() {
+    validate_label_name("has-dash");
+}
+
+#[test]
+#[should_panic(expected = "invalid label name")]
+fn validate_rejects_space() {
+    validate_label_name("has space");
+}
+
+#[test]
+#[should_panic(expected = "invalid label name")]
+fn validate_rejects_exclamation() {
+    validate_label_name("foo!");
+}
+
+#[test]
+#[should_panic(expected = "invalid label name")]
+fn new_rejects_invalid_name_at_runtime() {
+    Label::__new("bad-name");
+}
+
+// Cross-validation: validate_label_name and PEG grammar agree -----
+
+#[test]
+fn grammar_and_validator_agree() {
+    let valid = ["foo", "_bar", "A1_b2", "_", "_123", "a", "docker", "slow"];
+    let invalid = ["", "1foo", "has-dash", "has space", "foo!"];
+
+    for name in valid {
+        // validate_label_name should not panic
+        validate_label_name(name);
+        // PEG grammar should parse as a bare label
+        assert!(
+            parse_label_expr(name).is_ok(),
+            "PEG grammar rejected valid label name {:?}",
+            name
+        );
+    }
+
+    for name in invalid {
+        // validate_label_name should panic
+        let result = std::panic::catch_unwind(|| validate_label_name(name));
+        assert!(
+            result.is_err(),
+            "validate_label_name accepted invalid label name {:?}",
+            name
+        );
+        // PEG grammar should reject
+        assert!(
+            parse_label_expr(name).is_err(),
+            "PEG grammar accepted invalid label name {:?}",
+            name
+        );
+    }
 }

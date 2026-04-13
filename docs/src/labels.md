@@ -18,6 +18,8 @@ To reference a label defined elsewhere (e.g. in another crate), use `get_label!`
 skuld::get_label!(pub DOCKER, "docker"); // must have a new_label!("docker") somewhere
 ```
 
+Label names must be valid Rust identifiers (ASCII letters, digits, and underscores; must not start with a digit). Invalid names are rejected at compile time.
+
 At startup, skuld validates that:
 
 - No two `new_label!` calls share the same name (panics with both source locations).

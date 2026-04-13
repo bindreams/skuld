@@ -1,6 +1,6 @@
 WHITESPACE = _{ " " | "\t" | "\r" }
 
-label    = @{ (ASCII_ALPHANUMERIC | "_" | "-")+ }
+label    = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
 input    =  { SOI ~ expr ~ EOI }
 expr     =  { or_expr }
