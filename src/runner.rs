@@ -49,22 +49,6 @@ macro_rules! skuld_debug_eprintln {
 
 // Serial lock =====
 
-/// Retry a blocking I/O operation if interrupted by a signal (`EINTR`).
-///
-/// On Unix, blocking syscalls like `flock` can return `ErrorKind::Interrupted`
-/// when a signal handler (without `SA_RESTART`) fires during the call. This
-/// helper transparently retries until the operation completes or fails with a
-/// real error.
-#[allow(dead_code)] // used in tests; inlined in with_serial_lock due to borrow constraints
-pub(crate) fn retry_on_eintr<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
-    loop {
-        match f() {
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            result => return result,
-        }
-    }
-}
-
 /// Path to the cross-process serial lock file, resolved at compile time.
 fn serial_lock_path() -> std::path::PathBuf {
     std::path::Path::new(env!("SKULD_TARGET_PROFILE_DIR")).join(".skuld-serial.lock")

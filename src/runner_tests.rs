@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::Barrier;
 use std::time::Duration;
 
-use crate::runner::{retry_on_eintr, run_maybe_serial};
+use crate::runner::run_maybe_serial;
 
 #[test]
 fn serial_lock_prevents_concurrent_execution() {
@@ -75,6 +75,21 @@ fn serial_lock_recovers_after_panic() {
 }
 
 // retry_on_eintr tests -----
+
+/// Retry a blocking I/O operation if interrupted by a signal (`EINTR`).
+///
+/// This is the same logic inlined in `with_serial_lock` (which cannot call this
+/// function directly because `fd_lock::RwLock::write()` returns a guard that
+/// borrows the lock, and that borrow cannot escape an `FnMut` closure). These
+/// tests validate the retry pattern is correct.
+fn retry_on_eintr<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match f() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
 
 #[test]
 fn retry_on_eintr_retries_interrupted() {
