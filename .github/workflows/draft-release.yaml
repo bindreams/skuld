@@ -1,0 +1,131 @@
+name: Draft Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.0.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: draft-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Normalize and validate version
+        id: version
+        # inputs.version is passed via env to avoid shell injection on
+        # interpolation. GitHub's actionlint specifically flags direct
+        # ${{ inputs.* }} interpolation in run: blocks.
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${INPUT_VERSION#v}"
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version: '${INPUT_VERSION}'"
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Fail if release tag already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists (draft or published). Delete it or pick a new version."
+            exit 1
+          fi
+
+      - name: Create local tag for xtask check
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: git tag "v${VERSION}"
+
+      - name: Validate workspace version and dep pin against tag
+        # Runs workspace_version() (agreement + skuld-macros pin match) AND
+        # nearest-tag comparison with --exact. Fails on any inconsistency.
+        # Catches operator mistypes: if input version != Cargo.toml version,
+        # the newly-created local tag disagrees with Cargo.toml and --exact
+        # rejects it.
+        run: cargo xtask version --check --exact
+
+  ci:
+    name: CI
+    needs: validate
+    # Re-run the full CI matrix (lint + 6-platform test) against the release
+    # commit. Main's last green CI does not imply THIS commit is green — it
+    # might be behind main, and pushes to main between CI runs may have
+    # landed broken. Stage 1 is the last reversible gate before publish.
+    uses: ./.github/workflows/ci.yaml
+
+  verify:
+    name: Verify publishable
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Dry-run publish workspace
+        # cargo 1.84+ dry-run for multi-package. Packages in topological order.
+        # For dry-run, skuld-macros is NOT actually published, so skuld's
+        # verify step cannot resolve it from the registry — use --no-verify
+        # to skip the build check. Packaging errors (missing metadata,
+        # malformed manifest) still surface for both.
+        run: cargo publish -p skuld-macros -p skuld --dry-run --locked --no-verify
+
+  release:
+    name: Create draft release
+    needs: [validate, ci, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create draft release pinned to commit SHA
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "v${VERSION}" \
+            --draft \
+            --generate-notes \
+            --title "v${VERSION}" \
+            --target "$SHA"
+          echo "Draft release created for commit $SHA:"
+          echo "  https://github.com/${REPO}/releases/tag/v${VERSION}"

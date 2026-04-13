@@ -1,16 +1,26 @@
 [workspace]
-members = [".", "macros"]
+members = [".", "macros", "xtask"]
 
 [package]
 name = "skuld"
 version = "0.1.0"
 edition = "2021"
+authors = ["Anna Zhukova"]
+description = "A test harness with runtime preconditions, per-test FD capture, and fixture injection"
+license = "Apache-2.0"
+license-file = "LICENSE.md"
+repository = "https://github.com/bindreams/skuld"
+homepage = "https://skuld.readthedocs.io"
+documentation = "https://skuld.readthedocs.io"
+readme = "README.md"
+keywords = ["test", "harness", "fixture", "testing"]
+categories = ["development-tools::testing"]
 
 [features]
 tokio = ["dep:tokio"]
 
 [dependencies]
-skuld-macros = { path = "macros" }
+skuld-macros = { version = "=0.1.0", path = "macros" }
 inventory = "0.3"
 libtest-mimic = "0.8"
 # Needed for clap::Parser trait (Arguments::parse_from); libtest-mimic doesn't re-export it.
