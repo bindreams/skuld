@@ -1,0 +1,5 @@
+error: remove #[test] — #[skuld::test] already registers this function
+ --> tests/compile_fail/test_and_skuld_test.rs:2:1
+  |
+2 | #[test]
+  | ^^^^^^^

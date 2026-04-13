@@ -1,0 +1,5 @@
+error: conflicting `ignore`: remove either #[ignore] or the `ignore` argument from #[skuld::test(...)]
+ --> tests/compile_fail/ignore_conflict.rs:2:1
+  |
+2 | #[ignore]
+  | ^^^^^^^^^

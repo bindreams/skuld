@@ -53,6 +53,23 @@ async fn async_result_err_fails() -> Result<(), String> {
     Err("something went wrong".into())
 }
 
+// Outer attribute tests --------------------------------------------------------------------------
+
+static ASYNC_OUTER_IGNORE_RAN: AtomicBool = AtomicBool::new(false);
+
+#[skuld::test]
+#[ignore]
+async fn async_outer_ignore() {
+    ASYNC_OUTER_IGNORE_RAN.store(true, Ordering::Relaxed);
+}
+
+pub fn assert_outer_ignore_did_not_run() {
+    assert!(
+        !ASYNC_OUTER_IGNORE_RAN.load(Ordering::Relaxed),
+        "async_outer_ignore should NOT have run"
+    );
+}
+
 pub fn assert_all_ran() {
     assert!(
         BASIC_ASYNC_RAN.load(Ordering::Relaxed),

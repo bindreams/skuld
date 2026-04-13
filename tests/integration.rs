@@ -19,6 +19,8 @@ fn main() {
     support::env_tests::assert_all_ran_and_reverted();
     support::cwd_tests::assert_all_ran_and_reverted(&original_cwd);
     support::should_panic_tests::assert_all_ran();
+    support::harness_tests::assert_outer_ignore_tests_did_not_run();
+    support::async_tests::assert_outer_ignore_did_not_run();
 
     // Paranoia: if any capture-test regression made the run flaky, or
     // the newly-added tests' `should_panic` mechanism produced real

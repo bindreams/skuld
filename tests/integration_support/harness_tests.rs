@@ -63,3 +63,32 @@ pub fn assert_result_tests_ran() {
         "sync_result_err_fails should have executed"
     );
 }
+
+// Outer #[ignore] attribute tests ----------------------------------------------------------------
+
+static OUTER_IGNORE_BARE_RAN: AtomicBool = AtomicBool::new(false);
+
+#[skuld::test]
+#[ignore]
+fn outer_ignore_bare() {
+    OUTER_IGNORE_BARE_RAN.store(true, Ordering::Relaxed);
+}
+
+static OUTER_IGNORE_REASON_RAN: AtomicBool = AtomicBool::new(false);
+
+#[skuld::test]
+#[ignore = "not yet implemented"]
+fn outer_ignore_with_reason() {
+    OUTER_IGNORE_REASON_RAN.store(true, Ordering::Relaxed);
+}
+
+pub fn assert_outer_ignore_tests_did_not_run() {
+    assert!(
+        !OUTER_IGNORE_BARE_RAN.load(Ordering::Relaxed),
+        "outer_ignore_bare should NOT have run"
+    );
+    assert!(
+        !OUTER_IGNORE_REASON_RAN.load(Ordering::Relaxed),
+        "outer_ignore_with_reason should NOT have run"
+    );
+}

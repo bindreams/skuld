@@ -1,0 +1,5 @@
+error: expected #[should_panic] or #[should_panic(expected = "message")]
+ --> tests/compile_fail/should_panic_name_value.rs:2:1
+  |
+2 | #[should_panic = "msg"]
+  | ^^^^^^^^^^^^^^^^^^^^^^^
