@@ -14,7 +14,7 @@ use libtest_mimic::{Arguments, Trial};
 
 use crate::capture::FdCapture;
 use crate::fixture::{cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope};
-use crate::label::{read_label_filter, resolve_labels, validate_labels, Label, LabelExpr, ModuleLabels};
+use crate::label::{read_label_filter, resolve_labels, validate_labels, Label, LabelFilter, ModuleLabels};
 use crate::{Ignore, TestDef};
 
 // Debug env var =====
@@ -302,7 +302,7 @@ impl TestRunner {
 
     fn collect_inventory_tests(
         &self,
-        label_filter: Option<&LabelExpr>,
+        label_filter: Option<&LabelFilter>,
         module_defaults: &[&ModuleLabels],
         capture: bool,
         trials: &mut Vec<Trial>,
@@ -351,7 +351,7 @@ impl TestRunner {
         }
     }
 
-    fn collect_dynamic_tests(self, label_filter: Option<&LabelExpr>, capture: bool, trials: &mut Vec<Trial>) {
+    fn collect_dynamic_tests(self, label_filter: Option<&LabelFilter>, capture: bool, trials: &mut Vec<Trial>) {
         for dyn_test in self.dynamic {
             if let Some(filter) = label_filter {
                 if !filter.matches(&dyn_test.labels) {

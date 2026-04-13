@@ -242,6 +242,56 @@ impl LabelExpr {
             LabelExpr::Or(left, right) => left.matches(test_labels) || right.matches(test_labels),
         }
     }
+
+    /// Compile this expression to a SQL WHERE fragment for correlated subqueries.
+    ///
+    /// Assumes the `running` table is aliased as `r` and `labels` has columns
+    /// `running_id` and `label`.
+    pub(crate) fn to_sql(&self) -> String {
+        match self {
+            LabelExpr::Label(name) => {
+                format!("EXISTS (SELECT 1 FROM labels WHERE running_id = r.id AND label = '{name}')")
+            }
+            LabelExpr::Not(inner) => format!("NOT ({})", inner.to_sql()),
+            LabelExpr::And(a, b) => format!("({} AND {})", a.to_sql(), b.to_sql()),
+            LabelExpr::Or(a, b) => format!("({} OR {})", a.to_sql(), b.to_sql()),
+        }
+    }
+
+    /// Write the expression in human-readable form, adding parentheses only where
+    /// needed by operator precedence (OR=0, AND=1, NOT/Label=2).
+    fn fmt_with_prec(&self, f: &mut std::fmt::Formatter<'_>, min_prec: u8) -> std::fmt::Result {
+        let my_prec = match self {
+            LabelExpr::Or(_, _) => 0,
+            LabelExpr::And(_, _) => 1,
+            LabelExpr::Not(_) | LabelExpr::Label(_) => 2,
+        };
+        let needs_parens = my_prec < min_prec;
+        if needs_parens {
+            write!(f, "(")?;
+        }
+        match self {
+            LabelExpr::Label(name) => write!(f, "{name}")?,
+            LabelExpr::Not(inner) => {
+                write!(f, "!")?;
+                inner.fmt_with_prec(f, 2)?;
+            }
+            LabelExpr::And(a, b) => {
+                a.fmt_with_prec(f, 1)?;
+                write!(f, " & ")?;
+                b.fmt_with_prec(f, 1)?;
+            }
+            LabelExpr::Or(a, b) => {
+                a.fmt_with_prec(f, 0)?;
+                write!(f, " | ")?;
+                b.fmt_with_prec(f, 0)?;
+            }
+        }
+        if needs_parens {
+            write!(f, ")")?;
+        }
+        Ok(())
+    }
 }
 
 /// Parse a label filter expression string into an AST.
@@ -314,13 +364,127 @@ fn build_expr(pair: pest::iterators::Pair<'_, Rule>) -> Result<LabelExpr, String
 /// - Unset → `None` (no filtering, all tests run).
 /// - `""` (empty / whitespace-only) → panics (invalid expression).
 /// - Non-empty → parses as a boolean expression; panics on malformed input.
-pub(crate) fn read_label_filter() -> Option<LabelExpr> {
+pub(crate) fn read_label_filter() -> Option<LabelFilter> {
     let val = std::env::var("SKULD_LABELS").ok()?;
-    match parse_label_expr(&val) {
-        Ok(expr) => Some(expr),
+    match LabelFilter::parse(&val) {
+        Ok(filter) => Some(filter),
         Err(e) => panic!("skuld: SKULD_LABELS: {e}"),
     }
 }
+
+// Label filter type =====
+
+/// A boolean expression over label names that can be matched against a set of
+/// labels to determine whether a test should be selected.
+///
+/// The simplest filter is a single [`Label`]; complex filters are built
+/// with `&` (AND), `|` (OR), and `!` (NOT) operators.
+///
+/// ```ignore
+/// skuld::new_label!(pub DOCKER, "docker");
+/// skuld::new_label!(pub FAST, "fast");
+///
+/// // A single label is a filter:
+/// let f: LabelFilter = DOCKER.into();
+///
+/// // Compose with operators:
+/// let f = DOCKER & !FAST;
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelFilter {
+    pub(crate) expr: LabelExpr,
+}
+
+impl LabelFilter {
+    /// Parse a label filter expression from a string.
+    pub fn parse(input: &str) -> Result<Self, String> {
+        parse_label_expr(input).map(|expr| Self { expr })
+    }
+
+    /// Evaluate the filter against a set of test labels.
+    pub fn matches(&self, labels: &[Label]) -> bool {
+        self.expr.matches(labels)
+    }
+
+    /// Compile the filter to a SQL WHERE fragment for correlated subqueries.
+    ///
+    /// The result is a SQL expression suitable for:
+    /// ```sql
+    /// SELECT EXISTS (SELECT 1 FROM running r WHERE <result>)
+    /// ```
+    pub fn to_sql(&self) -> String {
+        self.expr.to_sql()
+    }
+}
+
+impl std::fmt::Display for LabelFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.expr.fmt_with_prec(f, 0)
+    }
+}
+
+impl From<Label> for LabelFilter {
+    fn from(label: Label) -> Self {
+        Self {
+            expr: LabelExpr::Label(label.name().to_string()),
+        }
+    }
+}
+
+// Operator overloads for LabelFilter composition -----
+
+impl std::ops::Not for LabelFilter {
+    type Output = LabelFilter;
+    fn not(self) -> LabelFilter {
+        LabelFilter {
+            expr: LabelExpr::Not(Box::new(self.expr)),
+        }
+    }
+}
+
+impl std::ops::Not for Label {
+    type Output = LabelFilter;
+    fn not(self) -> LabelFilter {
+        !LabelFilter::from(self)
+    }
+}
+
+macro_rules! impl_filter_binop {
+    ($trait:ident, $method:ident, $variant:ident) => {
+        impl std::ops::$trait for LabelFilter {
+            type Output = LabelFilter;
+            fn $method(self, rhs: LabelFilter) -> LabelFilter {
+                LabelFilter {
+                    expr: LabelExpr::$variant(Box::new(self.expr), Box::new(rhs.expr)),
+                }
+            }
+        }
+
+        impl std::ops::$trait<LabelFilter> for Label {
+            type Output = LabelFilter;
+            fn $method(self, rhs: LabelFilter) -> LabelFilter {
+                LabelFilter::from(self).$method(rhs)
+            }
+        }
+
+        impl std::ops::$trait<Label> for LabelFilter {
+            type Output = LabelFilter;
+            fn $method(self, rhs: Label) -> LabelFilter {
+                self.$method(LabelFilter::from(rhs))
+            }
+        }
+
+        impl std::ops::$trait for Label {
+            type Output = LabelFilter;
+            fn $method(self, rhs: Label) -> LabelFilter {
+                LabelFilter::from(self).$method(LabelFilter::from(rhs))
+            }
+        }
+    };
+}
+
+impl_filter_binop!(BitAnd, bitand, And);
+impl_filter_binop!(BitOr, bitor, Or);
 
 // Module-level default labels =====
 

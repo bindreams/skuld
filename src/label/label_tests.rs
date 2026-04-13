@@ -277,6 +277,216 @@ fn new_rejects_invalid_name_at_runtime() {
     Label::__new("bad-name");
 }
 
+// LabelFilter =====
+
+#[test]
+fn label_filter_parse_and_matches() {
+    let docker = Label::__new("docker");
+    let slow = Label::__new("slow");
+    let filter = LabelFilter::parse("docker & !slow").unwrap();
+    assert!(filter.matches(&[docker]));
+    assert!(!filter.matches(&[docker, slow]));
+    assert!(!filter.matches(&[slow]));
+}
+
+#[test]
+fn label_filter_parse_error() {
+    assert!(LabelFilter::parse("").is_err());
+    assert!(LabelFilter::parse("a &").is_err());
+}
+
+#[test]
+fn label_filter_from_label() {
+    let docker = Label::__new("docker");
+    let other = Label::__new("other");
+    let filter = LabelFilter::from(docker);
+    assert!(filter.matches(&[docker]));
+    assert!(!filter.matches(&[other]));
+    assert!(!filter.matches(&[]));
+}
+
+// LabelFilter: Display -----
+
+#[test]
+fn label_filter_display_bare_label() {
+    let f = LabelFilter::parse("foo").unwrap();
+    assert_eq!(f.to_string(), "foo");
+}
+
+#[test]
+fn label_filter_display_not() {
+    let f = LabelFilter::parse("!foo").unwrap();
+    assert_eq!(f.to_string(), "!foo");
+}
+
+#[test]
+fn label_filter_display_and() {
+    let f = LabelFilter::parse("a & b").unwrap();
+    assert_eq!(f.to_string(), "a & b");
+}
+
+#[test]
+fn label_filter_display_or() {
+    let f = LabelFilter::parse("a | b").unwrap();
+    assert_eq!(f.to_string(), "a | b");
+}
+
+#[test]
+fn label_filter_display_precedence_and_over_or() {
+    // a & b | c — no parens needed (AND binds tighter)
+    let f = LabelFilter::parse("a & b | c").unwrap();
+    assert_eq!(f.to_string(), "a & b | c");
+}
+
+#[test]
+fn label_filter_display_or_inside_and() {
+    // (a | b) & c — parens needed
+    let f = LabelFilter::parse("(a | b) & c").unwrap();
+    assert_eq!(f.to_string(), "(a | b) & c");
+}
+
+#[test]
+fn label_filter_display_not_complex() {
+    let f = LabelFilter::parse("!(a | b)").unwrap();
+    assert_eq!(f.to_string(), "!(a | b)");
+}
+
+#[test]
+fn label_filter_display_double_not() {
+    let f = LabelFilter::parse("!!a").unwrap();
+    assert_eq!(f.to_string(), "!!a");
+}
+
+#[test]
+fn label_filter_display_complex() {
+    let f = LabelFilter::parse("(docker | integration) & !slow").unwrap();
+    assert_eq!(f.to_string(), "(docker | integration) & !slow");
+}
+
+#[test]
+fn label_filter_display_round_trip() {
+    let exprs = ["a", "!a", "a & b", "a | b", "(a | b) & !c", "!(a & b)", "a & b & c"];
+    for expr in exprs {
+        let f = LabelFilter::parse(expr).unwrap();
+        let displayed = f.to_string();
+        let reparsed = LabelFilter::parse(&displayed).unwrap();
+        assert_eq!(
+            f, reparsed,
+            "round-trip failed for {expr:?} (displayed as {displayed:?})"
+        );
+    }
+}
+
+// LabelFilter: operators -----
+
+#[test]
+fn label_filter_not_label() {
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    let filter = !a;
+    assert!(!filter.matches(&[a]));
+    assert!(filter.matches(&[b]));
+}
+
+#[test]
+fn label_filter_label_and_label() {
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    let filter = a & b;
+    assert!(filter.matches(&[a, b]));
+    assert!(!filter.matches(&[a]));
+}
+
+#[test]
+fn label_filter_label_or_label() {
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    let c = Label::__new("c");
+    let filter = a | b;
+    assert!(filter.matches(&[a]));
+    assert!(filter.matches(&[b]));
+    assert!(!filter.matches(&[c]));
+}
+
+#[test]
+fn label_filter_complex_operator_composition() {
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    let c = Label::__new("c");
+    // (a | b) & !c
+    let filter = (a | b) & !c;
+    assert!(filter.matches(&[a]));
+    assert!(filter.matches(&[b]));
+    assert!(!filter.matches(&[c]));
+    assert!(!filter.matches(&[a, c]));
+    assert!(filter.matches(&[a, b]));
+}
+
+#[test]
+fn label_filter_mixed_types() {
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    // Label & LabelFilter
+    let f: LabelFilter = b.into();
+    let filter = a & f;
+    assert!(filter.matches(&[a, b]));
+    assert!(!filter.matches(&[a]));
+
+    // LabelFilter | Label
+    let f2: LabelFilter = a.into();
+    let filter2 = f2 | b;
+    assert!(filter2.matches(&[a]));
+    assert!(filter2.matches(&[b]));
+}
+
+// LabelFilter: to_sql -----
+
+#[test]
+fn label_filter_to_sql_label() {
+    let f = LabelFilter::parse("docker").unwrap();
+    assert_eq!(
+        f.to_sql(),
+        "EXISTS (SELECT 1 FROM labels WHERE running_id = r.id AND label = 'docker')"
+    );
+}
+
+#[test]
+fn label_filter_to_sql_not() {
+    let f = LabelFilter::parse("!docker").unwrap();
+    assert_eq!(
+        f.to_sql(),
+        "NOT (EXISTS (SELECT 1 FROM labels WHERE running_id = r.id AND label = 'docker'))"
+    );
+}
+
+#[test]
+fn label_filter_to_sql_and() {
+    let f = LabelFilter::parse("a & b").unwrap();
+    let sql = f.to_sql();
+    assert!(sql.contains("AND"), "expected AND in SQL: {sql}");
+    assert!(sql.contains("label = 'a'"));
+    assert!(sql.contains("label = 'b'"));
+}
+
+#[test]
+fn label_filter_to_sql_or() {
+    let f = LabelFilter::parse("a | b").unwrap();
+    let sql = f.to_sql();
+    assert!(sql.contains("OR"), "expected OR in SQL: {sql}");
+}
+
+#[test]
+fn label_filter_to_sql_complex() {
+    let f = LabelFilter::parse("(docker | integration) & !slow").unwrap();
+    let sql = f.to_sql();
+    assert!(sql.contains("AND"));
+    assert!(sql.contains("OR"));
+    assert!(sql.contains("NOT"));
+    assert!(sql.contains("label = 'docker'"));
+    assert!(sql.contains("label = 'integration'"));
+    assert!(sql.contains("label = 'slow'"));
+}
+
 // Cross-validation: validate_label_name and PEG grammar agree -----
 
 #[test]

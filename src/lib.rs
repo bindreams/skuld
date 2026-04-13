@@ -29,7 +29,7 @@ pub use fixtures::cwd::{cwd, CwdGuard};
 pub use fixtures::env::{env, EnvGuard};
 pub use fixtures::temp_dir::{temp_dir, TempDir};
 pub use fixtures::test_name::{test_name, TestName};
-pub use label::{Label, LabelEntry, LabelEntryKind, ModuleLabels};
+pub use label::{Label, LabelEntry, LabelEntryKind, LabelFilter, ModuleLabels};
 pub use metadata::{FixtureMetadata, RequirementInfo, TestMetadata};
 pub use runner::{run_all, TestRunner};
 
