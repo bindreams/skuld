@@ -24,7 +24,10 @@ fn metadata_lists_own_fixture(#[fixture(metadata)] meta: &TestMetadata) {
 
 #[skuld::test(serial)]
 fn metadata_serial_flag(#[fixture(metadata)] meta: &TestMetadata) {
-    assert!(meta.serial, "test marked serial should report serial=true");
+    assert!(
+        !meta.serial.is_empty(),
+        "test marked serial should report non-empty serial filter"
+    );
 }
 
 #[skuld::test]
@@ -41,7 +44,7 @@ fn fixture_metadata_from_registry() {
     let fm = FixtureMetadata::from_def(def);
     assert_eq!(fm.name, "test_name");
     assert_eq!(fm.scope, "test");
-    assert!(!fm.serial);
+    assert!(fm.serial.is_empty());
     let yaml = fm.to_string();
     assert!(yaml.contains("test_name"));
 }

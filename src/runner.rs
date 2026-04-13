@@ -13,7 +13,9 @@ use clap::Parser;
 use libtest_mimic::{Arguments, Trial};
 
 use crate::capture::FdCapture;
-use crate::fixture::{cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope};
+use crate::fixture::{
+    cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope, merge_serial_filters,
+};
 use crate::label::{read_label_filter, resolve_labels, validate_labels, Label, LabelFilter, ModuleLabels};
 use crate::{Ignore, TestDef};
 
@@ -179,7 +181,7 @@ fn run_with_observability(name: &str, capture: bool, serial: bool, body: impl Fn
 struct DynTest {
     name: String,
     ignored: bool,
-    serial: bool,
+    serial: String,
     labels: Vec<Label>,
     body: Box<dyn FnOnce() + Send + 'static>,
 }
@@ -220,7 +222,7 @@ impl TestRunner {
         self.dynamic.push(DynTest {
             name: name.into(),
             ignored,
-            serial: false,
+            serial: String::new(),
             labels: labels.to_vec(),
             body: Box::new(body),
         });
@@ -237,7 +239,25 @@ impl TestRunner {
         self.dynamic.push(DynTest {
             name: name.into(),
             ignored,
-            serial: true,
+            serial: "*".to_string(),
+            labels: labels.to_vec(),
+            body: Box::new(body),
+        });
+    }
+
+    /// Add a test with filtered serial execution.
+    pub fn add_serial_with(
+        &mut self,
+        name: impl Into<String>,
+        labels: &[Label],
+        ignored: bool,
+        filter: LabelFilter,
+        body: impl FnOnce() + Send + 'static,
+    ) {
+        self.dynamic.push(DynTest {
+            name: name.into(),
+            ignored,
+            serial: filter.to_string(),
             labels: labels.to_vec(),
             body: Box::new(body),
         });
@@ -337,7 +357,9 @@ impl TestRunner {
 
             if reasons.is_empty() {
                 let body = def.body;
-                let is_serial = def.serial || collect_fixture_serial(def.fixture_names);
+                let fixture_serial = collect_fixture_serial(def.fixture_names);
+                let effective_serial = merge_serial_filters(def.serial, &fixture_serial);
+                let is_serial = !effective_serial.is_empty();
                 let observed_name = trial_name.to_string();
                 trials.push(Trial::test(trial_name, move || {
                     run_with_observability(&observed_name, capture, is_serial, body);
@@ -360,7 +382,7 @@ impl TestRunner {
             }
 
             let body = dyn_test.body;
-            let is_serial = dyn_test.serial;
+            let is_serial = !dyn_test.serial.is_empty();
             // Intentional leak: dynamic test names need 'static lifetime for enter_test_scope.
             // Acceptable because the harness runs once per process.
             let name_static: &'static str = Box::leak(dyn_test.name.into_boxed_str());

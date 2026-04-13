@@ -15,7 +15,8 @@ struct TestArgs {
     name: Option<String>,
     labels: Option<Vec<Path>>,
     ignore: IgnoreArg,
-    serial: bool,
+    serial: Option<String>,
+    serial_labels: Vec<Ident>,
     should_panic: ShouldPanicArg,
 }
 
@@ -79,7 +80,14 @@ impl Parse for TestArgs {
                     }
                 }
                 "serial" => {
-                    args.serial = true;
+                    if input.peek(Token![=]) {
+                        let _eq: Token![=] = input.parse()?;
+                        let (expr_str, label_idents) = parse_serial_expr(input)?;
+                        args.serial = Some(expr_str);
+                        args.serial_labels = label_idents;
+                    } else {
+                        args.serial = Some("*".to_string());
+                    }
                 }
                 "should_panic" => {
                     if input.peek(Token![=]) {
@@ -181,7 +189,8 @@ struct FixtureArgs {
     scope: Option<Ident>,
     name: Option<String>,
     deref: bool,
-    serial: bool,
+    serial: Option<String>,
+    serial_labels: Vec<Ident>,
 }
 
 impl Parse for FixtureArgs {
@@ -224,7 +233,14 @@ impl Parse for FixtureArgs {
                     args.deref = true;
                 }
                 "serial" => {
-                    args.serial = true;
+                    if input.peek(Token![=]) {
+                        let _eq: Token![=] = input.parse()?;
+                        let (expr_str, label_idents) = parse_serial_expr(input)?;
+                        args.serial = Some(expr_str);
+                        args.serial_labels = label_idents;
+                    } else {
+                        args.serial = Some("*".to_string());
+                    }
                 }
                 other => {
                     return Err(syn::Error::new(
@@ -244,6 +260,59 @@ impl Parse for FixtureArgs {
         }
 
         Ok(args)
+    }
+}
+
+// Serial expression parsing =======================================================================
+
+/// Parse a serial filter expression from proc-macro tokens.
+/// Returns (canonical_expression_string, list_of_label_identifiers).
+fn parse_serial_expr(input: ParseStream) -> syn::Result<(String, Vec<Ident>)> {
+    let mut labels = Vec::new();
+    let expr = parse_serial_or(input, &mut labels)?;
+    Ok((expr, labels))
+}
+
+fn parse_serial_or(input: ParseStream, labels: &mut Vec<Ident>) -> syn::Result<String> {
+    let mut left = parse_serial_and(input, labels)?;
+    while input.peek(Token![|]) {
+        let _: Token![|] = input.parse()?;
+        let right = parse_serial_and(input, labels)?;
+        left = format!("{left} | {right}");
+    }
+    Ok(left)
+}
+
+fn parse_serial_and(input: ParseStream, labels: &mut Vec<Ident>) -> syn::Result<String> {
+    let mut left = parse_serial_not(input, labels)?;
+    while input.peek(Token![&]) {
+        let _: Token![&] = input.parse()?;
+        let right = parse_serial_not(input, labels)?;
+        left = format!("{left} & {right}");
+    }
+    Ok(left)
+}
+
+fn parse_serial_not(input: ParseStream, labels: &mut Vec<Ident>) -> syn::Result<String> {
+    if input.peek(Token![!]) {
+        let _: Token![!] = input.parse()?;
+        let inner = parse_serial_not(input, labels)?;
+        Ok(format!("!{inner}"))
+    } else {
+        parse_serial_primary(input, labels)
+    }
+}
+
+fn parse_serial_primary(input: ParseStream, labels: &mut Vec<Ident>) -> syn::Result<String> {
+    if input.peek(syn::token::Paren) {
+        let content;
+        syn::parenthesized!(content in input);
+        let inner = parse_serial_or(&content, labels)?;
+        Ok(format!("({inner})"))
+    } else {
+        let ident: Ident = input.parse()?;
+        labels.push(ident.clone());
+        Ok(ident.to_string())
     }
 }
 
@@ -561,11 +630,27 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
         ShouldPanicArg::WithMessage(msg) => quote! { ::skuld::ShouldPanic::WithMessage(#msg) },
     };
 
-    let serial = args.serial;
+    let serial_str = match &args.serial {
+        None => String::new(),
+        Some(s) => s.clone(),
+    };
+
+    let serial_label_checks = if args.serial_labels.is_empty() {
+        quote! {}
+    } else {
+        let label_idents = &args.serial_labels;
+        quote! {
+            const _: () = {
+                #(let _ = #label_idents;)*
+            };
+        }
+    };
 
     let expanded = quote! {
         #(#attrs)*
         #vis #asyncness #fn_token #name(#(#clean_params),*) #ret #block
+
+        #serial_label_checks
 
         ::skuld::inventory::submit!(::skuld::TestDef {
             name: #name_str,
@@ -576,7 +661,7 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
             ignore: #ignore_expr,
             labels: &[#(#label_paths),*],
             labels_explicit: #labels_explicit,
-            serial: #serial,
+            serial: #serial_str,
             should_panic: #should_panic_expr,
             body: #body_expr,
         });
@@ -735,7 +820,21 @@ fn expand_fixture_def(args: FixtureArgs, func: &mut ItemFn) -> TokenStream {
     };
 
     let fixture_ty_str = quote!(#fixture_ty).to_string();
-    let serial = args.serial;
+    let serial_str = match &args.serial {
+        None => String::new(),
+        Some(s) => s.clone(),
+    };
+
+    let serial_label_checks = if args.serial_labels.is_empty() {
+        quote! {}
+    } else {
+        let label_idents = &args.serial_labels;
+        quote! {
+            const _: () = {
+                #(let _ = #label_idents;)*
+            };
+        }
+    };
 
     // When a custom name is used (name = "..."), the fixture name differs from
     // the function name. Generate a public const anchor so that tests using
@@ -756,6 +855,8 @@ fn expand_fixture_def(args: FixtureArgs, func: &mut ItemFn) -> TokenStream {
 
         #anchor
 
+        #serial_label_checks
+
         ::skuld::inventory::submit!(::skuld::FixtureDef {
             name: #fixture_name,
             scope: #scope_expr,
@@ -772,7 +873,7 @@ fn expand_fixture_def(args: FixtureArgs, func: &mut ItemFn) -> TokenStream {
             },
             cast: #cast_fn,
             type_name: #fixture_ty_str,
-            serial: #serial,
+            serial: #serial_str,
         });
     };
     expanded.into()

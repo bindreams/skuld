@@ -27,7 +27,7 @@ mod runner_tests;
 pub use coordination::{SERIAL_ALL, SERIAL_NONE};
 pub use fixture::{
     cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope, fixture, fixture_get,
-    fixture_registry, warm_up, FixtureDef, FixtureHandle, FixtureRef, FixtureScope, TestScope,
+    fixture_registry, merge_serial_filters, warm_up, FixtureDef, FixtureHandle, FixtureRef, FixtureScope, TestScope,
 };
 pub use fixtures::cwd::{cwd, CwdGuard};
 pub use fixtures::env::{env, EnvGuard};
@@ -129,9 +129,11 @@ pub struct TestDef {
     /// Whether `labels = [...]` was explicitly written (even if empty).
     /// When false, module-level defaults from `default_labels!` apply.
     pub labels_explicit: bool,
-    /// Whether this test must run under the global serial lock.
+    /// Serial filter expression for this test.
+    /// Empty string means non-serial; `"*"` means serial with everything;
+    /// a label expression means serial only with tests matching that filter.
     /// Propagated transitively from fixtures via [`collect_fixture_serial`].
-    pub serial: bool,
+    pub serial: &'static str,
     pub should_panic: ShouldPanic,
     pub body: fn(),
 }

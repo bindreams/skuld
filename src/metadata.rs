@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::Serialize;
 
-use crate::fixture::{collect_fixture_serial, fixture_registry, FixtureDef, FixtureScope};
+use crate::fixture::{collect_fixture_serial, fixture_registry, merge_serial_filters, FixtureDef, FixtureScope};
 use crate::{Ignore, Requirement, ShouldPanic, TestDef};
 
 // RequirementInfo =================================================================================
@@ -43,7 +43,7 @@ impl RequirementInfo {
 pub struct FixtureMetadata {
     pub name: String,
     pub scope: String,
-    pub serial: bool,
+    pub serial: String,
     pub deps: Vec<String>,
     pub type_name: String,
     pub requires: Vec<RequirementInfo>,
@@ -60,7 +60,7 @@ impl FixtureMetadata {
                 FixtureScope::Process => "process",
             }
             .to_owned(),
-            serial: def.serial,
+            serial: def.serial.to_owned(),
             deps: def.deps.iter().map(|s| s.to_string()).collect(),
             type_name: def.type_name.to_owned(),
             requires: def.requires.iter().map(RequirementInfo::from_requirement).collect(),
@@ -85,7 +85,7 @@ pub struct TestMetadata {
     pub module: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    pub serial: bool,
+    pub serial: String,
     pub labels: Vec<String>,
     pub ignore: String,
     pub should_panic: String,
@@ -123,7 +123,8 @@ impl TestMetadata {
             .filter_map(|&name| registry.get(name).map(|d| FixtureMetadata::from_def(d)))
             .collect();
 
-        let is_serial = def.serial || collect_fixture_serial(def.fixture_names);
+        let fixture_serial = collect_fixture_serial(def.fixture_names);
+        let effective_serial = merge_serial_filters(def.serial, &fixture_serial);
 
         let requires: Vec<RequirementInfo> = def.requires.iter().map(RequirementInfo::from_requirement).collect();
 
@@ -143,7 +144,7 @@ impl TestMetadata {
             name: def.name.to_owned(),
             module: def.module.to_owned(),
             display_name: def.display_name.map(str::to_owned),
-            serial: is_serial,
+            serial: effective_serial,
             labels: def.labels.iter().map(|l| l.name().to_owned()).collect(),
             ignore,
             should_panic,
