@@ -116,7 +116,7 @@ fn acquire_serial_lock() -> SerialGuard {
 }
 
 /// Run `body` under the serial lock if `serial` is true, or directly otherwise.
-fn run_maybe_serial(serial: bool, body: impl FnOnce()) {
+pub(crate) fn run_maybe_serial(serial: bool, body: impl FnOnce()) {
     if serial {
         let _guard = acquire_serial_lock();
         body();
