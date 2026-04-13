@@ -144,7 +144,7 @@ impl TestMetadata {
             module: def.module.to_owned(),
             display_name: def.display_name.map(str::to_owned),
             serial: is_serial,
-            labels: def.labels.iter().map(|s| s.to_string()).collect(),
+            labels: def.labels.iter().map(|l| l.name().to_owned()).collect(),
             ignore,
             should_panic,
             fixtures: fixture_metas,

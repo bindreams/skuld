@@ -71,7 +71,7 @@ fn valgrind() -> Result<(), String> {
     skuld::probe_executable("valgrind")
 }
 
-#[skuld::test(requires = [valgrind], labels = [slow])]
+#[skuld::test(requires = [valgrind], labels = [SLOW])]
 fn smoke_test() {
     // Runs only if valgrind is available.
 }
@@ -189,29 +189,37 @@ fn example2(#[fixture(temp_dir)] dir: &Path) { /* ... */ }
 
 ## Labels
 
-Tests can be labeled for selective execution:
+Labels are sentinel values for tagging and filtering tests. Define them with `new_label!`:
 
 ```rust
-#[skuld::test(labels = [docker, slow])]
+skuld::new_label!(pub DOCKER, "docker");
+skuld::new_label!(pub SLOW, "slow");
+
+#[skuld::test(labels = [DOCKER, SLOW])]
 fn heavy_test() { /* ... */ }
 ```
 
-Filter from the command line:
+Filter with the `SKULD_LABELS` environment variable:
 
 ```bash
-cargo test -- --label docker          # run only tests labeled "docker"
-cargo test -- --label=docker,!slow    # docker tests, excluding slow ones
+SKULD_LABELS=docker cargo test           # only tests labeled "docker"
+SKULD_LABELS=docker,slow cargo test      # tests labeled "docker" OR "slow"
 ```
+
+Unset `SKULD_LABELS` runs all tests; `SKULD_LABELS=""` runs none.
 
 ### Module-level defaults
 
 ```rust
-skuld::default_labels!(smoke, unit);
+skuld::new_label!(pub SMOKE, "smoke");
+skuld::new_label!(pub UNIT, "unit");
+skuld::new_label!(pub SLOW, "slow");
+skuld::default_labels!(SMOKE, UNIT);
 
-#[skuld::test]                      // inherits [smoke, unit]
+#[skuld::test]                      // inherits [SMOKE, UNIT]
 fn test_a() { /* ... */ }
 
-#[skuld::test(labels = [slow])]     // gets [slow], NOT [smoke, unit, slow]
+#[skuld::test(labels = [SLOW])]     // gets [SLOW], NOT [SMOKE, UNIT, SLOW]
 fn test_b() { /* ... */ }
 
 #[skuld::test(labels = [])]         // gets nothing (explicit opt-out)
@@ -248,12 +256,14 @@ Use `TestRunner` to mix inventory-registered and runtime-generated tests:
 
 ```rust
 fn main() {
+    skuld::new_label!(DATA, "data");
+
     let mut runner = skuld::TestRunner::new();
     for file in std::fs::read_dir("test_data").unwrap() {
         let path = file.unwrap().path();
         runner.add(
             path.display().to_string(),
-            &["data"],
+            &[DATA],
             false,
             move || { /* test body */ },
         );

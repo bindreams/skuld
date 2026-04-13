@@ -1,91 +1,225 @@
-//! Label filtering and module-level default labels.
+//! Label types, filtering, validation, and module-level defaults.
 //!
-//! Tests can be labeled for selective execution via `--label` CLI arguments.
-//! Labels support inclusion (`--label docker`) and exclusion (`--label !slow`),
-//! with comma-separated values (`--label=docker,!slow`).
+//! Labels are sentinel values created with [`new_label!`] and optionally
+//! aliased with [`get_label!`]. Tests are filtered by the `SKULD_LABELS`
+//! environment variable (comma-separated, include-only, union semantics).
+
+#[cfg(test)]
+mod label_tests;
 
 use crate::TestDef;
 
-// Label selectors =====================================================================================
+// Label type =====
 
-pub(crate) enum LabelSelector {
-    Include(String),
-    Exclude(String),
-}
-
-/// Extract `--label` arguments from the process args, returning the selectors
-/// and the remaining args (for libtest-mimic).
+/// A test label. Created via [`new_label!`] (definition) or [`get_label!`] (reference).
 ///
-/// Supports `--label docker`, `--label=docker,!slow`, and comma-separated values.
-/// Use `!label` to exclude.
-pub(crate) fn extract_label_filters() -> (Vec<LabelSelector>, Vec<String>) {
-    let args: Vec<String> = std::env::args().collect();
-    let mut selectors = Vec::new();
-    let mut remaining = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--label" {
-            i += 1;
-            if i < args.len() {
-                parse_label_arg(&args[i], &mut selectors);
-            }
-        } else if let Some(val) = args[i].strip_prefix("--label=") {
-            parse_label_arg(val, &mut selectors);
-        } else {
-            remaining.push(args[i].clone());
-        }
-        i += 1;
-    }
-
-    (selectors, remaining)
+/// ```ignore
+/// skuld::new_label!(pub DOCKER, "docker");
+/// skuld::get_label!(pub ALSO_DOCKER, "docker");
+///
+/// #[skuld::test(labels = [DOCKER])]
+/// fn my_test() {}
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Label {
+    name: &'static str,
 }
 
-fn parse_label_arg(val: &str, selectors: &mut Vec<LabelSelector>) {
-    for part in val.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Some(label) = part.strip_prefix('!') {
-            selectors.push(LabelSelector::Exclude(label.to_string()));
-        } else {
-            selectors.push(LabelSelector::Include(part.to_string()));
+impl Label {
+    #[doc(hidden)]
+    pub const fn __new(name: &'static str) -> Self {
+        Self { name }
+    }
+
+    /// The string name of this label.
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+impl std::fmt::Display for Label {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name)
+    }
+}
+
+// Label registration =====
+
+/// Whether a label entry is a definition ([`new_label!`]) or a reference ([`get_label!`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelEntryKind {
+    New,
+    Get,
+}
+
+/// A registration entry submitted by [`new_label!`] or [`get_label!`] via `inventory`.
+#[doc(hidden)]
+pub struct LabelEntry {
+    pub name: &'static str,
+    pub kind: LabelEntryKind,
+    pub file: &'static str,
+    pub line: u32,
+    pub column: u32,
+}
+
+inventory::collect!(LabelEntry);
+
+/// Define a new label constant. Panics at startup if another `new_label!` with
+/// the same name exists anywhere in the binary.
+///
+/// ```ignore
+/// skuld::new_label!(pub DOCKER, "docker");
+/// skuld::new_label!(INTERNAL_LABEL, "internal"); // private
+/// ```
+#[macro_export]
+macro_rules! new_label {
+    ($vis:vis $ident:ident, $name:literal) => {
+        $vis const $ident: $crate::Label = $crate::Label::__new($name);
+
+        $crate::inventory::submit!($crate::LabelEntry {
+            name: $name,
+            kind: $crate::LabelEntryKind::New,
+            file: ::core::file!(),
+            line: ::core::line!(),
+            column: ::core::column!(),
+        });
+    };
+}
+
+/// Reference an existing label (defined elsewhere with [`new_label!`]).
+/// Panics at startup if no corresponding `new_label!` exists in the binary.
+///
+/// ```ignore
+/// skuld::get_label!(pub DOCKER, "docker"); // must have a new_label!("docker") somewhere
+/// ```
+#[macro_export]
+macro_rules! get_label {
+    ($vis:vis $ident:ident, $name:literal) => {
+        $vis const $ident: $crate::Label = $crate::Label::__new($name);
+
+        $crate::inventory::submit!($crate::LabelEntry {
+            name: $name,
+            kind: $crate::LabelEntryKind::Get,
+            file: ::core::file!(),
+            line: ::core::line!(),
+            column: ::core::column!(),
+        });
+    };
+}
+
+// Label validation =====
+
+/// Validate all label registrations. Called at the start of
+/// [`TestRunner::run_tests()`](crate::runner::TestRunner::run_tests).
+///
+/// Panics if:
+/// - Two `new_label!` entries share the same name.
+/// - A `get_label!` entry has no corresponding `new_label!`.
+pub(crate) fn validate_labels() {
+    if let Err(msg) = check_label_registry() {
+        panic!("{msg}");
+    }
+}
+
+/// Inner validation that returns all error messages instead of panicking,
+/// so unit tests can assert on specific failures.
+///
+/// Collects every error (duplicate definitions, orphan references) and
+/// returns them joined, so that a single run surfaces all problems.
+pub(crate) fn check_label_registry() -> Result<(), String> {
+    use std::collections::HashMap;
+
+    let mut definitions: HashMap<&str, Vec<&LabelEntry>> = HashMap::new();
+    let mut references: Vec<&LabelEntry> = Vec::new();
+
+    for entry in inventory::iter::<LabelEntry> {
+        match entry.kind {
+            LabelEntryKind::New => {
+                definitions.entry(entry.name).or_default().push(entry);
+            }
+            LabelEntryKind::Get => {
+                references.push(entry);
+            }
         }
     }
+
+    let mut errors: Vec<String> = Vec::new();
+
+    let mut sorted_names: Vec<&&str> = definitions.keys().collect();
+    sorted_names.sort();
+    for name in sorted_names {
+        let defs = &definitions[name];
+        if defs.len() > 1 {
+            let locations: Vec<String> = defs
+                .iter()
+                .map(|e| format!("  {}:{}:{}", e.file, e.line, e.column))
+                .collect();
+            errors.push(format!(
+                "label {:?} defined multiple times with new_label!:\n{}",
+                name,
+                locations.join("\n")
+            ));
+        }
+    }
+
+    for entry in &references {
+        if !definitions.contains_key(entry.name) {
+            errors.push(format!(
+                "get_label!({:?}) at {}:{}:{} has no corresponding new_label! definition",
+                entry.name, entry.file, entry.line, entry.column
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("skuld: label validation failed:\n{}", errors.join("\n")))
+    }
+}
+
+// Label filtering =====
+
+/// Read label filter from the `SKULD_LABELS` environment variable.
+///
+/// - Unset → `None` (no filtering, all tests run)
+/// - `""` → `Some(vec![])` (empty list, no tests match any label)
+/// - `"docker,slow"` → `Some(vec!["docker", "slow"])` (include-only, union)
+pub(crate) fn read_label_filter() -> Option<Vec<String>> {
+    parse_label_filter(std::env::var("SKULD_LABELS").ok())
+}
+
+/// Parse an optional label filter value into a filter list.
+///
+/// Pure function extracted from [`read_label_filter`] for testability.
+pub(crate) fn parse_label_filter(val: Option<String>) -> Option<Vec<String>> {
+    val.map(|v| {
+        v.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
 }
 
 /// Check whether a test with the given labels passes the label filter.
 ///
-/// - Includes form a union: test must match ANY include.
-/// - Excludes subtract: test must not match ANY exclude.
-/// - No includes → all tests included by default.
-/// - No selectors → all tests pass.
-pub(crate) fn label_matches(test_labels: &[&str], selectors: &[LabelSelector]) -> bool {
-    let has_includes = selectors.iter().any(|s| matches!(s, LabelSelector::Include(_)));
-
-    let included = if has_includes {
-        selectors.iter().any(|s| match s {
-            LabelSelector::Include(l) => test_labels.contains(&l.as_str()),
-            LabelSelector::Exclude(_) => false,
-        })
-    } else {
-        true
-    };
-
-    let excluded = selectors.iter().any(|s| match s {
-        LabelSelector::Exclude(l) => test_labels.contains(&l.as_str()),
-        LabelSelector::Include(_) => false,
-    });
-
-    included && !excluded
+/// - `None` → all tests pass (no filtering active).
+/// - `Some(&[])` → no tests pass (empty filter).
+/// - `Some(&[..])` → test must have at least one label whose name is in the list.
+pub(crate) fn label_matches(test_labels: &[Label], filter: Option<&[String]>) -> bool {
+    match filter {
+        None => true,
+        Some(allowed) => test_labels.iter().any(|l| allowed.iter().any(|a| a == l.name())),
+    }
 }
 
-// Module-level default labels =========================================================================
+// Module-level default labels =====
 
 /// Default labels for all tests in a module. Registered by [`default_labels!`].
 pub struct ModuleLabels {
     pub module: &'static str,
-    pub labels: &'static [&'static str],
+    pub labels: &'static [Label],
 }
 
 inventory::collect!(ModuleLabels);
@@ -96,32 +230,34 @@ inventory::collect!(ModuleLabels);
 /// not affected — explicit labels fully replace defaults.
 ///
 /// ```ignore
-/// skuld::default_labels!(docker, conformance);
+/// skuld::new_label!(pub DOCKER, "docker");
+/// skuld::new_label!(pub CONFORMANCE, "conformance");
+/// skuld::default_labels!(DOCKER, CONFORMANCE);
 ///
-/// #[skuld::test]                    // inherits [docker, conformance]
+/// #[skuld::test]                       // inherits [DOCKER, CONFORMANCE]
 /// fn test_a() { ... }
 ///
-/// #[skuld::test(labels = [slow])]   // gets [slow], not [docker, conformance, slow]
+/// #[skuld::test(labels = [DOCKER])]    // gets [DOCKER], not both
 /// fn test_b() { ... }
 ///
-/// #[skuld::test(labels = [])]       // gets nothing — explicit opt-out
+/// #[skuld::test(labels = [])]          // gets nothing — explicit opt-out
 /// fn test_c() { ... }
 /// ```
 #[macro_export]
 macro_rules! default_labels {
-    ($($label:ident),+ $(,)?) => {
+    ($($label:path),+ $(,)?) => {
         $crate::inventory::submit!($crate::ModuleLabels {
             module: ::core::module_path!(),
-            labels: &[$(::core::stringify!($label)),+],
+            labels: &[$($label),+],
         });
     };
 }
 
 /// Resolve the effective labels for a test, applying module defaults if the test
 /// did not explicitly specify `labels = [...]`.
-pub(crate) fn resolve_labels(def: &TestDef, module_defaults: &[&ModuleLabels]) -> Vec<String> {
+pub(crate) fn resolve_labels(def: &TestDef, module_defaults: &[&ModuleLabels]) -> Vec<Label> {
     if def.labels_explicit {
-        return def.labels.iter().map(|s| s.to_string()).collect();
+        return def.labels.to_vec();
     }
     // Find the longest module prefix match.
     let default = module_defaults
@@ -129,7 +265,7 @@ pub(crate) fn resolve_labels(def: &TestDef, module_defaults: &[&ModuleLabels]) -
         .filter(|m| def.module.starts_with(m.module))
         .max_by_key(|m| m.module.len());
     match default {
-        Some(m) => m.labels.iter().map(|s| s.to_string()).collect(),
-        None => def.labels.iter().map(|s| s.to_string()).collect(),
+        Some(m) => m.labels.to_vec(),
+        None => def.labels.to_vec(),
     }
 }

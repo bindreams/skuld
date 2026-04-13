@@ -89,4 +89,4 @@ test result: ok. 0 passed; 0 failed; 2 ignored
 
 - [Writing Tests](writing-tests.md) — all `#[skuld::test]` options
 - [Fixtures](fixtures.md) — dependency-injected test resources
-- [Labels](labels.md) — filter tests from the command line
+- [Labels](labels.md) — tag tests with sentinel labels and filter via `SKULD_LABELS`
