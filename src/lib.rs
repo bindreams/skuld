@@ -13,6 +13,9 @@
 extern crate self as skuld;
 
 mod capture;
+// TODO(#21): remove allow(dead_code) once runner integration is complete.
+#[allow(dead_code)]
+pub(crate) mod coordination;
 pub mod fixture;
 pub mod fixtures;
 pub mod label;
@@ -21,6 +24,7 @@ pub mod runner;
 #[cfg(test)]
 mod runner_tests;
 
+pub use coordination::{SERIAL_ALL, SERIAL_NONE};
 pub use fixture::{
     cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope, fixture, fixture_get,
     fixture_registry, warm_up, FixtureDef, FixtureHandle, FixtureRef, FixtureScope, TestScope,
