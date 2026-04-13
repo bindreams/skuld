@@ -62,7 +62,10 @@ hooks = [
 repo = "https://github.com/hukkin/mdformat"
 rev = "0.7.21"
 hooks = [
-  { id = "mdformat", additional_dependencies = ["mdformat-gfm"] },
+  # Exclude LICENSE.md: license text is canonical and should not be
+  # reformatted (mdformat would convert asterisk bullets to hyphens and
+  # double-space line breaks to backslash line breaks).
+  { id = "mdformat", additional_dependencies = ["mdformat-gfm"], exclude = '^LICENSE\.md$' },
 ]
 
 [[repos]]
