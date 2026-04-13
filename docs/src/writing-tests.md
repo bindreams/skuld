@@ -11,7 +11,8 @@ Every test function must be annotated with `#[skuld::test]`. The attribute regis
 #[skuld::test(labels = [DOCKER, SLOW])]             // labels for filtering
 #[skuld::test(ignore)]                              // statically ignored
 #[skuld::test(ignore = "blocked on #123")]          // ignored with reason
-#[skuld::test(serial)]                              // run under global mutex
+#[skuld::test(serial)]                              // serial with everything
+#[skuld::test(serial = DATABASE & !FAST)]            // serial with a filter
 ```
 
 Options can be combined:

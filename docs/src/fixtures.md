@@ -37,23 +37,23 @@ fn my_resource() -> Result<MyResource, String> {
 
 The `#[skuld::fixture]` attribute supports these options:
 
-| Option | Description |
-| --- | --- |
-| `scope = variable\|test\|process` | Lifetime scope (default: `variable`) |
-| `requires = [...]` | Runtime preconditions (propagated to tests) |
-| `name = "..."` | Override the fixture name (default: function name) |
-| `deref` | Also support injection as `Deref::Target` type |
-| `serial` | Tests using this fixture run under the global serial mutex |
+| Option                            | Description                                                                            |
+| --------------------------------- | -------------------------------------------------------------------------------------- |
+| `scope = variable\|test\|process` | Lifetime scope (default: `variable`)                                                   |
+| `requires = [...]`                | Runtime preconditions (propagated to tests)                                            |
+| `name = "..."`                    | Override the fixture name (default: function name)                                     |
+| `deref`                           | Also support injection as `Deref::Target` type                                         |
+| `serial` or `serial = <expr>`     | Tests using this fixture inherit the serial constraint (see [Serial Tests](serial.md)) |
 
 ## Scopes
 
 Each fixture has a lifetime scope that controls when it's created and destroyed:
 
-| Scope | Behaviour |
-| --- | --- |
+| Scope                | Behaviour                                                             |
+| -------------------- | --------------------------------------------------------------------- |
 | `variable` (default) | Fresh instance per injection. Dropped when the `FixtureHandle` drops. |
-| `test` | Cached per test. Dropped when the test ends. |
-| `process` | Cached globally. Dropped after all tests finish (LIFO). |
+| `test`               | Cached per test. Dropped when the test ends.                          |
+| `process`            | Cached globally. Dropped after all tests finish (LIFO).               |
 
 ```rust
 #[skuld::fixture(scope = test)]
@@ -100,14 +100,15 @@ If a fixture declares `requires = [...]`, any test using that fixture automatica
 
 ## Built-in fixtures
 
-| Fixture | Scope | Type | Serial | Description |
-| --- | --- | --- | --- | --- |
-| `test_name` | test | `TestName` (deref to `&str`) | no | Current test function name |
-| `temp_dir` | variable | `TempDir` (deref to `&Path`) | no | Temporary directory named after the test |
-| `env` | test | `EnvGuard` | yes | Set/remove env vars with automatic revert |
-| `cwd` | test | `CwdGuard` | yes | Change working directory with automatic revert |
+| Fixture     | Scope    | Type                         | Serial | Description                                    |
+| ----------- | -------- | ---------------------------- | ------ | ---------------------------------------------- |
+| `test_name` | test     | `TestName` (deref to `&str`) | no     | Current test function name                     |
+| `temp_dir`  | variable | `TempDir` (deref to `&Path`) | no     | Temporary directory named after the test       |
+| `env`       | test     | `EnvGuard`                   | yes    | Set/remove env vars with automatic revert      |
+| `cwd`       | test     | `CwdGuard`                   | yes    | Change working directory with automatic revert |
 
 (env-environment-variables)=
+
 ### `env` — environment variables
 
 The `env` fixture provides an `EnvGuard` for safely modifying environment variables. All changes are reverted when the test ends:
@@ -124,6 +125,7 @@ fn my_test(#[fixture] env: &skuld::EnvGuard) {
 Because environment variables are process-global, the `env` fixture is marked `serial` — tests using it never run in parallel.
 
 (cwd-working-directory)=
+
 ### `cwd` — working directory
 
 The `cwd` fixture provides a `CwdGuard` for safely changing the working directory. It maintains a stack of directories, so `back()` returns to the previous one (like `cd -`):
@@ -139,6 +141,21 @@ fn my_test(#[fixture] cwd: &skuld::CwdGuard, #[fixture(temp_dir)] dir: &Path) {
 ```
 
 Like `env`, the `cwd` fixture is `serial`.
+
+## Serial fixtures
+
+Fixtures support the same `serial` syntax as tests. A bare `serial` means serial with everything; `serial = <expr>` applies a filter:
+
+```rust
+skuld::new_label!(DATABASE, "database");
+
+#[skuld::fixture(scope = test, serial = DATABASE)]
+fn db_conn() -> Result<DbConn, String> {
+    Ok(DbConn::new())
+}
+```
+
+Any test using `db_conn` inherits `serial = DATABASE` without declaring it. When multiple fixtures contribute different serial filters, they are combined with OR. See [Serial Tests](serial.md) for details.
 
 ## Tool fixtures
 

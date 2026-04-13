@@ -44,6 +44,25 @@ runner.add_serial(
 );
 ```
 
+## Filtered serial dynamic tests
+
+Use `add_serial_with` for dynamic tests that need serial execution with a filter expression:
+
+```rust
+skuld::new_label!(DATABASE, "database");
+skuld::new_label!(FAST, "fast");
+
+runner.add_serial_with(
+    "filtered serial test",
+    &[DATABASE],
+    false,
+    DATABASE & !FAST,   // LabelFilter via operator overloads
+    || { /* body */ },
+);
+```
+
+The filter argument is a `LabelFilter`, built from `Label` constants using `&` (AND), `|` (OR), and `!` (NOT).
+
 ## Custom CLI arguments
 
 If your test binary accepts custom flags that would otherwise be rejected by the argument parser, strip them:
