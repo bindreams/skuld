@@ -8,7 +8,6 @@ use crate::LabelFilter;
 // tests assert that canonicalization actually collapses the redundancies.
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn merge_dedup_same_label() {
     let merged = merge_serial_filters("a", "a");
     let canon = LabelFilter::parse(&merged).unwrap().to_string();
@@ -16,7 +15,6 @@ fn merge_dedup_same_label() {
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn merge_dedup_commutative() {
     let merged = merge_serial_filters("a & b", "b & a");
     let canon = LabelFilter::parse(&merged).unwrap();
@@ -24,7 +22,6 @@ fn merge_dedup_commutative() {
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn merge_tautology_canonicalizes_to_const_true() {
     // a | !a ≡ true. After canonicalization, displayed as the literal "true".
     let merged = merge_serial_filters("a", "!a");

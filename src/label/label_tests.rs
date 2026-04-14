@@ -24,80 +24,109 @@ fn label_display() {
 }
 
 // parse_label_expr =====
+//
+// `parse_label_expr` returns a CANONICAL `LabelExpr` (= `Expr<String>` from
+// the boolean_expression crate), so structural-equality tests against
+// hand-built ASTs only work for already-canonical inputs (single terminals,
+// flat AND/OR chains where alphabetical ordering already holds, etc.).
+// Behavioral assertions go through `matches`, which works for any input.
 
-fn label(name: &str) -> LabelExpr {
-    LabelExpr::Label(name.into())
-}
-
-fn not(inner: LabelExpr) -> LabelExpr {
-    LabelExpr::Not(Box::new(inner))
-}
-
-fn and(left: LabelExpr, right: LabelExpr) -> LabelExpr {
-    LabelExpr::And(Box::new(left), Box::new(right))
-}
-
-fn or(left: LabelExpr, right: LabelExpr) -> LabelExpr {
-    LabelExpr::Or(Box::new(left), Box::new(right))
+fn term(name: &str) -> LabelExpr {
+    LabelExpr::Terminal(name.into())
 }
 
 #[test]
 fn parse_bare_label() {
-    assert_eq!(parse_label_expr("unit").unwrap(), label("unit"));
+    assert_eq!(parse_label_expr("unit").unwrap(), term("unit"));
 }
 
 #[test]
-fn parse_or() {
-    assert_eq!(parse_label_expr("a|b").unwrap(), or(label("a"), label("b")));
+fn parse_or_matches_function() {
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    let c = Label::__new("c");
+    let f = parse_label_expr("a|b").unwrap();
+    assert!(matches_expr(&f, &[a]));
+    assert!(matches_expr(&f, &[b]));
+    assert!(!matches_expr(&f, &[c]));
 }
 
 #[test]
-fn parse_and() {
-    assert_eq!(parse_label_expr("a&b").unwrap(), and(label("a"), label("b")));
+fn parse_and_matches_function() {
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    let f = parse_label_expr("a&b").unwrap();
+    assert!(matches_expr(&f, &[a, b]));
+    assert!(!matches_expr(&f, &[a]));
+    assert!(!matches_expr(&f, &[b]));
 }
 
 #[test]
-fn parse_not() {
-    assert_eq!(parse_label_expr("!a").unwrap(), not(label("a")));
+fn parse_not_matches_function() {
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    let f = parse_label_expr("!a").unwrap();
+    assert!(!matches_expr(&f, &[a]));
+    assert!(matches_expr(&f, &[b]));
+    assert!(matches_expr(&f, &[]));
 }
 
 #[test]
 fn parse_precedence_not_over_and() {
-    // !a&b → (!a) & b
-    assert_eq!(parse_label_expr("!a&b").unwrap(), and(not(label("a")), label("b")));
+    // !a&b should match exactly when a is absent and b is present.
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    let f = parse_label_expr("!a&b").unwrap();
+    assert!(matches_expr(&f, &[b]));
+    assert!(!matches_expr(&f, &[a]));
+    assert!(!matches_expr(&f, &[a, b]));
+    assert!(!matches_expr(&f, &[]));
 }
 
 #[test]
 fn parse_precedence_and_over_or() {
-    // a|b&c → a | (b&c)
-    assert_eq!(
-        parse_label_expr("a|b&c").unwrap(),
-        or(label("a"), and(label("b"), label("c")))
-    );
+    // a|b&c should match a alone or b&c together, but not b alone.
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    let c = Label::__new("c");
+    let f = parse_label_expr("a|b&c").unwrap();
+    assert!(matches_expr(&f, &[a]));
+    assert!(matches_expr(&f, &[b, c]));
+    assert!(!matches_expr(&f, &[b]));
+    assert!(!matches_expr(&f, &[c]));
 }
 
 #[test]
 fn parse_grouping_overrides_precedence() {
-    // (a|b)&c
-    assert_eq!(
-        parse_label_expr("(a|b)&c").unwrap(),
-        and(or(label("a"), label("b")), label("c"))
-    );
+    // (a|b)&c requires c plus one of {a, b}.
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    let c = Label::__new("c");
+    let f = parse_label_expr("(a|b)&c").unwrap();
+    assert!(matches_expr(&f, &[a, c]));
+    assert!(matches_expr(&f, &[b, c]));
+    assert!(!matches_expr(&f, &[a]));
+    assert!(!matches_expr(&f, &[c]));
 }
 
 #[test]
 fn parse_whitespace_ignored() {
-    assert_eq!(parse_label_expr("  a  |  b  ").unwrap(), or(label("a"), label("b")));
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    let f = parse_label_expr("  a  |  b  ").unwrap();
+    assert!(matches_expr(&f, &[a]));
+    assert!(matches_expr(&f, &[b]));
 }
 
 #[test]
-fn parse_double_negation() {
-    assert_eq!(parse_label_expr("!!a").unwrap(), not(not(label("a"))));
+fn parse_double_negation_canonicalizes() {
+    // !!a is semantically `a`; canonicalization collapses it.
+    assert_eq!(parse_label_expr("!!a").unwrap(), term("a"));
 }
 
 #[test]
 fn parse_underscores_and_digits() {
-    assert_eq!(parse_label_expr("my_label_2").unwrap(), label("my_label_2"));
+    assert_eq!(parse_label_expr("my_label_2").unwrap(), term("my_label_2"));
 }
 
 #[test]
@@ -112,29 +141,42 @@ fn parse_rejects_hyphenated_label() {
 
 #[test]
 fn parse_complex_expression() {
-    // (docker|integration)&!slow
-    assert_eq!(
-        parse_label_expr("(docker|integration)&!slow").unwrap(),
-        and(or(label("docker"), label("integration")), not(label("slow")))
-    );
+    // (docker|integration)&!slow → must match docker OR integration when slow absent.
+    let docker = Label::__new("docker");
+    let integration = Label::__new("integration");
+    let slow = Label::__new("slow");
+    let unit = Label::__new("unit");
+    let f = parse_label_expr("(docker|integration)&!slow").unwrap();
+    assert!(matches_expr(&f, &[docker]));
+    assert!(matches_expr(&f, &[integration]));
+    assert!(!matches_expr(&f, &[docker, slow]));
+    assert!(!matches_expr(&f, &[unit]));
 }
 
 #[test]
-fn parse_left_associative_or() {
-    // a|b|c → Or(Or(a,b),c)
-    assert_eq!(
-        parse_label_expr("a|b|c").unwrap(),
-        or(or(label("a"), label("b")), label("c"))
-    );
+fn parse_associative_or_function() {
+    // a|b|c — any one of {a,b,c} satisfies.
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    let c = Label::__new("c");
+    let d = Label::__new("d");
+    let f = parse_label_expr("a|b|c").unwrap();
+    assert!(matches_expr(&f, &[a]));
+    assert!(matches_expr(&f, &[b]));
+    assert!(matches_expr(&f, &[c]));
+    assert!(!matches_expr(&f, &[d]));
 }
 
 #[test]
-fn parse_left_associative_and() {
-    // a&b&c → And(And(a,b),c)
-    assert_eq!(
-        parse_label_expr("a&b&c").unwrap(),
-        and(and(label("a"), label("b")), label("c"))
-    );
+fn parse_associative_and_function() {
+    // a&b&c — all three must be present.
+    let a = Label::__new("a");
+    let b = Label::__new("b");
+    let c = Label::__new("c");
+    let f = parse_label_expr("a&b&c").unwrap();
+    assert!(matches_expr(&f, &[a, b, c]));
+    assert!(!matches_expr(&f, &[a, b]));
+    assert!(!matches_expr(&f, &[a]));
 }
 
 #[test]
@@ -171,7 +213,7 @@ fn parse_invalid_space_separated() {
 // LabelExpr::matches =====
 
 fn matches(expr: &str, labels: &[Label]) -> bool {
-    parse_label_expr(expr).unwrap().matches(labels)
+    matches_expr(&parse_label_expr(expr).unwrap(), labels)
 }
 
 #[test]
@@ -339,28 +381,36 @@ fn label_filter_display_precedence_and_over_or() {
 }
 
 #[test]
-fn label_filter_display_or_inside_and() {
-    // (a | b) & c — parens needed
+fn label_filter_display_or_inside_and_canonicalizes() {
+    // (a | b) & c is semantically equivalent to (a & c) | (b & c). The canonical
+    // form is the latter (sum-of-products from the BDD), and `sort_children`
+    // orders the cubes by Display string.
     let f = LabelFilter::parse("(a | b) & c").unwrap();
-    assert_eq!(f.to_string(), "(a | b) & c");
+    assert_eq!(f.to_string(), "a & c | b & c");
 }
 
 #[test]
-fn label_filter_display_not_complex() {
+fn label_filter_display_de_morgan() {
+    // !(a | b) is semantically equivalent to !a & !b; the canonical form
+    // applies De Morgan's law, then sorts children lexicographically (where
+    // `!` sorts before letters in ASCII).
     let f = LabelFilter::parse("!(a | b)").unwrap();
-    assert_eq!(f.to_string(), "!(a | b)");
+    assert_eq!(f.to_string(), "!a & !b");
 }
 
 #[test]
-fn label_filter_display_double_not() {
+fn label_filter_display_double_not_collapses() {
     let f = LabelFilter::parse("!!a").unwrap();
-    assert_eq!(f.to_string(), "!!a");
+    assert_eq!(f.to_string(), "a");
 }
 
 #[test]
-fn label_filter_display_complex() {
+fn label_filter_display_complex_canonicalizes() {
+    // (docker | integration) & !slow ≡ (!slow & docker) | (!slow & integration).
+    // Within each AND, `!slow` sorts before the letter; across the OR, the cubes
+    // sort by their Display string (`!slow & docker` < `!slow & integration`).
     let f = LabelFilter::parse("(docker | integration) & !slow").unwrap();
-    assert_eq!(f.to_string(), "(docker | integration) & !slow");
+    assert_eq!(f.to_string(), "!slow & docker | !slow & integration");
 }
 
 #[test]
@@ -491,20 +541,22 @@ fn label_filter_to_sql_complex() {
 
 #[test]
 fn parse_lowercases_uppercase_label() {
-    assert_eq!(parse_label_expr("DOCKER").unwrap(), label("docker"));
+    assert_eq!(parse_label_expr("DOCKER").unwrap(), term("docker"));
 }
 
 #[test]
 fn parse_lowercases_mixed_case_label() {
-    assert_eq!(parse_label_expr("Docker").unwrap(), label("docker"));
+    assert_eq!(parse_label_expr("Docker").unwrap(), term("docker"));
 }
 
 #[test]
 fn parse_lowercases_inside_expression() {
-    assert_eq!(
-        parse_label_expr("Docker & SLOW").unwrap(),
-        and(label("docker"), label("slow")),
-    );
+    let docker = Label::__new("docker");
+    let slow = Label::__new("slow");
+    let f = parse_label_expr("Docker & SLOW").unwrap();
+    assert!(matches_expr(&f, &[docker, slow]));
+    assert!(!matches_expr(&f, &[docker]));
+    assert!(!matches_expr(&f, &[slow]));
 }
 
 #[test]
@@ -557,6 +609,29 @@ fn grammar_and_validator_agree() {
             name
         );
     }
+
+    // Reserved names (`true`, `false`) are an asymmetric case: identifier-shape
+    // valid, but rejected by the validator AND interpreted by the grammar as
+    // `Const`, never as a `Terminal`. Both sides reference RESERVED_LABEL_NAMES.
+    use crate::label::RESERVED_LABEL_NAMES;
+    for name in RESERVED_LABEL_NAMES {
+        let validated = std::panic::catch_unwind(|| validate_label_name(name));
+        assert!(
+            validated.is_err(),
+            "validate_label_name accepted reserved name {:?}",
+            name
+        );
+        let parsed = parse_label_expr(name).expect("reserved name parses as Const");
+        let expected = match *name {
+            "true" => boolean_expression::Expr::Const(true),
+            "false" => boolean_expression::Expr::Const(false),
+            other => panic!("unexpected reserved name {other:?}"),
+        };
+        assert_eq!(
+            parsed, expected,
+            "reserved name {name:?} should parse to Const, not Terminal",
+        );
+    }
 }
 
 // Canonicalization tests (azhukova/35) =====
@@ -572,7 +647,6 @@ const PENDING: &str = "pending impl in azhukova/35";
 // Semantic equality -----
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_eq_and_commutative() {
     assert_eq!(
         LabelFilter::parse("a & b").unwrap(),
@@ -581,7 +655,6 @@ fn canon_eq_and_commutative() {
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_eq_or_commutative() {
     assert_eq!(
         LabelFilter::parse("a | b").unwrap(),
@@ -590,7 +663,6 @@ fn canon_eq_or_commutative() {
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_eq_distributive() {
     assert_eq!(
         LabelFilter::parse("(a & b) | (a & c)").unwrap(),
@@ -599,13 +671,11 @@ fn canon_eq_distributive() {
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_eq_double_negation() {
     assert_eq!(LabelFilter::parse("!!a").unwrap(), LabelFilter::parse("a").unwrap());
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_eq_tautology() {
     assert_eq!(
         LabelFilter::parse("a | !a").unwrap(),
@@ -614,7 +684,6 @@ fn canon_eq_tautology() {
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_eq_contradiction() {
     assert_eq!(
         LabelFilter::parse("a & !a").unwrap(),
@@ -623,14 +692,12 @@ fn canon_eq_contradiction() {
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_eq_dedup() {
     assert_eq!(LabelFilter::parse("a | a").unwrap(), LabelFilter::parse("a").unwrap());
     assert_eq!(LabelFilter::parse("a & a").unwrap(), LabelFilter::parse("a").unwrap());
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_eq_unused_terminal_dropped() {
     // b & !b is a contradiction, so a | (b & !b) is just a.
     assert_eq!(
@@ -640,7 +707,6 @@ fn canon_eq_unused_terminal_dropped() {
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_clone_preserves_equality_and_matches() {
     let a = Label::__new("a");
     let b = Label::__new("b");
@@ -654,32 +720,27 @@ fn canon_clone_preserves_equality_and_matches() {
 // Display canonical form -----
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_display_double_negation_collapses() {
     assert_eq!(LabelFilter::parse("!!a").unwrap().to_string(), "a");
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_display_tautology() {
     assert_eq!(LabelFilter::parse("a | !a").unwrap().to_string(), "true");
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_display_contradiction() {
     assert_eq!(LabelFilter::parse("a & !a").unwrap().to_string(), "false");
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_display_negated_const() {
     assert_eq!(LabelFilter::parse("!true").unwrap().to_string(), "false");
     assert_eq!(LabelFilter::parse("!false").unwrap().to_string(), "true");
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_round_trip_corpus() {
     let corpus = [
         "a",
@@ -707,7 +768,6 @@ fn canon_round_trip_corpus() {
 // From<Label> matches parse -----
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_from_label_matches_parse() {
     let a = Label::__new("a");
     assert_eq!(LabelFilter::from(a), LabelFilter::parse("a").unwrap());
@@ -716,7 +776,6 @@ fn canon_from_label_matches_parse() {
 // Grammar boundaries (true/false literals) -----
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_grammar_true_matches_everything() {
     let a = Label::__new("a");
     let f = LabelFilter::parse("true").unwrap();
@@ -725,7 +784,6 @@ fn canon_grammar_true_matches_everything() {
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_grammar_false_matches_nothing() {
     let a = Label::__new("a");
     let b = Label::__new("b");
@@ -735,18 +793,19 @@ fn canon_grammar_false_matches_nothing() {
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_grammar_truelike_label_names() {
     // `true` and `false` are reserved, but anything that has them as a prefix
     // and continues with an identifier character is a regular label name.
+    // Labels are stored canonical-lowercase (per #29), so the filter parser
+    // lowercases mixed-case identifiers like `TrueLike` to `truelike`.
     let cases: &[(&str, Label)] = &[
         ("truely", Label::__new("truely")),
         ("truex", Label::__new("truex")),
         ("true_", Label::__new("true_")),
         ("falsey", Label::__new("falsey")),
         ("_true", Label::__new("_true")),
-        ("TRUE", Label::__new("TRUE")),
-        ("False", Label::__new("False")),
+        ("TrueLike", Label::__new("truelike")),
+        ("Falseish", Label::__new("falseish")),
     ];
     for (name, lbl) in cases {
         let f = LabelFilter::parse(name).unwrap();
@@ -756,10 +815,18 @@ fn canon_grammar_truelike_label_names() {
     }
 }
 
+#[test]
+fn canon_grammar_uppercase_true_false_collapse_to_const() {
+    // After bool_lit became case-insensitive (matching the case-insensitive
+    // label parsing from #29), `True`/`FALSE` parse as Const, not Terminal.
+    assert!(LabelFilter::parse("True").unwrap().is_tautology());
+    assert!(LabelFilter::parse("FALSE").unwrap().is_contradiction());
+    assert!(LabelFilter::parse("tRuE").unwrap().is_tautology());
+}
+
 // Matching with extra labels -----
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_matches_extra_labels() {
     let a = Label::__new("a");
     let b = Label::__new("b");
@@ -771,7 +838,6 @@ fn canon_matches_extra_labels() {
 // SQL for constants -----
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_sql_true() {
     let sql = LabelFilter::parse("true").unwrap().to_sql();
     assert_eq!(sql, "1=1");
@@ -782,7 +848,6 @@ fn canon_sql_true() {
 }
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_sql_false() {
     let sql = LabelFilter::parse("false").unwrap().to_sql();
     assert_eq!(sql, "1=0");
@@ -791,7 +856,6 @@ fn canon_sql_false() {
 // validate_serial_filters with constants -----
 
 #[test]
-#[ignore = "pending impl in azhukova/35"]
 fn canon_serial_filter_false_validates() {
     // `serial = "false"` is well-formed and parses to a contradiction.
     assert!(LabelFilter::parse("false").is_ok());
@@ -871,8 +935,7 @@ mod canon_proptest {
 
     proptest! {
         #[test]
-        #[ignore = "pending impl in azhukova/35"]
-        fn semantic_equality_matches_structural_equality(
+                fn semantic_equality_matches_structural_equality(
             s1 in filter_strategy(),
             s2 in filter_strategy(),
         ) {
@@ -887,8 +950,7 @@ mod canon_proptest {
         }
 
         #[test]
-        #[ignore = "pending impl in azhukova/35"]
-        fn display_round_trip_is_stable(s in filter_strategy()) {
+                fn display_round_trip_is_stable(s in filter_strategy()) {
             let f = LabelFilter::parse(&s).unwrap();
             let displayed = f.to_string();
             let reparsed = LabelFilter::parse(&displayed).unwrap();
