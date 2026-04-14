@@ -1,0 +1,20 @@
+error[E0080]: evaluation panicked: invalid label name: "true" and "false" are reserved by the filter grammar
+ --> tests/compile_fail/label_reserved_true.rs:4:1
+  |
+4 | #[skuld::label]
+  | ^^^^^^^^^^^^^^^ evaluation of `TRUE` failed inside this call
+  |
+note: inside `Label::__new`
+ --> src/label.rs
+  |
+  |         validate_label_name(name);
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+note: inside `label::validate_label_name`
+ --> $RUST/core/src/panic.rs
+  |
+  = note: the failure occurred here
+  |
+ ::: src/label.rs
+  |
+  |             panic!("invalid label name: \"true\" and \"false\" are reserved by the filter grammar");
+  |             --------------------------------------------------------------------------------------- in this macro invocation

@@ -854,11 +854,24 @@ fn canon_sql_false() {
 }
 
 // validate_serial_filters with constants -----
+//
+// `validate_serial_filters` iterates the `inventory` registry, so unit tests
+// cannot inject fixtures into it. We instead verify that the constants `true`
+// and `false`:
+//   1. Parse successfully (which is the only thing validate_serial_filters
+//      checks against `def.serial`).
+//   2. Land in the canonical form that `to_storage` expects (so the
+//      coordinate-time sentinel collapse works).
 
 #[test]
-fn canon_serial_filter_false_validates() {
-    // `serial = "false"` is well-formed and parses to a contradiction.
-    assert!(LabelFilter::parse("false").is_ok());
+fn canon_const_filters_parse_to_predicates() {
+    let f_true = LabelFilter::parse("true").unwrap();
+    let f_false = LabelFilter::parse("false").unwrap();
+    assert!(f_true.is_tautology());
+    assert!(f_false.is_contradiction());
+    // Round-trip via Display so coordinate()'s to_storage path succeeds.
+    assert_eq!(LabelFilter::parse(&f_true.to_string()).unwrap(), f_true);
+    assert_eq!(LabelFilter::parse(&f_false.to_string()).unwrap(), f_false);
 }
 
 // Avoid unused-const warning when the rest are run with --ignored.
@@ -934,6 +947,11 @@ mod canon_proptest {
     }
 
     proptest! {
+        // Canonicity is the load-bearing invariant of the whole change; run
+        // 1000 cases (the design-plan target) to push for failures the corpus
+        // tests don't catch.
+        #![proptest_config(ProptestConfig { cases: 1000, ..ProptestConfig::default() })]
+
         #[test]
                 fn semantic_equality_matches_structural_equality(
             s1 in filter_strategy(),

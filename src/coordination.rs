@@ -171,8 +171,14 @@ fn scrub_serial_filters_v1(conn: &rusqlite::Connection) {
     };
     for (id, iid, raw) in rows {
         match LabelFilter::parse(&raw) {
-            Ok(_) => {
-                let canonical = to_storage(&raw);
+            Ok(filter) => {
+                let canonical = if filter.is_tautology() {
+                    SERIAL_ALL.to_string()
+                } else if filter.is_contradiction() {
+                    SERIAL_NONE.to_string()
+                } else {
+                    filter.to_string()
+                };
                 if canonical != raw {
                     if let Err(e) = conn.execute(
                         "UPDATE running SET serial_filter = ?1 WHERE id = ?2",
@@ -189,10 +195,9 @@ fn scrub_serial_filters_v1(conn: &rusqlite::Connection) {
                         "[skuld] warning: schema scrub: leaving unparseable serial_filter \
                          {raw:?} on running id={id} (owning instance {iid} alive): {e}"
                     );
-                } else {
-                    // Owning instance is dead; clean_stale_entries will remove
-                    // this row on the next coordinate() call. No action here.
                 }
+                // Dead-owner rows fall through to clean_stale_entries on the
+                // next coordinate() call — no action here.
             }
         }
     }

@@ -526,7 +526,6 @@ impl LabelFilter {
     /// Whether the canonical form of this filter is `Const(true)` — i.e. the
     /// filter is satisfied by every possible label set. Used by
     /// `coordination::to_storage` to collapse tautologies into the `*` sentinel.
-    #[allow(dead_code)] // wired up in coordination.rs in the next commit
     pub(crate) fn is_tautology(&self) -> bool {
         matches!(self.expr, Expr::Const(true))
     }
@@ -534,7 +533,6 @@ impl LabelFilter {
     /// Whether the canonical form of this filter is `Const(false)` — i.e. no
     /// label set satisfies it. Used by `coordination::to_storage` to collapse
     /// contradictions into the `""` (non-serial) sentinel.
-    #[allow(dead_code)] // wired up in coordination.rs in the next commit
     pub(crate) fn is_contradiction(&self) -> bool {
         matches!(self.expr, Expr::Const(false))
     }
