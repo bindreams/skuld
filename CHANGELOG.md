@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `coordinate()` no longer panics on `SQLITE_BUSY` / `SQLITE_LOCKED` under
+  heavy concurrent access. Lock contention errors are retried via the
+  existing outer backoff loop instead of unwrapping.
+
 ### Added
 
 - **Serial filter expressions.** `serial = <expr>` restricts mutual exclusion
