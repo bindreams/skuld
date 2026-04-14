@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two `#[skuld::label]` declarations (in any crate linked into the binary)
   produce the same lowercased name.
 
+- End-to-end test suite for `SKULD_LABELS` filtering (`tests/label_filter_cli.rs`
+  - `tests/support_bins/label_filter_fixture/`). Covers operator precedence,
+    `default_labels!` inheritance, dynamic tests, `#[ignore]`, `requires`,
+    `serial`, `should_panic`, and libtest-mimic CLI flag interactions.
+
 ### Changed
 
 - **`serial` semantics changed.** A bare `serial` now blocks ALL tests (serial

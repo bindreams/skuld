@@ -1960,6 +1960,7 @@ dependencies = [
  "pest_derive",
  "rusqlite",
  "serde",
+ "serde_json",
  "serde_yml",
  "skuld",
  "skuld-macros",
