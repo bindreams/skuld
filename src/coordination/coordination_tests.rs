@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::Barrier;
 use std::time::Duration;
 
-use crate::coordination::{can_start, coordinate, is_busy, open_db, register, SERIAL_ALL, SERIAL_NONE};
+use crate::coordination::{can_start, coordinate, is_retryable, open_db, register, SERIAL_ALL, SERIAL_NONE};
 use crate::label::Label;
 
 /// Create a temporary database for testing.
@@ -282,26 +282,33 @@ fn coordinate_retries_on_busy_lock() {
     // On broken code: panics at src/coordination.rs:261 after ~5.5 s.
     // On fixed code: the next outer-loop iteration's BEGIN EXCLUSIVE
     // succeeds once the holder commits, then register() + COMMIT succeed.
+    let waiter_started = std::time::Instant::now();
     let _reg = coordinate(&path, "waiter", &[], SERIAL_NONE);
+    let waited = waiter_started.elapsed();
 
     holder.join().unwrap();
+
+    // Guard against regression to a non-contending fast path: coordinate()
+    // must have actually exhausted busy_timeout (5 s) at least once before
+    // succeeding.
+    assert!(
+        waited >= Duration::from_secs(5),
+        "waiter returned in {waited:?}; should have hit busy_timeout (>=5s)"
+    );
 }
 
-// is_busy =====
+// is_retryable =====
 
 #[test]
-fn is_busy_matches_expected_codes() {
-    use rusqlite::{ffi, Error, ErrorCode};
+fn is_retryable_matches_busy_and_locked_only() {
+    use rusqlite::{ffi, Error};
 
     let busy = Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_BUSY), Some("database is locked".into()));
     let locked = Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_LOCKED), None);
-    let other = Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_CONSTRAINT), None);
+    let constraint = Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_CONSTRAINT), None);
 
-    assert_eq!(busy.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
-    assert_eq!(locked.sqlite_error_code(), Some(ErrorCode::DatabaseLocked));
-    assert_eq!(other.sqlite_error_code(), Some(ErrorCode::ConstraintViolation));
-
-    assert!(is_busy(&busy));
-    assert!(is_busy(&locked));
-    assert!(!is_busy(&other));
+    assert!(is_retryable(&busy));
+    assert!(is_retryable(&locked));
+    assert!(!is_retryable(&constraint));
+    assert!(!is_retryable(&Error::QueryReturnedNoRows));
 }

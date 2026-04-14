@@ -92,12 +92,10 @@ pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
 /// blocks progress. rusqlite collapses extended codes (`SQLITE_BUSY_SNAPSHOT`,
 /// `SQLITE_LOCKED_SHAREDCACHE`, etc.) onto these primary variants, so a
 /// primary-code match covers all transient lock-contention errors.
-pub(crate) fn is_busy(err: &rusqlite::Error) -> bool {
+pub(crate) fn is_retryable(err: &rusqlite::Error) -> bool {
     matches!(
-        err,
-        rusqlite::Error::SqliteFailure(e, _)
-            if e.code == rusqlite::ErrorCode::DatabaseBusy
-                || e.code == rusqlite::ErrorCode::DatabaseLocked
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
     )
 }
 
@@ -177,8 +175,7 @@ fn can_start(
             conn.prepare("SELECT serial_filter FROM running WHERE serial_filter != '' AND serial_filter != ?1")?;
         let filters: Vec<String> = stmt
             .query_map([SERIAL_ALL], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         for filter_str in &filters {
             if let Ok(filter) = LabelFilter::parse(filter_str) {
                 if filter.matches(my_labels) {
@@ -212,6 +209,10 @@ fn can_start(
 
 /// Register a running test in the coordination database.
 /// Returns the row ID used for cleanup.
+///
+/// Must be called inside an active transaction: the two INSERTs are not atomic
+/// at the function level, and a mid-call failure leaves a half-inserted row
+/// that the caller's surrounding txn must roll back.
 fn register(
     conn: &rusqlite::Connection,
     name: &str,
@@ -262,8 +263,8 @@ impl Drop for TestRegistration {
 /// and return a guard that unregisters it on drop.
 ///
 /// Under lock contention (`SQLITE_BUSY` / `SQLITE_LOCKED`), retries via the
-/// outer backoff loop (10 ms → 200 ms cap). Emits a debug warning after 60 s
-/// of continuous contention.
+/// outer exponential backoff loop (10 ms → 200 ms cap). Emits a debug warning
+/// after 60 s of continuous contention.
 ///
 /// This is the main entry point called by the test runner for every test.
 pub(crate) fn coordinate(
@@ -302,7 +303,11 @@ pub(crate) fn coordinate(
                 };
             }
             Ok(None) => { /* serial conflict — fall through to backoff */ }
-            Err(ref e) if is_busy(e) => {
+            Err(ref e) if is_retryable(e) => {
+                // Best-effort rollback. If the inner ROLLBACK already ran (e.g.
+                // a row-iteration failed after the closure's ROLLBACK on the
+                // can_start=false path) this is a no-op that returns
+                // SQLITE_ERROR ("no transaction is active"); harmlessly discarded.
                 let _ = conn.execute_batch("ROLLBACK");
             }
             Err(e) => {
