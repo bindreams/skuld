@@ -48,6 +48,12 @@ fn instance_id() -> String {
 
 // Database initialization =====
 
+/// Current schema version. Bumped to 1 when LabelFilter canonicalization landed
+/// (azhukova/35). Older DBs may contain non-canonical `serial_filter` strings
+/// from pre-canonicalization skuld; the migration in [`migrate_schema`] scrubs
+/// them on first open after upgrade.
+const SCHEMA_VERSION: i64 = 1;
+
 /// Open a connection to the coordination database, creating it and the schema
 /// if necessary. Each call returns a fresh connection suitable for single-thread
 /// use.
@@ -73,7 +79,10 @@ pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
          );";
     for attempt in 0..50 {
         match conn.execute_batch(init_sql) {
-            Ok(()) => return conn,
+            Ok(()) => {
+                migrate_schema(&conn);
+                return conn;
+            }
             Err(e) if e.to_string().contains("database is locked") && attempt < 49 => {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -97,6 +106,119 @@ pub(crate) fn is_retryable(err: &rusqlite::Error) -> bool {
         err.sqlite_error_code(),
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
     )
+}
+
+// Schema migration =====
+
+/// Run all pending schema migrations. Gated by `PRAGMA user_version` and
+/// performed inside `BEGIN IMMEDIATE` so concurrent test binaries don't race.
+/// Once a migration completes, the version pragma is bumped and subsequent
+/// connections skip the work.
+fn migrate_schema(conn: &rusqlite::Connection) {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap_or(0);
+    if current >= SCHEMA_VERSION {
+        return;
+    }
+    // Take an immediate write lock so two processes don't both start scrubbing.
+    if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+        eprintln!("[skuld] warning: failed to acquire migration lock: {e}");
+        return;
+    }
+    // Re-check inside the transaction in case another process beat us to it.
+    let inside_tx: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap_or(0);
+    if inside_tx >= SCHEMA_VERSION {
+        let _ = conn.execute_batch("COMMIT");
+        return;
+    }
+    if current < 1 {
+        scrub_serial_filters_v1(conn);
+    }
+    if let Err(e) = conn.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), []) {
+        eprintln!("[skuld] warning: failed to bump schema version: {e}");
+    }
+    if let Err(e) = conn.execute_batch("COMMIT") {
+        eprintln!("[skuld] warning: failed to commit schema migration: {e}");
+    }
+}
+
+/// Migration v0 → v1: rewrite every `serial_filter` to its canonical Display
+/// form, collapsing `Const(true)` and `Const(false)` to the `*` and `""`
+/// sentinels respectively. Rows that fail to parse are LEFT ALONE if their
+/// owning instance is alive (touching them might break a running test's
+/// serialization invariants); only the standard `clean_stale_entries` path
+/// removes them later.
+fn scrub_serial_filters_v1(conn: &rusqlite::Connection) {
+    let mut stmt =
+        match conn.prepare("SELECT id, instance_id, serial_filter FROM running WHERE serial_filter NOT IN ('', ?1)") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[skuld] warning: schema scrub: prepare failed: {e}");
+                return;
+            }
+        };
+    let rows: Vec<(i64, String, String)> = match stmt.query_map([SERIAL_ALL], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    }) {
+        Ok(it) => it.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            eprintln!("[skuld] warning: schema scrub: query failed: {e}");
+            return;
+        }
+    };
+    for (id, iid, raw) in rows {
+        match LabelFilter::parse(&raw) {
+            Ok(_) => {
+                let canonical = to_storage(&raw);
+                if canonical != raw {
+                    if let Err(e) = conn.execute(
+                        "UPDATE running SET serial_filter = ?1 WHERE id = ?2",
+                        rusqlite::params![canonical, id],
+                    ) {
+                        eprintln!("[skuld] warning: schema scrub: update id={id} failed: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                let alive = pid_from_instance_id(&iid).is_some_and(is_pid_alive);
+                if alive {
+                    eprintln!(
+                        "[skuld] warning: schema scrub: leaving unparseable serial_filter \
+                         {raw:?} on running id={id} (owning instance {iid} alive): {e}"
+                    );
+                } else {
+                    // Owning instance is dead; clean_stale_entries will remove
+                    // this row on the next coordinate() call. No action here.
+                }
+            }
+        }
+    }
+}
+
+/// Canonicalize a raw `serial_filter` string for storage in the DB.
+///
+/// Sentinels (`""`, `"*"`) pass through unchanged. Otherwise the string is
+/// parsed (must be valid — `validate_serial_filters` guarantees this for
+/// startup-registered tests) and the result of `LabelFilter::Display` is
+/// returned, with `Const(true)` collapsed to `SERIAL_ALL` and `Const(false)`
+/// collapsed to `SERIAL_NONE` so two semantically-equivalent declarations
+/// (e.g. `serial = "a | !a"` and `serial = "*"`) share storage representation.
+fn to_storage(serial_filter: &str) -> String {
+    if serial_filter == SERIAL_NONE || serial_filter == SERIAL_ALL {
+        return serial_filter.to_string();
+    }
+    let f = LabelFilter::parse(serial_filter)
+        .expect("to_storage: serial filter must parse — guarded by validate_serial_filters");
+    if f.is_tautology() {
+        SERIAL_ALL.to_string()
+    } else if f.is_contradiction() {
+        SERIAL_NONE.to_string()
+    } else {
+        f.to_string()
+    }
 }
 
 // Stale entry cleanup =====
@@ -177,10 +299,19 @@ fn can_start(
             .query_map([SERIAL_ALL], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         for filter_str in &filters {
-            if let Ok(filter) = LabelFilter::parse(filter_str) {
-                if filter.matches(my_labels) {
-                    return Ok(false);
+            // Newly-inserted rows are canonicalized via `to_storage`, so parse
+            // failures here indicate a legacy row that the schema scrub left
+            // behind (owner alive, can't safely DELETE). Warn and skip; the
+            // scrub will retry once the owner exits.
+            match LabelFilter::parse(filter_str) {
+                Ok(filter) => {
+                    if filter.matches(my_labels) {
+                        return Ok(false);
+                    }
                 }
+                Err(e) => eprintln!(
+                    "[skuld] warning: skipping unparseable serial_filter {filter_str:?} from running table: {e}"
+                ),
             }
         }
     }
@@ -192,13 +323,18 @@ fn can_start(
     }
 
     // (d) If I have a filter, does any running test's labels match it?
+    //
+    // `my_serial_filter` always reaches us already canonical (coordinate()
+    // routes through to_storage before INSERT, and validate_serial_filters
+    // proves it parseable at startup). An Err here is a logic bug, not a
+    // runtime condition — surface it loudly.
     if !my_serial_filter.is_empty() && my_serial_filter != SERIAL_ALL {
-        if let Ok(filter) = LabelFilter::parse(my_serial_filter) {
-            let sql = format!("SELECT EXISTS (SELECT 1 FROM running r WHERE {})", filter.to_sql());
-            let blocked: bool = conn.query_row(&sql, [], |row| row.get(0))?;
-            if blocked {
-                return Ok(false);
-            }
+        let filter = LabelFilter::parse(my_serial_filter)
+            .expect("can_start: my_serial_filter must parse — guarded by validate_serial_filters");
+        let sql = format!("SELECT EXISTS (SELECT 1 FROM running r WHERE {})", filter.to_sql());
+        let blocked: bool = conn.query_row(&sql, [], |row| row.get(0))?;
+        if blocked {
+            return Ok(false);
         }
     }
 
@@ -274,6 +410,9 @@ pub(crate) fn coordinate(
     serial_filter: &str,
 ) -> TestRegistration {
     let conn = open_db(db_path);
+    // Canonicalize once up front so every comparison and INSERT in the loop
+    // below operates on the storage form (e.g. "a | !a" → "*").
+    let canonical_filter = to_storage(serial_filter);
 
     let mut backoff = Duration::from_millis(10);
     let max_backoff = Duration::from_millis(200);
@@ -285,8 +424,8 @@ pub(crate) fn coordinate(
         let txn = || -> Result<Option<i64>, rusqlite::Error> {
             conn.execute_batch("BEGIN EXCLUSIVE")?;
             clean_stale_entries(&conn)?;
-            if can_start(&conn, labels, serial_filter)? {
-                let id = register(&conn, name, labels, serial_filter)?;
+            if can_start(&conn, labels, &canonical_filter)? {
+                let id = register(&conn, name, labels, &canonical_filter)?;
                 conn.execute_batch("COMMIT")?;
                 Ok(Some(id))
             } else {
