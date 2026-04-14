@@ -69,6 +69,8 @@ Whitespace between tokens is optional. Quote the value in shell when using `|`.
 
 **Unset** `SKULD_LABELS` → no filtering, all tests run.
 
+**Empty or whitespace-only** `SKULD_LABELS` (e.g. `SKULD_LABELS=""` or `SKULD_LABELS="   "`) → panic at startup with `skuld: SKULD_LABELS: ...`. Shell expansions like `SKULD_LABELS="$MAYBE_UNSET"` that produce an empty string will therefore panic, not be treated as "no filter." If you want a conditional filter, use `if [ -n "$VAR" ]; then ... fi` or similar.
+
 ## Module-level defaults
 
 Use `default_labels!` to set default labels for all `#[skuld::test]` functions in a module:
