@@ -256,3 +256,33 @@ fn filtered_serial_blocks_only_matching_tests() {
     let conn = open_db(&path);
     assert!(!can_start(&conn, &[docker], SERIAL_NONE).unwrap());
 }
+
+#[test]
+fn coordinate_retries_on_busy_lock() {
+    use std::sync::mpsc;
+
+    let (_dir, path) = temp_db();
+
+    // Holder grabs EXCLUSIVE and holds it longer than the waiter's
+    // busy_timeout (5 s). Empirically the busy handler can take up to
+    // ~5.5 s to surrender, so we hold for 7 s to force a SQLITE_BUSY
+    // return inside coordinate(). The waiter must survive this via the
+    // outer retry loop instead of panicking on .unwrap().
+    let holder_path = path.clone();
+    let (lock_tx, lock_rx) = mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let conn = open_db(&holder_path);
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        lock_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(7_000));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+
+    lock_rx.recv().unwrap();
+    // On broken code: panics at src/coordination.rs:261 after ~5.5 s.
+    // On fixed code: the next outer-loop iteration's BEGIN EXCLUSIVE
+    // succeeds once the holder commits, then register() + COMMIT succeed.
+    let _reg = coordinate(&path, "waiter", &[], SERIAL_NONE);
+
+    holder.join().unwrap();
+}
