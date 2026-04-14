@@ -217,26 +217,39 @@ fn global_serial_prevents_concurrent_execution() {
 #[test]
 fn non_serial_allows_concurrent_execution() {
     const THREADS: usize = 8;
+    const { assert!(THREADS >= 2) };
     let (_dir, path) = temp_db();
 
-    let barrier = Barrier::new(THREADS);
+    // Two barriers: the first races every thread into coordinate() together
+    // (stressing lock contention); the second holds every thread past
+    // fetch_add before any exits, so peak == THREADS on success regardless
+    // of per-thread coordinate() latency. If coordination regresses and
+    // serializes non-serial tests, the second barrier deadlocks — the CI
+    // job-level timeout is the intended backstop.
+    let entry = Barrier::new(THREADS);
+    let observation = Barrier::new(THREADS);
     let peak = AtomicU32::new(0);
     let running = AtomicU32::new(0);
 
     std::thread::scope(|s| {
         for _ in 0..THREADS {
             s.spawn(|| {
-                barrier.wait();
+                entry.wait();
                 let _reg = coordinate(&path, "parallel_test", &[], SERIAL_NONE);
                 let n = running.fetch_add(1, SeqCst) + 1;
                 peak.fetch_max(n, SeqCst);
-                std::thread::sleep(Duration::from_millis(50));
+                observation.wait();
                 running.fetch_sub(1, SeqCst);
             });
         }
     });
 
-    assert!(peak.load(SeqCst) > 1, "non-serial tests should run concurrently");
+    debug_assert!(peak.load(SeqCst) <= THREADS as u32);
+    assert_eq!(
+        peak.load(SeqCst) as usize,
+        THREADS,
+        "non-serial tests should run concurrently",
+    );
 }
 
 #[test]
