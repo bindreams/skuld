@@ -1,9 +1,9 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::parse::{Parse, ParseStream};
+use syn::parse::{Nothing, Parse, ParseStream};
 use syn::{
-    bracketed, parse_macro_input, punctuated::Punctuated, Expr, FnArg, Ident, ItemFn, Lit, LitStr, Path, ReturnType,
-    Token, Type,
+    bracketed, parse_macro_input, punctuated::Punctuated, Attribute, Expr, FnArg, Ident, ItemFn, Lit, LitStr, Path,
+    ReturnType, Token, Type, Visibility,
 };
 
 // #[skuld::test] argument parsing =================================================================
@@ -875,6 +875,82 @@ fn expand_fixture_def(args: FixtureArgs, func: &mut ItemFn) -> TokenStream {
             type_name: #fixture_ty_str,
             serial: #serial_str,
         });
+    };
+    expanded.into()
+}
+
+// #[skuld::label] ================================================================================
+
+/// Parsed form of `$(#[...])* $vis const $ident : $ty ;`. `ItemConst` is not
+/// reusable here because it requires an `= expr` initializer.
+struct LabelItem {
+    attrs: Vec<Attribute>,
+    vis: Visibility,
+    _const_token: Token![const],
+    ident: Ident,
+    _colon: Token![:],
+    ty: Type,
+    _semi: Token![;],
+}
+
+impl Parse for LabelItem {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        Ok(Self {
+            attrs: input.call(Attribute::parse_outer)?,
+            vis: input.parse()?,
+            _const_token: input.parse()?,
+            ident: input.parse()?,
+            _colon: input.parse()?,
+            ty: input.parse()?,
+            _semi: input.parse()?,
+        })
+    }
+}
+
+/// Declare a label constant. The label's string name is the identifier
+/// lowercased (`FOO` → `"foo"`).
+///
+/// ```ignore
+/// #[skuld::label]
+/// pub const DOCKER: skuld::Label;
+/// ```
+///
+/// The type position accepts any path resolving to `skuld::Label` — so aliases
+/// (`use skuld::Label as L;`) work. A mismatched type surfaces as a normal
+/// `E0308: mismatched types` error at the RHS.
+///
+/// Attributes on the declaration are preserved: doc comments decorate the
+/// const; gating attributes like `#[cfg(test)]` are forwarded to the
+/// inventory submission so the const and its registration stay in lock-step.
+#[proc_macro_attribute]
+pub fn label(attr: TokenStream, item: TokenStream) -> TokenStream {
+    parse_macro_input!(attr as Nothing);
+    let LabelItem {
+        attrs, vis, ident, ty, ..
+    } = parse_macro_input!(item as LabelItem);
+    let name_str = ident.to_string().to_ascii_lowercase();
+    // Only gating attributes (`cfg`, `cfg_attr`) are forwarded to the
+    // `inventory::submit!` invocation so the const and its registration stay
+    // in lock-step. Everything else (doc, allow, deprecated, must_use, ...)
+    // applies only to the const; attaching `#[deprecated]` to a macro
+    // invocation would be a compile error.
+    let submit_attrs: Vec<&Attribute> = attrs
+        .iter()
+        .filter(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
+        .collect();
+    let expanded = quote! {
+        #(#attrs)*
+        #vis const #ident: #ty = ::skuld::Label::__new(#name_str);
+
+        #(#submit_attrs)*
+        ::skuld::inventory::submit! {
+            ::skuld::LabelEntry {
+                name: #name_str,
+                file: ::core::file!(),
+                line: ::core::line!(),
+                column: ::core::column!(),
+            }
+        }
     };
     expanded.into()
 }

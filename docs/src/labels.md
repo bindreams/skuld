@@ -4,26 +4,28 @@ Labels are sentinel values for tagging and filtering tests.
 
 ## Defining labels
 
-Use `new_label!` to define a label constant:
+Use `#[skuld::label]` on a constant declaration. The label's string name is the identifier lowercased — `DOCKER` becomes the name `"docker"`.
 
 ```rust
-skuld::new_label!(pub DOCKER, "docker");
-skuld::new_label!(pub SLOW, "slow");
-skuld::new_label!(pub UNIT, "unit");
+#[skuld::label] pub const DOCKER: skuld::Label;
+#[skuld::label] pub const SLOW: skuld::Label;
+#[skuld::label] pub const UNIT: skuld::Label;
 ```
 
-To reference a label defined elsewhere (e.g. in another crate), use `get_label!`:
+The const name must be a valid Rust identifier (ASCII letters, digits, and underscores; must not start with a digit) — it's a plain Rust `const`, so the compiler enforces the usual identifier rules on the symbol. The runtime label string is the identifier lowercased.
+
+### Cross-crate sharing
+
+To use a label defined in another crate, just `use` it:
 
 ```rust
-skuld::get_label!(pub DOCKER, "docker"); // must have a new_label!("docker") somewhere
+use other_crate::DOCKER;
+
+#[skuld::test(labels = [DOCKER])]
+fn my_test() { /* ... */ }
 ```
 
-Label names must be valid Rust identifiers (ASCII letters, digits, and underscores; must not start with a digit). Invalid names are rejected at compile time.
-
-At startup, skuld validates that:
-
-- No two `new_label!` calls share the same name (panics with both source locations).
-- Every `get_label!` has a matching `new_label!` (panics with the orphan's location).
+At startup, skuld panics (with both source locations) if two `#[skuld::label]` declarations in the binary produce the same lowercased name.
 
 ## Labeling tests
 
@@ -49,6 +51,8 @@ SKULD_LABELS="!slow" cargo test                        # all tests except "slow"
 SKULD_LABELS="(docker | integration) & !slow" cargo test  # combined
 ```
 
+Label names in `SKULD_LABELS` are matched case-insensitively. `SKULD_LABELS=DOCKER`, `SKULD_LABELS=Docker`, and `SKULD_LABELS=docker` are equivalent.
+
 ### Expression syntax
 
 | Operator | Meaning    | Example                           |
@@ -70,9 +74,9 @@ Whitespace between tokens is optional. Quote the value in shell when using `|`.
 Use `default_labels!` to set default labels for all `#[skuld::test]` functions in a module:
 
 ```rust
-skuld::new_label!(pub SMOKE, "smoke");
-skuld::new_label!(pub UNIT, "unit");
-skuld::new_label!(pub SLOW, "slow");
+#[skuld::label] pub const SMOKE: skuld::Label;
+#[skuld::label] pub const UNIT: skuld::Label;
+#[skuld::label] pub const SLOW: skuld::Label;
 skuld::default_labels!(SMOKE, UNIT);
 
 #[skuld::test]                      // inherits [SMOKE, UNIT]

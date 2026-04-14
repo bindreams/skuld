@@ -79,6 +79,13 @@ path = "tests/capture_cli.rs"
 name = "compile_errors"
 path = "tests/compile_errors.rs"
 
+# Subprocess test for cross-module duplicate-label detection. Spawns the
+# `duplicate_labels` binary (two modules declaring the same label) and
+# asserts the startup panic mentions both source locations.
+[[test]]
+name = "duplicate_labels_cli"
+path = "tests/duplicate_labels_cli.rs"
+
 # Minimal skuld-powered binary spawned by capture_cli.rs subprocess
 # tests. Not a real product binary; only exists so CARGO_BIN_EXE_*
 # resolves to a path we can feed to Command::new.
@@ -89,5 +96,13 @@ path = "tests/compile_errors.rs"
 [[bin]]
 name = "capture_fixture"
 path = "tests/support_bins/capture_fixture/main.rs"
+test = false
+doc = false
+
+# Binary spawned by duplicate_labels_cli.rs. Declares `DUP` twice via
+# sibling modules to exercise `check_label_registry`.
+[[bin]]
+name = "duplicate_labels"
+path = "tests/support_bins/duplicate_labels/main.rs"
 test = false
 doc = false

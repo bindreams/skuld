@@ -5,7 +5,7 @@ For tests generated at runtime (e.g. from data files), use `TestRunner` instead 
 ## Basic usage
 
 ```rust
-skuld::new_label!(DATA, "data");
+#[skuld::label] const DATA: skuld::Label;
 
 fn main() {
     let mut runner = skuld::TestRunner::new();
@@ -34,7 +34,7 @@ Dynamic tests are collected alongside `#[skuld::test]`-registered tests. They su
 Use `add_serial` for dynamic tests that need the serial mutex:
 
 ```rust
-skuld::new_label!(INTEGRATION, "integration");
+#[skuld::label] const INTEGRATION: skuld::Label;
 
 runner.add_serial(
     "env-sensitive test",
@@ -49,8 +49,8 @@ runner.add_serial(
 Use `add_serial_with` for dynamic tests that need serial execution with a filter expression:
 
 ```rust
-skuld::new_label!(DATABASE, "database");
-skuld::new_label!(FAST, "fast");
+#[skuld::label] const DATABASE: skuld::Label;
+#[skuld::label] const FAST: skuld::Label;
 
 runner.add_serial_with(
     "filtered serial test",

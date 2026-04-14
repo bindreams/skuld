@@ -1,0 +1,5 @@
+error: expected identifier, found keyword `_`
+ --> tests/compile_fail/label_underscore_ident.rs:2:7
+  |
+2 | const _: skuld::Label;
+  |       ^
