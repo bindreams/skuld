@@ -147,7 +147,7 @@ Like `env`, the `cwd` fixture is `serial`.
 Fixtures support the same `serial` syntax as tests. A bare `serial` means serial with everything; `serial = <expr>` applies a filter:
 
 ```rust
-skuld::new_label!(DATABASE, "database");
+#[skuld::label] const DATABASE: skuld::Label;
 
 #[skuld::fixture(scope = test, serial = DATABASE)]
 fn db_conn() -> Result<DbConn, String> {

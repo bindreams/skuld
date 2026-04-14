@@ -487,6 +487,43 @@ fn label_filter_to_sql_complex() {
     assert!(sql.contains("label = 'slow'"));
 }
 
+// Case-insensitive filter parsing -----
+
+#[test]
+fn parse_lowercases_uppercase_label() {
+    assert_eq!(parse_label_expr("DOCKER").unwrap(), label("docker"));
+}
+
+#[test]
+fn parse_lowercases_mixed_case_label() {
+    assert_eq!(parse_label_expr("Docker").unwrap(), label("docker"));
+}
+
+#[test]
+fn parse_lowercases_inside_expression() {
+    assert_eq!(
+        parse_label_expr("Docker & SLOW").unwrap(),
+        and(label("docker"), label("slow")),
+    );
+}
+
+#[test]
+fn filter_matches_case_insensitive_simple() {
+    let docker = Label::__new("docker");
+    let filter = LabelFilter::parse("Docker").unwrap();
+    assert!(filter.matches(&[docker]));
+}
+
+#[test]
+fn filter_matches_case_insensitive_complex() {
+    let docker = Label::__new("docker");
+    let slow = Label::__new("slow");
+    let filter = LabelFilter::parse("DOCKER & !SLOW").unwrap();
+    assert!(filter.matches(&[docker]));
+    assert!(!filter.matches(&[docker, slow]));
+    assert!(!filter.matches(&[slow]));
+}
+
 // Cross-validation: validate_label_name and PEG grammar agree -----
 
 #[test]

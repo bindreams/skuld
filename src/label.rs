@@ -1,8 +1,9 @@
 //! Label types, filtering, validation, and module-level defaults.
 //!
-//! Labels are sentinel values created with [`new_label!`] and optionally
-//! aliased with [`get_label!`]. Tests are filtered by the `SKULD_LABELS`
-//! environment variable (boolean expression with `&`, `|`, `!`, and grouping).
+//! Labels are sentinel values created with the [`macro@crate::label`] attribute
+//! macro. Tests are filtered by the `SKULD_LABELS` environment variable
+//! (boolean expression with `&`, `|`, `!`, and grouping, matched
+//! case-insensitively).
 
 #[cfg(test)]
 mod label_tests;
@@ -11,11 +12,11 @@ use crate::TestDef;
 
 // Label type =====
 
-/// A test label. Created via [`new_label!`] (definition) or [`get_label!`] (reference).
+/// A test label. Created via the [`macro@crate::label`] attribute macro.
 ///
 /// ```ignore
-/// skuld::new_label!(pub DOCKER, "docker");
-/// skuld::get_label!(pub ALSO_DOCKER, "docker");
+/// #[skuld::label]
+/// pub const DOCKER: skuld::Label;
 ///
 /// #[skuld::test(labels = [DOCKER])]
 /// fn my_test() {}
@@ -29,6 +30,16 @@ impl Label {
     #[doc(hidden)]
     pub const fn __new(name: &'static str) -> Self {
         validate_label_name(name);
+        // Canonical-lowercase invariant is a hard contract, not a sanity
+        // check: the `#[skuld::label]` macro lowercases at expansion time,
+        // and label matching everywhere else (SQL, hash buckets, filter
+        // parsing) assumes stored names are already lowercase. A stray
+        // uppercase name silently matches nothing — fail loud in release
+        // builds too.
+        assert!(
+            contains_no_ascii_uppercase(name),
+            "Label::__new requires a canonical-lowercase name"
+        );
         Self { name }
     }
 
@@ -36,6 +47,20 @@ impl Label {
     pub const fn name(&self) -> &'static str {
         self.name
     }
+}
+
+/// Stdlib `str::bytes().all(|b| !b.is_ascii_uppercase())` is not const-stable;
+/// hand-rolled here so [`Label::__new`] can be a `const fn`.
+const fn contains_no_ascii_uppercase(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] >= b'A' && bytes[i] <= b'Z' {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 impl std::fmt::Display for Label {
@@ -46,19 +71,11 @@ impl std::fmt::Display for Label {
 
 // Label registration =====
 
-/// Whether a label entry is a definition ([`new_label!`]) or a reference ([`get_label!`]).
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LabelEntryKind {
-    New,
-    Get,
-}
-
-/// A registration entry submitted by [`new_label!`] or [`get_label!`] via `inventory`.
+/// A registration entry submitted by the [`macro@crate::label`] attribute
+/// macro via `inventory`. Used at startup to detect duplicate labels.
 #[doc(hidden)]
 pub struct LabelEntry {
     pub name: &'static str,
-    pub kind: LabelEntryKind,
     pub file: &'static str,
     pub line: u32,
     pub column: u32,
@@ -66,56 +83,14 @@ pub struct LabelEntry {
 
 inventory::collect!(LabelEntry);
 
-/// Define a new label constant. Panics at startup if another `new_label!` with
-/// the same name exists anywhere in the binary.
-///
-/// ```ignore
-/// skuld::new_label!(pub DOCKER, "docker");
-/// skuld::new_label!(INTERNAL_LABEL, "internal"); // private
-/// ```
-#[macro_export]
-macro_rules! new_label {
-    ($vis:vis $ident:ident, $name:literal) => {
-        $vis const $ident: $crate::Label = $crate::Label::__new($name);
-
-        $crate::inventory::submit!($crate::LabelEntry {
-            name: $name,
-            kind: $crate::LabelEntryKind::New,
-            file: ::core::file!(),
-            line: ::core::line!(),
-            column: ::core::column!(),
-        });
-    };
-}
-
-/// Reference an existing label (defined elsewhere with [`new_label!`]).
-/// Panics at startup if no corresponding `new_label!` exists in the binary.
-///
-/// ```ignore
-/// skuld::get_label!(pub DOCKER, "docker"); // must have a new_label!("docker") somewhere
-/// ```
-#[macro_export]
-macro_rules! get_label {
-    ($vis:vis $ident:ident, $name:literal) => {
-        $vis const $ident: $crate::Label = $crate::Label::__new($name);
-
-        $crate::inventory::submit!($crate::LabelEntry {
-            name: $name,
-            kind: $crate::LabelEntryKind::Get,
-            file: ::core::file!(),
-            line: ::core::line!(),
-            column: ::core::column!(),
-        });
-    };
-}
-
 // Label validation =====
 
 /// Validate that a label name follows Rust identifier rules (ASCII subset).
 ///
 /// Must start with `[a-zA-Z_]`, followed by `[a-zA-Z0-9_]`.
 /// Panics with a descriptive message. When called from a const context
-/// (e.g. `new_label!`), this becomes a compile-time error.
+/// (via [`Label::__new`] inside the attribute macro), this becomes a
+/// compile-time error.
 pub(crate) const fn validate_label_name(name: &str) {
     let bytes = name.as_bytes();
     if bytes.is_empty() {
@@ -138,9 +113,8 @@ pub(crate) const fn validate_label_name(name: &str) {
 /// Validate all label registrations. Called at the start of
 /// [`TestRunner::run_tests()`](crate::runner::TestRunner::run_tests).
 ///
-/// Panics if:
-/// - Two `new_label!` entries share the same name.
-/// - A `get_label!` entry has no corresponding `new_label!`.
+/// Panics if two `#[skuld::label]` declarations (anywhere in the binary,
+/// including in different crates) produce the same lowercased name.
 pub(crate) fn validate_labels() {
     if let Err(msg) = check_label_registry() {
         panic!("{msg}");
@@ -179,30 +153,21 @@ pub(crate) fn validate_serial_filters() {
     }
 }
 
-/// Inner validation that returns all error messages instead of panicking,
-/// so unit tests can assert on specific failures.
+/// Inner validation that returns the error message instead of panicking, so
+/// unit tests can assert on specific failures.
 ///
-/// Collects every error (duplicate definitions, orphan references) and
-/// returns them joined, so that a single run surfaces all problems.
+/// Buckets all registered labels by name and returns an error for every
+/// bucket with more than one entry, including every source location so a
+/// single run surfaces all duplicates.
 pub(crate) fn check_label_registry() -> Result<(), String> {
     use std::collections::HashMap;
 
     let mut definitions: HashMap<&str, Vec<&LabelEntry>> = HashMap::new();
-    let mut references: Vec<&LabelEntry> = Vec::new();
-
     for entry in inventory::iter::<LabelEntry> {
-        match entry.kind {
-            LabelEntryKind::New => {
-                definitions.entry(entry.name).or_default().push(entry);
-            }
-            LabelEntryKind::Get => {
-                references.push(entry);
-            }
-        }
+        definitions.entry(entry.name).or_default().push(entry);
     }
 
     let mut errors: Vec<String> = Vec::new();
-
     let mut sorted_names: Vec<&&str> = definitions.keys().collect();
     sorted_names.sort();
     for name in sorted_names {
@@ -213,18 +178,9 @@ pub(crate) fn check_label_registry() -> Result<(), String> {
                 .map(|e| format!("  {}:{}:{}", e.file, e.line, e.column))
                 .collect();
             errors.push(format!(
-                "label {:?} defined multiple times with new_label!:\n{}",
+                "label {:?} declared multiple times:\n{}",
                 name,
                 locations.join("\n")
-            ));
-        }
-    }
-
-    for entry in &references {
-        if !definitions.contains_key(entry.name) {
-            errors.push(format!(
-                "get_label!({:?}) at {}:{}:{} has no corresponding new_label! definition",
-                entry.name, entry.file, entry.line, entry.column
             ));
         }
     }
@@ -386,7 +342,7 @@ fn build_expr(pair: pest::iterators::Pair<'_, Rule>) -> Result<LabelExpr, String
             let child = pair.into_inner().next().unwrap();
             build_expr(child)
         }
-        Rule::label => Ok(LabelExpr::Label(pair.as_str().to_string())),
+        Rule::label => Ok(LabelExpr::Label(pair.as_str().to_ascii_lowercase())),
         _ => Err(format!("unexpected rule: {:?}", pair.as_rule())),
     }
 }
@@ -412,12 +368,15 @@ pub(crate) fn read_label_filter() -> Option<LabelFilter> {
 /// The simplest filter is a single [`Label`]; complex filters are built
 /// with `&` (AND), `|` (OR), and `!` (NOT) operators.
 ///
+/// String-based filters ([`LabelFilter::parse`], `SKULD_LABELS`,
+/// `#[skuld::test(serial = ...)]`) match label names case-insensitively.
+///
 /// ```ignore
-/// skuld::new_label!(pub DOCKER, "docker");
-/// skuld::new_label!(pub FAST, "fast");
+/// #[skuld::label] pub const DOCKER: skuld::Label;
+/// #[skuld::label] pub const FAST: skuld::Label;
 ///
 /// // A single label is a filter:
-/// let f: LabelFilter = DOCKER.into();
+/// let f: skuld::LabelFilter = DOCKER.into();
 ///
 /// // Compose with operators:
 /// let f = DOCKER & !FAST;
@@ -520,7 +479,7 @@ impl_filter_binop!(BitOr, bitor, Or);
 
 // Module-level default labels =====
 
-/// Default labels for all tests in a module. Registered by [`default_labels!`].
+/// Default labels for all tests in a module. Registered by [`crate::default_labels!`].
 pub struct ModuleLabels {
     pub module: &'static str,
     pub labels: &'static [Label],
@@ -534,8 +493,8 @@ inventory::collect!(ModuleLabels);
 /// not affected — explicit labels fully replace defaults.
 ///
 /// ```ignore
-/// skuld::new_label!(pub DOCKER, "docker");
-/// skuld::new_label!(pub CONFORMANCE, "conformance");
+/// #[skuld::label] pub const DOCKER: skuld::Label;
+/// #[skuld::label] pub const CONFORMANCE: skuld::Label;
 /// skuld::default_labels!(DOCKER, CONFORMANCE);
 ///
 /// #[skuld::test]                       // inherits [DOCKER, CONFORMANCE]

@@ -213,15 +213,17 @@ fn example2(#[fixture(temp_dir)] dir: &Path) { /* ... */ }
 
 ## Labels
 
-Labels are sentinel values for tagging and filtering tests. Define them with `new_label!`:
+Labels are sentinel values for tagging and filtering tests. Define them with `#[skuld::label]`:
 
 ```rust
-skuld::new_label!(pub DOCKER, "docker");
-skuld::new_label!(pub SLOW, "slow");
+#[skuld::label] pub const DOCKER: skuld::Label;
+#[skuld::label] pub const SLOW: skuld::Label;
 
 #[skuld::test(labels = [DOCKER, SLOW])]
 fn heavy_test() { /* ... */ }
 ```
+
+The label's string name is the identifier lowercased (`DOCKER` → `"docker"`). To reuse a label from another crate, just `use` it: `use other_crate::DOCKER;`.
 
 Filter with the `SKULD_LABELS` environment variable using boolean expressions (`&` AND, `|` OR, `!` NOT, parentheses):
 
@@ -231,14 +233,14 @@ SKULD_LABELS="docker | slow" cargo test                # "docker" OR "slow"
 SKULD_LABELS="(docker | integration) & !slow" cargo test  # combined
 ```
 
-Unset `SKULD_LABELS` runs all tests. Precedence: `!` > `&` > `|`.
+Unset `SKULD_LABELS` runs all tests. Precedence: `!` > `&` > `|`. Label names are matched case-insensitively, so `SKULD_LABELS=DOCKER` is equivalent to `SKULD_LABELS=docker`.
 
 ### Module-level defaults
 
 ```rust
-skuld::new_label!(pub SMOKE, "smoke");
-skuld::new_label!(pub UNIT, "unit");
-skuld::new_label!(pub SLOW, "slow");
+#[skuld::label] pub const SMOKE: skuld::Label;
+#[skuld::label] pub const UNIT: skuld::Label;
+#[skuld::label] pub const SLOW: skuld::Label;
 skuld::default_labels!(SMOKE, UNIT);
 
 #[skuld::test]                      // inherits [SMOKE, UNIT]
@@ -281,7 +283,7 @@ Use `TestRunner` to mix inventory-registered and runtime-generated tests:
 
 ```rust
 fn main() {
-    skuld::new_label!(DATA, "data");
+    #[skuld::label] const DATA: skuld::Label;
 
     let mut runner = skuld::TestRunner::new();
     for file in std::fs::read_dir("test_data").unwrap() {

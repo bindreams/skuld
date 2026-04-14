@@ -1,5 +1,5 @@
 error: expected identifier
- --> tests/compile_fail/serial_invalid_literal.rs:3:24
+ --> tests/compile_fail/serial_invalid_literal.rs:4:24
   |
-3 | #[skuld::test(serial = 42)]
+4 | #[skuld::test(serial = 42)]
   |                        ^^

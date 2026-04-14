@@ -23,8 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SQLite-based cross-process serial coordination (replaces the previous
   file-lock mechanism).
 
-- Startup validation panics with source locations (`file:line:column`) if
-  duplicate `new_label!` definitions or orphan `get_label!` references exist.
+- Startup validation panics with source locations (`file:line:column`) when
+  two `#[skuld::label]` declarations (in any crate linked into the binary)
+  produce the same lowercased name.
 
 ### Changed
 
@@ -38,22 +39,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a SQLite database instead of file locks, enabling filter-aware cross-process
   mutual exclusion.
 
-- **Labels are now sentinel values (`Label` type) instead of plain strings.**
-  Use `new_label!` to define label constants, `get_label!` to reference labels
-  defined elsewhere. `#[skuld::test(labels = [...])]` now accepts `Label`
-  constant paths instead of bare identifiers. `default_labels!` likewise accepts
+- **Labels are now sentinel values (`Label` type) declared via `#[skuld::label]`.**
+  The attribute macro replaces `new_label!` / `get_label!`; the label's string
+  name is the identifier lowercased (`FOO` → `"foo"`). `#[skuld::test(labels =
+[...])]` accepts `Label` constant paths; `default_labels!` likewise accepts
   `Label` paths. `TestRunner::add`/`add_serial` take `&[Label]` instead of
-  `&[&str]`.
+  `&[&str]`. Cross-crate sharing is a plain `use other_crate::FOO;`.
+
+  ```rust
+  // before
+  skuld::new_label!(pub FOO, "foo");
+  skuld::get_label!(pub FOO, "foo");      // in another crate
+  // after
+  #[skuld::label] pub const FOO: skuld::Label;
+  use other_crate::FOO;                   // in another crate
+  ```
 
 - **Label names are now restricted to Rust identifier syntax** (ASCII letters,
-  digits, underscore; must not start with a digit). Names with hyphens or
-  leading digits are no longer accepted. Invalid names in `new_label!` /
-  `get_label!` are caught at compile time; invalid names in `SKULD_LABELS` are
-  caught at parse time.
+  digits, underscore; must not start with a digit). The constant ident itself
+  is validated by the compiler; names inside `SKULD_LABELS` are checked at
+  parse time.
 
 - **Label filtering uses `SKULD_LABELS` env var with boolean expression syntax.**
   Supports `&` (AND), `|` (OR), `!` (NOT), and parenthesized grouping.
-  Precedence: `!` > `&` > `|`. Unset = no filtering, all tests run.
+  Precedence: `!` > `&` > `|`. Label names in `SKULD_LABELS` and in
+  `#[skuld::test(serial = ...)]` expressions are matched case-insensitively.
+  Unset `SKULD_LABELS` = no filtering, all tests run.
 
 - **Per-test output capture now happens at the file-descriptor level instead of
   through a tracing subscriber.** Skuld no longer installs any `tracing`
@@ -90,3 +101,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `probe_executable` and `probe_path` helper functions. Inline the equivalent
   logic directly in your requirement functions (see updated docs).
+
+- The `new_label!` and `get_label!` declarative macros, the `LabelEntryKind`
+  enum, and the `kind` field on `LabelEntry`. Use `#[skuld::label]` to declare
+  labels and `use` to reuse them across crates.

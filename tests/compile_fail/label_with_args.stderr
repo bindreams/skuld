@@ -1,0 +1,5 @@
+error: unexpected token
+ --> tests/compile_fail/label_with_args.rs:1:16
+  |
+1 | #[skuld::label(foo = "bar")]
+  |                ^^^

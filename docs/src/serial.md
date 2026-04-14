@@ -22,8 +22,8 @@ While a `serial` test is running, no other test executes. This is the safest opt
 When only a subset of tests conflict, use `serial = <expr>` to restrict mutual exclusion to tests whose labels match the expression:
 
 ```rust
-skuld::new_label!(DATABASE, "database");
-skuld::new_label!(FAST, "fast");
+#[skuld::label] const DATABASE: skuld::Label;
+#[skuld::label] const FAST: skuld::Label;
 
 #[skuld::test(labels = [DATABASE], serial = DATABASE)]
 fn migrate_schema() {
@@ -43,7 +43,7 @@ The expression supports boolean operators with bare operator syntax:
 
 Operator precedence: `!` > `&` > `|`. Parentheses override precedence.
 
-Labels used in serial expressions must be `Label` constants in scope (defined with `new_label!` or referenced with `get_label!`).
+Labels used in serial expressions must be `Label` constants in scope (defined with `#[skuld::label]`). The expression matches label names case-insensitively, so `serial = DATABASE` and `serial = database` are equivalent.
 
 ## How coordination works
 
@@ -54,7 +54,7 @@ Serial tests are coordinated through a SQLite database, automatically managed by
 Fixtures can declare `serial` too. Any test that uses a serial fixture automatically inherits the serial constraint:
 
 ```rust
-skuld::new_label!(DATABASE, "database");
+#[skuld::label] const DATABASE: skuld::Label;
 
 #[skuld::fixture(scope = test, serial = DATABASE)]
 fn db_conn() -> Result<DbConn, String> {
@@ -89,8 +89,8 @@ For programmatic use (e.g. in dynamic tests), the `LabelFilter` type supports th
 ```rust
 use skuld::LabelFilter;
 
-skuld::new_label!(DATABASE, "database");
-skuld::new_label!(FAST, "fast");
+#[skuld::label] const DATABASE: skuld::Label;
+#[skuld::label] const FAST: skuld::Label;
 
 let filter: LabelFilter = DATABASE.into();
 let filter = DATABASE & !FAST;

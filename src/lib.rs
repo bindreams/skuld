@@ -31,7 +31,7 @@ pub use fixtures::cwd::{cwd, CwdGuard};
 pub use fixtures::env::{env, EnvGuard};
 pub use fixtures::temp_dir::{temp_dir, TempDir};
 pub use fixtures::test_name::{test_name, TestName};
-pub use label::{Label, LabelEntry, LabelEntryKind, LabelFilter, ModuleLabels};
+pub use label::{Label, LabelEntry, LabelFilter, ModuleLabels};
 pub use metadata::{FixtureMetadata, RequirementInfo, TestMetadata};
 pub use runner::{run_all, TestRunner};
 
@@ -41,6 +41,7 @@ use std::sync::OnceLock;
 
 // Re-export proc macros for consumers.
 pub use skuld_macros::fixture;
+pub use skuld_macros::label;
 pub use skuld_macros::test;
 
 // Re-export inventory so that macro-generated `inventory::submit!` calls resolve.
