@@ -26,8 +26,10 @@ pub enum Command {
     /// Print or validate the workspace version.
     ///
     /// Without flags: print the shared Cargo.toml version.
-    /// With `--check`: validate it matches the nearest git tag, or is one bump ahead.
-    /// With `--check --exact`: require an exact match (used by release CI).
+    /// With `--check`: validate it matches, or is one bump ahead of, at least one
+    ///   nearest ancestor version tag. Passes silently when no ancestor tags exist.
+    /// With `--check --exact`: require exact equality with at least one nearest
+    ///   ancestor tag. Errors if no ancestor tags exist. Used by release CI.
     Version {
         #[arg(long)]
         check: bool,

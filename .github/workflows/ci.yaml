@@ -16,6 +16,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 is required so `cargo xtask version --check`
+          # (run via the prek hook) can see ancestor tags. Default depth 1
+          # with no tags would make the check silently always-pass.
+          fetch-depth: 0
 
       # setup-rust is still needed so the cargo-fmt / cargo-clippy /
       # cargo-xtask-version hooks inside prek can find a Rust toolchain.

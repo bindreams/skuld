@@ -37,11 +37,13 @@ pass_filenames = false
 
 [[repos.hooks]]
 id = "cargo-xtask-version"
-name = "cargo xtask version"
-# Without --check: asserts workspace members agree on a strict
-# MAJOR.MINOR.PATCH version AND that skuld's skuld-macros dep pin matches.
-# Tag comparison is deferred to the Draft Release workflow.
-entry = "cargo xtask version"
+name = "cargo xtask version --check"
+# Asserts:
+#   1. workspace members agree on a strict MAJOR.MINOR.PATCH version
+#   2. skuld-macros dep pin matches
+#   3. Cargo.toml version == or one-bump-after some nearest ancestor tag
+#      (prevents main from drifting ahead of released tags without a release)
+entry = "cargo xtask version --check"
 language = "system"
 # Only run when a Cargo.toml changes — the check reads manifests, not src.
 files = '(^|/)Cargo\.toml$'
