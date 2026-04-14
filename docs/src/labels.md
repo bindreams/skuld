@@ -58,6 +58,8 @@ Label names in `SKULD_LABELS` are matched case-insensitively. `SKULD_LABELS=DOCK
 | Operator | Meaning    | Example                           |
 | -------- | ---------- | --------------------------------- |
 | (none)   | bare label | `docker`                          |
+| `true`   | constant   | `true` (matches every test)       |
+| `false`  | constant   | `false` (matches no test)         |
 | `!`      | NOT        | `!slow`                           |
 | `&`      | AND        | `docker & slow`                   |
 | `\|`     | OR         | `docker \| slow`                  |
@@ -70,6 +72,19 @@ Whitespace between tokens is optional. Quote the value in shell when using `|`.
 **Unset** `SKULD_LABELS` → no filtering, all tests run.
 
 **Empty or whitespace-only** `SKULD_LABELS` (e.g. `SKULD_LABELS=""` or `SKULD_LABELS="   "`) → panic at startup with `skuld: SKULD_LABELS: ...`. Shell expansions like `SKULD_LABELS="$MAYBE_UNSET"` that produce an empty string will therefore panic, not be treated as "no filter." If you want a conditional filter, use `if [ -n "$VAR" ]; then ... fi` or similar.
+
+The names `true` and `false` are reserved by the grammar. Attempting to define a label with one of those names (`#[skuld::label] pub const TRUE: skuld::Label`) is a compile-time error.
+
+### Canonical form
+
+Filters are stored in a canonical (BDD-simplified, sort-normalized) form. Two semantically-equivalent expressions are interchangeable:
+
+- `LabelFilter::parse("a & b") == LabelFilter::parse("b & a")` — operator order does not matter.
+- `LabelFilter::parse("!!a") == LabelFilter::parse("a")` — double negation collapses.
+- `LabelFilter::parse("a | !a") == LabelFilter::parse("true")` — tautologies fold to `true`.
+- Merged fixture filters dedup automatically — `(a) | (a) | (b)` displays as `a | b`.
+
+Display output reflects the canonical form, so `parse(filter.to_string())` round-trips. Note that the canonical form uses sum-of-products with sorted children, so `(a | b) & c` displays as `a & c | b & c`.
 
 ## Module-level defaults
 
