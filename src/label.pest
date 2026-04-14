@@ -1,6 +1,14 @@
 WHITESPACE = _{ " " | "\t" | "\r" }
 
+// `bool_lit` MUST precede `label` in the `primary` alternation so that pest's
+// ordered-choice picks the constant first. The negative lookahead ensures
+// names like `truely` / `false_` fall through to `label`.
 label    = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+// `^"..."` is pest's case-insensitive string match — mirrors the
+// label-matching case-insensitivity that #29 introduced for terminals,
+// so `True` / `FALSE` collapse to `Const` instead of falling through to
+// `label` and lowercasing to a (reserved-name) Terminal.
+bool_lit = @{ (^"true" | ^"false") ~ !(ASCII_ALPHANUMERIC | "_") }
 
 input    =  { SOI ~ expr ~ EOI }
 expr     =  { or_expr }
@@ -8,4 +16,4 @@ or_expr  =  { and_expr ~ ("|" ~ and_expr)* }
 and_expr =  { not_expr ~ ("&" ~ not_expr)* }
 not_expr =  { neg | primary }
 neg      =  { "!" ~ not_expr }
-primary  =  { "(" ~ expr ~ ")" | label }
+primary  =  { "(" ~ expr ~ ")" | bool_lit | label }

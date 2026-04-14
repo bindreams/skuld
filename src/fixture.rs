@@ -560,3 +560,6 @@ pub fn merge_serial_filters(a: &str, b: &str) -> String {
     }
     format!("({a}) | ({b})")
 }
+
+#[cfg(test)]
+mod fixture_tests;

@@ -325,3 +325,117 @@ fn is_retryable_matches_busy_and_locked_only() {
     assert!(!is_retryable(&constraint));
     assert!(!is_retryable(&Error::QueryReturnedNoRows));
 }
+
+// Canonicalization at the storage boundary (azhukova/35) =====
+//
+// Verify that `coordinate()` collapses redundant and tautological serial
+// filters before INSERTing them, so the DB invariant holds: every stored
+// serial_filter is either `""`, `"*"`, or a canonical Display string.
+
+fn stored_serial_filter(conn: &rusqlite::Connection, name: &str) -> String {
+    conn.query_row("SELECT serial_filter FROM running WHERE name = ?1", [name], |row| {
+        row.get::<_, String>(0)
+    })
+    .expect("test row should exist")
+}
+
+#[test]
+fn coordinate_stores_canonical_form_for_redundant_filter() {
+    let (_dir, path) = temp_db();
+    let _reg = coordinate(&path, "redundant", &[], "(a) | (a)");
+    let conn = open_db(&path);
+    assert_eq!(stored_serial_filter(&conn, "redundant"), "a");
+}
+
+#[test]
+fn coordinate_collapses_tautology_to_global_serial_sentinel() {
+    let (_dir, path) = temp_db();
+    let _reg = coordinate(&path, "taut", &[], "a | !a");
+    let conn = open_db(&path);
+    assert_eq!(stored_serial_filter(&conn, "taut"), SERIAL_ALL);
+}
+
+#[test]
+fn coordinate_collapses_contradiction_to_non_serial_sentinel() {
+    let (_dir, path) = temp_db();
+    let _reg = coordinate(&path, "contra", &[], "a & !a");
+    let conn = open_db(&path);
+    assert_eq!(stored_serial_filter(&conn, "contra"), SERIAL_NONE);
+}
+
+#[test]
+fn coordinate_preserves_serial_none_sentinel() {
+    let (_dir, path) = temp_db();
+    let _reg = coordinate(&path, "none", &[], SERIAL_NONE);
+    let conn = open_db(&path);
+    assert_eq!(stored_serial_filter(&conn, "none"), SERIAL_NONE);
+}
+
+#[test]
+fn coordinate_preserves_serial_all_sentinel() {
+    // Use a fresh DB so SERIAL_ALL isn't blocked by the SERIAL_NONE row above.
+    let (_dir, path) = temp_db();
+    let _reg = coordinate(&path, "all", &[], SERIAL_ALL);
+    let conn = open_db(&path);
+    assert_eq!(stored_serial_filter(&conn, "all"), SERIAL_ALL);
+}
+
+// Schema migration v0 → v1 =====
+
+#[test]
+fn migration_rewrites_legacy_non_canonical_rows() {
+    let (_dir, path) = temp_db();
+    // Open and seed the DB with the OLD schema (user_version still 0) plus
+    // a row containing a legacy non-canonical serial_filter that happens to
+    // simplify to the canonical "a".
+    let conn = open_db(&path);
+    // Reset version so the migration runs again on the next open.
+    conn.execute("PRAGMA user_version = 0", []).unwrap();
+    register(&conn, "legacy", &[], "(a) | (a)").unwrap();
+    drop(conn);
+
+    // Re-open. open_db should run migrate_schema and rewrite the legacy row
+    // in place. After the migration, user_version is 1 and the row's filter
+    // is the canonical Display form.
+    let conn = open_db(&path);
+    let stored: String = stored_serial_filter(&conn, "legacy");
+    assert_eq!(stored, "a", "legacy row should be canonicalized");
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    assert_eq!(version, 1, "schema version should bump to 1");
+}
+
+#[test]
+fn migration_skips_already_canonical_rows() {
+    let (_dir, path) = temp_db();
+    let conn = open_db(&path);
+    conn.execute("PRAGMA user_version = 0", []).unwrap();
+    register(&conn, "already_canonical", &[], "a").unwrap();
+    drop(conn);
+
+    let conn = open_db(&path);
+    assert_eq!(stored_serial_filter(&conn, "already_canonical"), "a");
+}
+
+#[test]
+fn migration_leaves_unparseable_live_rows_alone() {
+    let (_dir, path) = temp_db();
+    let conn = open_db(&path);
+    conn.execute("PRAGMA user_version = 0", []).unwrap();
+    // Insert a row with garbage that won't parse, owned by THIS process
+    // (i.e. an alive instance) — the migration must not delete it.
+    let our_pid = std::process::id();
+    conn.execute(
+        "INSERT INTO running (instance_id, name, serial_filter) VALUES (?1, ?2, ?3)",
+        rusqlite::params![format!("{our_pid}:0"), "garbage", "this is not a filter!!"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let conn = open_db(&path);
+    let kept: String = conn
+        .query_row("SELECT serial_filter FROM running WHERE name = 'garbage'", [], |row| {
+            row.get(0)
+        })
+        .expect("live unparseable row should be preserved");
+    assert_eq!(kept, "this is not a filter!!");
+}

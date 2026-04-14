@@ -85,7 +85,27 @@ inventory::collect!(LabelEntry);
 
 // Label validation =====
 
-/// Validate that a label name follows Rust identifier rules (ASCII subset).
+/// Names that the filter grammar parses as boolean literals (`Expr::Const`)
+/// rather than as label terminals. Single source of truth for both
+/// [`validate_label_name`] and the pest grammar (`bool_lit` rule).
+pub(crate) const RESERVED_LABEL_NAMES: &[&str] = &["true", "false"];
+
+const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Validate that a label name follows Rust identifier rules (ASCII subset)
+/// and is not a reserved name (`true`, `false`).
 ///
 /// Must start with `[a-zA-Z_]`, followed by `[a-zA-Z0-9_]`.
 /// Panics with a descriptive message. When called from a const context
@@ -107,6 +127,13 @@ pub(crate) const fn validate_label_name(name: &str) {
             panic!("invalid label name: must contain only ASCII letters, digits, and underscores");
         }
         i += 1;
+    }
+    let mut j = 0;
+    while j < RESERVED_LABEL_NAMES.len() {
+        if bytes_eq(bytes, RESERVED_LABEL_NAMES[j].as_bytes()) {
+            panic!("invalid label name: \"true\" and \"false\" are reserved by the filter grammar");
+        }
+        j += 1;
     }
 }
 
@@ -202,88 +229,166 @@ mod parser {
     pub(super) struct LabelExprParser;
 }
 
+use boolean_expression::{Expr, BDD};
 use parser::Rule;
 
-/// A boolean expression over test labels.
+/// A boolean expression over test labels, in canonical form.
 ///
-/// Parsed from the `SKULD_LABELS` environment variable by [`parse_label_expr`].
-/// Supports `&` (AND), `|` (OR), `!` (NOT), and parenthesized grouping.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LabelExpr {
-    /// Matches if the test has this label.
-    Label(String),
-    /// Logical NOT: matches if the inner expression does not match.
-    Not(Box<LabelExpr>),
-    /// Logical AND: matches if both sides match.
-    And(Box<LabelExpr>, Box<LabelExpr>),
-    /// Logical OR: matches if either side matches.
-    Or(Box<LabelExpr>, Box<LabelExpr>),
+/// Type alias for `boolean_expression::Expr<String>`. Wherever a `LabelExpr`
+/// crosses a public-ish API boundary (e.g. inside [`LabelFilter`]) it is the
+/// output of [`canonicalize`] — BDD-simplified with alphabetical variable
+/// ordering, then sort-normalized so structural equality coincides with
+/// semantic equivalence.
+pub(crate) type LabelExpr = Expr<String>;
+
+// Canonicalization =====
+
+/// Collect the names of every `Terminal` in `expr`. Constants contribute none.
+fn collect_terminals(expr: &LabelExpr) -> Vec<&str> {
+    fn walk<'a>(e: &'a LabelExpr, out: &mut Vec<&'a str>) {
+        match e {
+            Expr::Terminal(t) => out.push(t.as_str()),
+            Expr::Const(_) => {}
+            Expr::Not(x) => walk(x, out),
+            Expr::And(a, b) | Expr::Or(a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(expr, &mut out);
+    out
 }
 
-impl LabelExpr {
-    /// Evaluate this expression against a set of test labels.
-    pub(crate) fn matches(&self, test_labels: &[Label]) -> bool {
-        match self {
-            LabelExpr::Label(name) => test_labels.iter().any(|l| l.name() == name),
-            LabelExpr::Not(inner) => !inner.matches(test_labels),
-            LabelExpr::And(left, right) => left.matches(test_labels) && right.matches(test_labels),
-            LabelExpr::Or(left, right) => left.matches(test_labels) || right.matches(test_labels),
-        }
+/// Reduce an arbitrary `Expr<String>` to its canonical form:
+/// 1. Collect terminals and seed a `BDD` with them in alphabetical order so the
+///    resulting ROBDD is canonical given the input function.
+/// 2. Round-trip through `BDD::to_expr` to drop unused variables and produce a
+///    deterministic SOP-like `Expr<String>`.
+/// 3. Apply [`sort_children`] so any residual ordering jitter from the BDD's
+///    cubelist insertion order is eliminated.
+///
+/// The closure passed to `evaluate_with` is never called when there are no
+/// terminals: pure-constant inputs reduce via the crate's `Expr::Const` arms.
+pub(crate) fn canonicalize(expr: LabelExpr) -> LabelExpr {
+    let mut terms: Vec<&str> = collect_terminals(&expr);
+    terms.sort_unstable();
+    terms.dedup();
+    if terms.is_empty() {
+        return Expr::Const(expr.evaluate_with(|_: &String| false));
     }
-
-    /// Compile this expression to a SQL WHERE fragment for correlated subqueries.
-    ///
-    /// Assumes the `running` table is aliased as `r` and `labels` has columns
-    /// `running_id` and `label`.
-    pub(crate) fn to_sql(&self) -> String {
-        match self {
-            LabelExpr::Label(name) => {
-                format!("EXISTS (SELECT 1 FROM labels WHERE running_id = r.id AND label = '{name}')")
-            }
-            LabelExpr::Not(inner) => format!("NOT ({})", inner.to_sql()),
-            LabelExpr::And(a, b) => format!("({} AND {})", a.to_sql(), b.to_sql()),
-            LabelExpr::Or(a, b) => format!("({} OR {})", a.to_sql(), b.to_sql()),
-        }
+    let mut bdd: BDD<String> = BDD::new();
+    for t in &terms {
+        bdd.terminal(t.to_string());
     }
+    let func = bdd.from_expr(&expr);
+    sort_children(bdd.to_expr(func))
+}
 
-    /// Write the expression in human-readable form, adding parentheses only where
-    /// needed by operator precedence (OR=0, AND=1, NOT/Label=2).
-    fn fmt_with_prec(&self, f: &mut std::fmt::Formatter<'_>, min_prec: u8) -> std::fmt::Result {
-        let my_prec = match self {
-            LabelExpr::Or(_, _) => 0,
-            LabelExpr::And(_, _) => 1,
-            LabelExpr::Not(_) | LabelExpr::Label(_) => 2,
-        };
-        let needs_parens = my_prec < min_prec;
-        if needs_parens {
-            write!(f, "(")?;
+/// Recursively put each `Or`/`And` node's children in lexicographic order of
+/// their `Display` rendering. Applied after `BDD::to_expr` as a defensive
+/// canonicalization step — see "Why canonicity holds" in the design plan.
+fn sort_children(expr: LabelExpr) -> LabelExpr {
+    match expr {
+        Expr::Not(x) => Expr::Not(Box::new(sort_children(*x))),
+        Expr::And(a, b) => {
+            let (lo, hi) = sort_pair(sort_children(*a), sort_children(*b));
+            Expr::And(Box::new(lo), Box::new(hi))
         }
-        match self {
-            LabelExpr::Label(name) => write!(f, "{name}")?,
-            LabelExpr::Not(inner) => {
-                write!(f, "!")?;
-                inner.fmt_with_prec(f, 2)?;
-            }
-            LabelExpr::And(a, b) => {
-                a.fmt_with_prec(f, 1)?;
-                write!(f, " & ")?;
-                b.fmt_with_prec(f, 1)?;
-            }
-            LabelExpr::Or(a, b) => {
-                a.fmt_with_prec(f, 0)?;
-                write!(f, " | ")?;
-                b.fmt_with_prec(f, 0)?;
-            }
+        Expr::Or(a, b) => {
+            let (lo, hi) = sort_pair(sort_children(*a), sort_children(*b));
+            Expr::Or(Box::new(lo), Box::new(hi))
         }
-        if needs_parens {
-            write!(f, ")")?;
-        }
-        Ok(())
+        leaf @ (Expr::Terminal(_) | Expr::Const(_)) => leaf,
     }
 }
 
-/// Parse a label filter expression string into an AST.
+fn sort_pair(a: LabelExpr, b: LabelExpr) -> (LabelExpr, LabelExpr) {
+    if format_expr(&a) <= format_expr(&b) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+// Display, evaluation, SQL =====
+
+/// Evaluate `expr` against a set of test labels. A label is "present" iff its
+/// name matches a `Terminal` in `expr`; absent labels evaluate to `false`,
+/// preserving the original `!docker` ⇒ true on empty-labels semantics.
+pub(crate) fn matches_expr(expr: &LabelExpr, labels: &[Label]) -> bool {
+    expr.evaluate_with(|t: &String| labels.iter().any(|l| l.name() == t))
+}
+
+/// Compile `expr` to a SQL WHERE fragment for correlated subqueries on the
+/// `running` table (alias `r`) and `labels` table.
+pub(crate) fn to_sql_expr(expr: &LabelExpr) -> String {
+    match expr {
+        Expr::Terminal(name) => {
+            format!("EXISTS (SELECT 1 FROM labels WHERE running_id = r.id AND label = '{name}')")
+        }
+        Expr::Const(true) => "1=1".to_string(),
+        Expr::Const(false) => "1=0".to_string(),
+        Expr::Not(inner) => format!("NOT ({})", to_sql_expr(inner)),
+        Expr::And(a, b) => format!("({} AND {})", to_sql_expr(a), to_sql_expr(b)),
+        Expr::Or(a, b) => format!("({} OR {})", to_sql_expr(a), to_sql_expr(b)),
+    }
+}
+
+/// Write `expr` in human-readable form, adding parentheses only where required
+/// by operator precedence (OR=0, AND=1, NOT/leaf=2).
+fn fmt_expr(expr: &LabelExpr, f: &mut std::fmt::Formatter<'_>, min_prec: u8) -> std::fmt::Result {
+    let my_prec = match expr {
+        Expr::Or(_, _) => 0,
+        Expr::And(_, _) => 1,
+        Expr::Not(_) | Expr::Terminal(_) | Expr::Const(_) => 2,
+    };
+    let needs_parens = my_prec < min_prec;
+    if needs_parens {
+        write!(f, "(")?;
+    }
+    match expr {
+        Expr::Terminal(name) => write!(f, "{name}")?,
+        Expr::Const(true) => write!(f, "true")?,
+        Expr::Const(false) => write!(f, "false")?,
+        Expr::Not(inner) => {
+            write!(f, "!")?;
+            fmt_expr(inner, f, 2)?;
+        }
+        Expr::And(a, b) => {
+            fmt_expr(a, f, 1)?;
+            write!(f, " & ")?;
+            fmt_expr(b, f, 1)?;
+        }
+        Expr::Or(a, b) => {
+            fmt_expr(a, f, 0)?;
+            write!(f, " | ")?;
+            fmt_expr(b, f, 0)?;
+        }
+    }
+    if needs_parens {
+        write!(f, ")")?;
+    }
+    Ok(())
+}
+
+fn format_expr(expr: &LabelExpr) -> String {
+    struct D<'a>(&'a LabelExpr);
+    impl std::fmt::Display for D<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            fmt_expr(self.0, f, 0)
+        }
+    }
+    D(expr).to_string()
+}
+
+// Parsing =====
+
+/// Parse a label filter expression string into a CANONICAL `LabelExpr`.
 ///
+/// The returned expression has been BDD-simplified and sort-normalized; two
+/// semantically-equivalent inputs produce structurally identical outputs.
 /// Returns `Err` with a human-readable message on malformed input.
 pub(crate) fn parse_label_expr(input: &str) -> Result<LabelExpr, String> {
     use pest::Parser;
@@ -301,7 +406,8 @@ pub(crate) fn parse_label_expr(input: &str) -> Result<LabelExpr, String> {
         .find(|p| p.as_rule() == Rule::expr)
         .expect("pest grammar guarantees input rule contains expr");
 
-    build_expr(expr_pair)
+    let raw = build_expr(expr_pair)?;
+    Ok(canonicalize(raw))
 }
 
 fn build_expr(pair: pest::iterators::Pair<'_, Rule>) -> Result<LabelExpr, String> {
@@ -315,7 +421,7 @@ fn build_expr(pair: pest::iterators::Pair<'_, Rule>) -> Result<LabelExpr, String
             let mut inner = pair.into_inner();
             let mut left = build_expr(inner.next().unwrap())?;
             for right_pair in inner {
-                left = LabelExpr::Or(Box::new(left), Box::new(build_expr(right_pair)?));
+                left = Expr::Or(Box::new(left), Box::new(build_expr(right_pair)?));
             }
             Ok(left)
         }
@@ -324,7 +430,7 @@ fn build_expr(pair: pest::iterators::Pair<'_, Rule>) -> Result<LabelExpr, String
             let mut inner = pair.into_inner();
             let mut left = build_expr(inner.next().unwrap())?;
             for right_pair in inner {
-                left = LabelExpr::And(Box::new(left), Box::new(build_expr(right_pair)?));
+                left = Expr::And(Box::new(left), Box::new(build_expr(right_pair)?));
             }
             Ok(left)
         }
@@ -335,14 +441,15 @@ fn build_expr(pair: pest::iterators::Pair<'_, Rule>) -> Result<LabelExpr, String
         Rule::neg => {
             // neg = { "!" ~ not_expr }
             let inner = pair.into_inner().next().unwrap();
-            Ok(LabelExpr::Not(Box::new(build_expr(inner)?)))
+            Ok(Expr::Not(Box::new(build_expr(inner)?)))
         }
         Rule::primary => {
-            // primary = { "(" ~ expr ~ ")" | label }
+            // primary = { "(" ~ expr ~ ")" | bool_lit | label }
             let child = pair.into_inner().next().unwrap();
             build_expr(child)
         }
-        Rule::label => Ok(LabelExpr::Label(pair.as_str().to_ascii_lowercase())),
+        Rule::bool_lit => Ok(Expr::Const(pair.as_str().eq_ignore_ascii_case("true"))),
+        Rule::label => Ok(Expr::Terminal(pair.as_str().to_ascii_lowercase())),
         _ => Err(format!("unexpected rule: {:?}", pair.as_rule())),
     }
 }
@@ -366,7 +473,15 @@ pub(crate) fn read_label_filter() -> Option<LabelFilter> {
 /// labels to determine whether a test should be selected.
 ///
 /// The simplest filter is a single [`Label`]; complex filters are built
-/// with `&` (AND), `|` (OR), and `!` (NOT) operators.
+/// with `&` (AND), `|` (OR), and `!` (NOT) operators. The grammar also
+/// accepts the literal constants `true` and `false` (the names `"true"` and
+/// `"false"` are reserved and may not be used as label names).
+///
+/// Filters are stored in a canonical form: two semantically-equivalent
+/// expressions compare equal under `==`, dedup automatically when merged,
+/// and round-trip through `Display`/`parse`. For example,
+/// `LabelFilter::parse("a & b") == LabelFilter::parse("b & a")`, and the
+/// merged form of `(a) | (a) | (b)` displays as `a | b`.
 ///
 /// String-based filters ([`LabelFilter::parse`], `SKULD_LABELS`,
 /// `#[skuld::test(serial = ...)]`) match label names case-insensitively.
@@ -381,20 +496,21 @@ pub(crate) fn read_label_filter() -> Option<LabelFilter> {
 /// // Compose with operators:
 /// let f = DOCKER & !FAST;
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LabelFilter {
     pub(crate) expr: LabelExpr,
 }
 
 impl LabelFilter {
-    /// Parse a label filter expression from a string.
+    /// Parse a label filter expression from a string. The result is in
+    /// canonical form (BDD-simplified, sort-normalized).
     pub fn parse(input: &str) -> Result<Self, String> {
         parse_label_expr(input).map(|expr| Self { expr })
     }
 
     /// Evaluate the filter against a set of test labels.
     pub fn matches(&self, labels: &[Label]) -> bool {
-        self.expr.matches(labels)
+        matches_expr(&self.expr, labels)
     }
 
     /// Compile the filter to a SQL WHERE fragment for correlated subqueries.
@@ -404,31 +520,61 @@ impl LabelFilter {
     /// SELECT EXISTS (SELECT 1 FROM running r WHERE <result>)
     /// ```
     pub fn to_sql(&self) -> String {
-        self.expr.to_sql()
+        to_sql_expr(&self.expr)
+    }
+
+    /// Whether the canonical form of this filter is `Const(true)` — i.e. the
+    /// filter is satisfied by every possible label set. Used by
+    /// `coordination::to_storage` to collapse tautologies into the `*` sentinel.
+    pub(crate) fn is_tautology(&self) -> bool {
+        matches!(self.expr, Expr::Const(true))
+    }
+
+    /// Whether the canonical form of this filter is `Const(false)` — i.e. no
+    /// label set satisfies it. Used by `coordination::to_storage` to collapse
+    /// contradictions into the `""` (non-serial) sentinel.
+    pub(crate) fn is_contradiction(&self) -> bool {
+        matches!(self.expr, Expr::Const(false))
     }
 }
 
 impl std::fmt::Display for LabelFilter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.expr.fmt_with_prec(f, 0)
+        fmt_expr(&self.expr, f, 0)
     }
 }
 
 impl From<Label> for LabelFilter {
     fn from(label: Label) -> Self {
+        // A single terminal is already canonical (no simplification possible
+        // and no children to sort). `validate_label_name` rejects "true" /
+        // "false" so this Terminal can never alias a `Const`.
         Self {
-            expr: LabelExpr::Label(label.name().to_string()),
+            expr: Expr::Terminal(label.name().to_string()),
         }
     }
 }
 
+// Compile-time assertion that LabelFilter remains thread-safe across crate
+// upgrades. The runtime carries filters across thread boundaries (test
+// runner, coordination DB queries) and must not silently lose Send/Sync.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<LabelFilter>();
+};
+
 // Operator overloads for LabelFilter composition -----
+//
+// Each operator builds a non-canonical Expr from the inputs and runs it
+// through `canonicalize` once. For typical chained usage (≤10 operators) the
+// total cost is negligible and avoids the alternative of deferring
+// canonicalization to a separate "finalize" step.
 
 impl std::ops::Not for LabelFilter {
     type Output = LabelFilter;
     fn not(self) -> LabelFilter {
         LabelFilter {
-            expr: LabelExpr::Not(Box::new(self.expr)),
+            expr: canonicalize(Expr::Not(Box::new(self.expr))),
         }
     }
 }
@@ -446,7 +592,7 @@ macro_rules! impl_filter_binop {
             type Output = LabelFilter;
             fn $method(self, rhs: LabelFilter) -> LabelFilter {
                 LabelFilter {
-                    expr: LabelExpr::$variant(Box::new(self.expr), Box::new(rhs.expr)),
+                    expr: canonicalize(Expr::$variant(Box::new(self.expr), Box::new(rhs.expr))),
                 }
             }
         }

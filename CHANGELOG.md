@@ -38,6 +38,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `default_labels!` inheritance, dynamic tests, `#[ignore]`, `requires`,
     `serial`, `should_panic`, and libtest-mimic CLI flag interactions.
 
+- **Canonical `LabelFilter`.** Filters are now stored in a canonical form
+  (BDD-simplified via the `boolean_expression` crate, sort-normalized) so
+  semantically-equivalent filters compare equal under `==`, dedup
+  automatically when fixture serial filters are merged, and produce
+  deterministic `Display` output. For example,
+  `LabelFilter::parse("a & b") == LabelFilter::parse("b & a")`,
+  `parse("!!a") == parse("a")`, and `parse("a | !a") == parse("true")`.
+
+- **`true` / `false` literals in filter expressions.** `SKULD_LABELS="true"`
+  matches every test, `SKULD_LABELS="false"` matches none. The names
+  `"true"` and `"false"` are reserved and may not be used as label names
+  (`new_label!(pub TRUE_LABEL, "true")` is a compile-time error).
+
 ### Changed
 
 - **`serial` semantics changed.** A bare `serial` now blocks ALL tests (serial

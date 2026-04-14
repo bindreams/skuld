@@ -225,7 +225,7 @@ fn heavy_test() { /* ... */ }
 
 The label's string name is the identifier lowercased (`DOCKER` → `"docker"`). To reuse a label from another crate, just `use` it: `use other_crate::DOCKER;`.
 
-Filter with the `SKULD_LABELS` environment variable using boolean expressions (`&` AND, `|` OR, `!` NOT, parentheses):
+Filter with the `SKULD_LABELS` environment variable using boolean expressions (`&` AND, `|` OR, `!` NOT, parentheses, plus the `true` and `false` literals):
 
 ```bash
 SKULD_LABELS=docker cargo test                         # only "docker"
@@ -233,7 +233,7 @@ SKULD_LABELS="docker | slow" cargo test                # "docker" OR "slow"
 SKULD_LABELS="(docker | integration) & !slow" cargo test  # combined
 ```
 
-Unset `SKULD_LABELS` runs all tests. Precedence: `!` > `&` > `|`. Label names are matched case-insensitively, so `SKULD_LABELS=DOCKER` is equivalent to `SKULD_LABELS=docker`.
+Unset `SKULD_LABELS` runs all tests. Precedence: `!` > `&` > `|`. Label names are matched case-insensitively, so `SKULD_LABELS=DOCKER` is equivalent to `SKULD_LABELS=docker`. Filters are stored canonically, so `parse("a & b") == parse("b & a")`.
 
 ### Module-level defaults
 
