@@ -13,18 +13,23 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Preflight runs BEFORE the Deploy environment gate, so trivial operator
-  # errors (invalid version string, missing draft, draft pinned to a branch
-  # instead of a SHA) fail loudly without waiting for approver attention.
-  preflight:
-    name: Preflight (validate)
+  publish:
+    name: Verify and publish
     runs-on: ubuntu-latest
+    # The Deploy environment scopes CARGO_REGISTRY_TOKEN to this job and
+    # enforces any environment protection rules (required reviewers, wait
+    # timers) configured in the repo.
+    #
+    # Real preflight (version validation, CI matrix, cargo publish dry-run)
+    # happens in draft-release.yaml before a draft can exist. This workflow
+    # assumes the operator has already reviewed the draft and is committing
+    # to publishing — so we don't duplicate preflight here.
+    environment: Deploy
     permissions:
-      contents: read
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
-      commit_sha: ${{ steps.release.outputs.commit_sha }}
+      # `write` is required (not just `read`) so the List releases API
+      # returns drafts: per GitHub docs, drafts are only returned "if the
+      # user has push access", which means write-level auth.
+      contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -70,24 +75,9 @@ jobs:
           fi
           echo "commit_sha=$TARGET" >> "$GITHUB_OUTPUT"
 
-  publish:
-    name: Verify and publish
-    needs: preflight
-    runs-on: ubuntu-latest
-    # The Deploy environment scopes CARGO_REGISTRY_TOKEN to this job only and
-    # enforces any environment protection rules (required reviewers, wait
-    # timers) configured in the repo. Placed AFTER preflight so operator
-    # typos fail before the approver is pinged.
-    environment: Deploy
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-    steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.preflight.outputs.commit_sha }}
+          ref: ${{ steps.release.outputs.commit_sha }}
           # fetch-depth: 0 so `cargo xtask version --check --exact` sees
           # all ancestor tags, not just the one we're about to create.
           fetch-depth: 0
@@ -98,7 +88,7 @@ jobs:
         # Belt-and-suspenders: the checked-out commit's Cargo.toml must agree
         # with the version being published.
         env:
-          TAG: ${{ needs.preflight.outputs.tag }}
+          TAG: ${{ steps.version.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
@@ -116,7 +106,7 @@ jobs:
 
       - name: Publish GitHub release
         env:
-          TAG: ${{ needs.preflight.outputs.tag }}
+          TAG: ${{ steps.version.outputs.tag }}
           REPO: ${{ github.repository }}
         shell: bash
         run: |
