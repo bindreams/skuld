@@ -35,6 +35,10 @@ os_pipe = "1.2"
 rusqlite = { version = "0.39", features = ["bundled"] }
 pest = "2"
 pest_derive = "2"
+# Boolean algebra primitives backing the canonical form of LabelFilter (BDD-based
+# canonicalization, semantic equality, simplification). Parsing stays in pest;
+# this crate provides Expr<T>, BDD<T>, and the Expr <-> BDD round-trip.
+boolean_expression = "0.4"
 tokio = { version = "1", features = ["rt"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -63,6 +67,8 @@ log = "0.4"
 trybuild = "1"
 # label_filter_cli.rs parses libtest-mimic's --format json output.
 serde_json = "1"
+# Property-based testing for LabelFilter canonicalization invariants.
+proptest = "1"
 
 [[test]]
 name = "integration"
