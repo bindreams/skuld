@@ -83,6 +83,22 @@ pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
     unreachable!()
 }
 
+// Transient error classification =====
+
+/// Returns true for transient SQLite errors that callers should retry.
+///
+/// `SQLITE_BUSY` (code 5) means another connection holds a lock that prevents
+/// progress; `SQLITE_LOCKED` (code 6) means a shared-cache / table-level lock
+/// blocks progress. rusqlite collapses extended codes (`SQLITE_BUSY_SNAPSHOT`,
+/// `SQLITE_LOCKED_SHAREDCACHE`, etc.) onto these primary variants, so a
+/// primary-code match covers all transient lock-contention errors.
+pub(crate) fn is_retryable(err: &rusqlite::Error) -> bool {
+    matches!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
 // Stale entry cleanup =====
 
 /// Extract the PID from an instance_id string ("{pid}:{timestamp}").
@@ -118,22 +134,20 @@ fn is_pid_alive(pid: u32) -> bool {
 }
 
 /// Delete entries from the `running` table whose process is no longer alive.
-fn clean_stale_entries(conn: &rusqlite::Connection) {
+fn clean_stale_entries(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     let our_instance = instance_id();
-    let mut stmt = conn
-        .prepare("SELECT DISTINCT instance_id FROM running WHERE instance_id != ?1")
-        .unwrap();
+    let mut stmt = conn.prepare("SELECT DISTINCT instance_id FROM running WHERE instance_id != ?1")?;
     let stale_instances: Vec<String> = stmt
-        .query_map([&our_instance], |row| row.get::<_, String>(0))
-        .unwrap()
-        .filter_map(|r| r.ok())
+        .query_map([&our_instance], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .filter(|iid| pid_from_instance_id(iid).is_none_or(|pid| !is_pid_alive(pid)))
         .collect();
 
     for iid in &stale_instances {
-        conn.execute("DELETE FROM running WHERE instance_id = ?1", [iid])
-            .unwrap();
+        conn.execute("DELETE FROM running WHERE instance_id = ?1", [iid])?;
     }
+    Ok(())
 }
 
 // Blocking checks =====
@@ -161,8 +175,7 @@ fn can_start(
             conn.prepare("SELECT serial_filter FROM running WHERE serial_filter != '' AND serial_filter != ?1")?;
         let filters: Vec<String> = stmt
             .query_map([SERIAL_ALL], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         for filter_str in &filters {
             if let Ok(filter) = LabelFilter::parse(filter_str) {
                 if filter.matches(my_labels) {
@@ -196,21 +209,28 @@ fn can_start(
 
 /// Register a running test in the coordination database.
 /// Returns the row ID used for cleanup.
-fn register(conn: &rusqlite::Connection, name: &str, labels: &[Label], serial_filter: &str) -> i64 {
+///
+/// Must be called inside an active transaction: the two INSERTs are not atomic
+/// at the function level, and a mid-call failure leaves a half-inserted row
+/// that the caller's surrounding txn must roll back.
+fn register(
+    conn: &rusqlite::Connection,
+    name: &str,
+    labels: &[Label],
+    serial_filter: &str,
+) -> Result<i64, rusqlite::Error> {
     conn.execute(
         "INSERT INTO running (instance_id, name, serial_filter) VALUES (?1, ?2, ?3)",
         rusqlite::params![instance_id(), name, serial_filter],
-    )
-    .unwrap();
+    )?;
     let id = conn.last_insert_rowid();
     for label in labels {
         conn.execute(
             "INSERT INTO labels (running_id, label) VALUES (?1, ?2)",
             rusqlite::params![id, label.name()],
-        )
-        .unwrap();
+        )?;
     }
-    id
+    Ok(id)
 }
 
 // RAII guard =====
@@ -242,6 +262,10 @@ impl Drop for TestRegistration {
 /// Coordinate test execution: block until the test can start, register it,
 /// and return a guard that unregisters it on drop.
 ///
+/// Under lock contention (`SQLITE_BUSY` / `SQLITE_LOCKED`), retries via the
+/// outer exponential backoff loop (10 ms → 200 ms cap). Emits a debug warning
+/// after 60 s of continuous contention.
+///
 /// This is the main entry point called by the test runner for every test.
 pub(crate) fn coordinate(
     db_path: &std::path::Path,
@@ -258,20 +282,33 @@ pub(crate) fn coordinate(
     let mut warned = false;
 
     loop {
-        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        clean_stale_entries(&conn);
+        let txn = || -> Result<Option<i64>, rusqlite::Error> {
+            conn.execute_batch("BEGIN EXCLUSIVE")?;
+            clean_stale_entries(&conn)?;
+            if can_start(&conn, labels, serial_filter)? {
+                let id = register(&conn, name, labels, serial_filter)?;
+                conn.execute_batch("COMMIT")?;
+                Ok(Some(id))
+            } else {
+                conn.execute_batch("ROLLBACK")?;
+                Ok(None)
+            }
+        };
 
-        match can_start(&conn, labels, serial_filter) {
-            Ok(true) => {
-                let id = register(&conn, name, labels, serial_filter);
-                conn.execute_batch("COMMIT").unwrap();
+        match txn() {
+            Ok(Some(id)) => {
                 return TestRegistration {
                     id,
                     db_path: db_path.to_path_buf(),
                 };
             }
-            Ok(false) => {
-                conn.execute_batch("ROLLBACK").unwrap();
+            Ok(None) => { /* serial conflict — fall through to backoff */ }
+            Err(ref e) if is_retryable(e) => {
+                // Best-effort rollback. If the inner ROLLBACK already ran (e.g.
+                // a row-iteration failed after the closure's ROLLBACK on the
+                // can_start=false path) this is a no-op that returns
+                // SQLITE_ERROR ("no transaction is active"); harmlessly discarded.
+                let _ = conn.execute_batch("ROLLBACK");
             }
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");

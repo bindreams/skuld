@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::Barrier;
 use std::time::Duration;
 
-use crate::coordination::{can_start, coordinate, open_db, register, SERIAL_ALL, SERIAL_NONE};
+use crate::coordination::{can_start, coordinate, is_retryable, open_db, register, SERIAL_ALL, SERIAL_NONE};
 use crate::label::Label;
 
 /// Create a temporary database for testing.
@@ -27,7 +27,7 @@ fn non_serial_can_start_when_empty() {
 fn non_serial_blocked_by_global_serial() {
     let (_dir, path) = temp_db();
     let conn = open_db(&path);
-    register(&conn, "blocker", &[], SERIAL_ALL);
+    register(&conn, "blocker", &[], SERIAL_ALL).unwrap();
     assert!(!can_start(&conn, &[], SERIAL_NONE).unwrap());
 }
 
@@ -37,7 +37,7 @@ fn non_serial_blocked_by_matching_filter() {
     let conn = open_db(&path);
     let docker = Label::__new("docker");
     // A serial test filtering on "docker" is running
-    register(&conn, "serial_docker", &[], "docker");
+    register(&conn, "serial_docker", &[], "docker").unwrap();
     // A test WITH label docker is blocked
     assert!(!can_start(&conn, &[docker], SERIAL_NONE).unwrap());
     // A test WITHOUT label docker is NOT blocked
@@ -48,7 +48,7 @@ fn non_serial_blocked_by_matching_filter() {
 fn global_serial_blocked_when_anything_running() {
     let (_dir, path) = temp_db();
     let conn = open_db(&path);
-    register(&conn, "some_test", &[], SERIAL_NONE);
+    register(&conn, "some_test", &[], SERIAL_NONE).unwrap();
     assert!(!can_start(&conn, &[], SERIAL_ALL).unwrap());
 }
 
@@ -65,7 +65,7 @@ fn filtered_serial_blocked_by_matching_running_test() {
     let conn = open_db(&path);
     let docker = Label::__new("docker");
     // A non-serial test with label "docker" is running
-    register(&conn, "docker_test", &[docker], SERIAL_NONE);
+    register(&conn, "docker_test", &[docker], SERIAL_NONE).unwrap();
     // A serial test filtering on "docker" is blocked
     assert!(!can_start(&conn, &[], "docker").unwrap());
 }
@@ -76,7 +76,7 @@ fn filtered_serial_not_blocked_by_non_matching() {
     let conn = open_db(&path);
     let network = Label::__new("network");
     // A test with label "network" is running
-    register(&conn, "network_test", &[network], SERIAL_NONE);
+    register(&conn, "network_test", &[network], SERIAL_NONE).unwrap();
     // A serial test filtering on "docker" is NOT blocked
     assert!(can_start(&conn, &[], "docker").unwrap());
 }
@@ -89,12 +89,12 @@ fn filtered_serial_and_semantics() {
     let b = Label::__new("b");
 
     // Test with only [a] is running
-    register(&conn, "test_a", &[a], SERIAL_NONE);
+    register(&conn, "test_a", &[a], SERIAL_NONE).unwrap();
     // serial = "a & b" should NOT be blocked (running test doesn't have both a and b)
     assert!(can_start(&conn, &[], "a & b").unwrap());
 
     // Now add a test with [a, b]
-    register(&conn, "test_ab", &[a, b], SERIAL_NONE);
+    register(&conn, "test_ab", &[a, b], SERIAL_NONE).unwrap();
     // serial = "a & b" IS now blocked
     assert!(!can_start(&conn, &[], "a & b").unwrap());
 }
@@ -107,12 +107,12 @@ fn filtered_serial_not_semantics() {
     let b = Label::__new("b");
 
     // Test with label [a] is running
-    register(&conn, "test_a", &[a], SERIAL_NONE);
+    register(&conn, "test_a", &[a], SERIAL_NONE).unwrap();
     // serial = "!a" should NOT be blocked (running test HAS label a)
     assert!(can_start(&conn, &[], "!a").unwrap());
 
     // Test with label [b] is running (no label a)
-    register(&conn, "test_b", &[b], SERIAL_NONE);
+    register(&conn, "test_b", &[b], SERIAL_NONE).unwrap();
     // serial = "!a" IS now blocked (test_b doesn't have a, so !a matches)
     assert!(!can_start(&conn, &[], "!a").unwrap());
 }
@@ -124,7 +124,7 @@ fn register_and_delete() {
     let (_dir, path) = temp_db();
     let conn = open_db(&path);
     let docker = Label::__new("docker");
-    let id = register(&conn, "my_test", &[docker], SERIAL_NONE);
+    let id = register(&conn, "my_test", &[docker], SERIAL_NONE).unwrap();
 
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
@@ -145,7 +145,7 @@ fn delete_cascades_labels() {
     let conn = open_db(&path);
     let a = Label::__new("a");
     let b = Label::__new("b");
-    let id = register(&conn, "test", &[a, b], SERIAL_NONE);
+    let id = register(&conn, "test", &[a, b], SERIAL_NONE).unwrap();
 
     let label_count: i64 = conn.query_row("SELECT COUNT(*) FROM labels", [], |r| r.get(0)).unwrap();
     assert_eq!(label_count, 2);
@@ -268,4 +268,60 @@ fn filtered_serial_blocks_only_matching_tests() {
     // Test this by checking can_start, since coordinate would block.
     let conn = open_db(&path);
     assert!(!can_start(&conn, &[docker], SERIAL_NONE).unwrap());
+}
+
+#[test]
+fn coordinate_retries_on_busy_lock() {
+    use std::sync::mpsc;
+
+    let (_dir, path) = temp_db();
+
+    // Holder grabs EXCLUSIVE and holds it longer than the waiter's
+    // busy_timeout (5 s). Empirically the busy handler can take up to
+    // ~5.5 s to surrender, so we hold for 7 s to force a SQLITE_BUSY
+    // return inside coordinate(). The waiter must survive this via the
+    // outer retry loop instead of panicking on .unwrap().
+    let holder_path = path.clone();
+    let (lock_tx, lock_rx) = mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let conn = open_db(&holder_path);
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        lock_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(7_000));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+
+    lock_rx.recv().unwrap();
+    // On broken code: panics at src/coordination.rs:261 after ~5.5 s.
+    // On fixed code: the next outer-loop iteration's BEGIN EXCLUSIVE
+    // succeeds once the holder commits, then register() + COMMIT succeed.
+    let waiter_started = std::time::Instant::now();
+    let _reg = coordinate(&path, "waiter", &[], SERIAL_NONE);
+    let waited = waiter_started.elapsed();
+
+    holder.join().unwrap();
+
+    // Guard against regression to a non-contending fast path: coordinate()
+    // must have actually exhausted busy_timeout (5 s) at least once before
+    // succeeding.
+    assert!(
+        waited >= Duration::from_secs(5),
+        "waiter returned in {waited:?}; should have hit busy_timeout (>=5s)"
+    );
+}
+
+// is_retryable =====
+
+#[test]
+fn is_retryable_matches_busy_and_locked_only() {
+    use rusqlite::{ffi, Error};
+
+    let busy = Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_BUSY), Some("database is locked".into()));
+    let locked = Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_LOCKED), None);
+    let constraint = Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_CONSTRAINT), None);
+
+    assert!(is_retryable(&busy));
+    assert!(is_retryable(&locked));
+    assert!(!is_retryable(&constraint));
+    assert!(!is_retryable(&Error::QueryReturnedNoRows));
 }
