@@ -35,6 +35,20 @@ language = "system"
 types = ["rust"]
 pass_filenames = false
 
+[[repos.hooks]]
+id = "cargo-xtask-version"
+name = "cargo xtask version --check"
+# Asserts:
+#   1. workspace members agree on a strict MAJOR.MINOR.PATCH version
+#   2. skuld-macros dep pin matches
+#   3. Cargo.toml version == or one-bump-after some nearest ancestor tag
+#      (prevents main from drifting ahead of released tags without a release)
+entry = "cargo xtask version --check"
+language = "system"
+# Only run when a Cargo.toml changes — the check reads manifests, not src.
+files = '(^|/)Cargo\.toml$'
+pass_filenames = false
+
 # External hooks =======================================================================================================
 
 [[repos]]
@@ -47,10 +61,14 @@ hooks = [
 ]
 
 [[repos]]
-repo = "https://github.com/hukkin/mdformat"
-rev = "0.7.21"
+# Using prettier instead of mdformat because prettier preserves the
+# `  ` (two-space) trailing-whitespace line break style instead of
+# rewriting it to `\`. That matters for files like LICENSE.md whose
+# byte identity is conventional.
+repo = "https://github.com/rbubley/mirrors-prettier"
+rev = "v3.8.2"
 hooks = [
-  { id = "mdformat", additional_dependencies = ["mdformat-gfm"] },
+  { id = "prettier", types = ["markdown"] },
 ]
 
 [[repos]]

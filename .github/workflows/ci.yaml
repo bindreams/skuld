@@ -4,11 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: sccache
 
 jobs:
   lint:
@@ -17,29 +16,23 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 is required so `cargo xtask version --check`
+          # (run via the prek hook) can see ancestor tags. Default depth 1
+          # with no tags would make the check silently always-pass.
+          fetch-depth: 0
 
-      - name: Install Rust toolchain
-        id: rust-toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # setup-rust is still needed so the cargo-fmt / cargo-clippy /
+      # cargo-xtask-version hooks inside prek can find a Rust toolchain.
+      - uses: ./.github/actions/setup-rust
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+      # Single source of truth for lint is prek.toml — the same checks run
+      # locally as pre-commit hooks. prek-action runs `prek run --all-files`
+      # with `--show-diff-on-failure --color=always`, so fmt / mdformat /
+      # mixed-line-ending failures surface as a diff in CI logs.
+      - uses: j178/prek-action@v2
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
@@ -78,25 +71,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        id: rust-toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Build workspace
-        run: cargo build --workspace --target ${{ matrix.target }}
+        # Exclude xtask from the matrix: it's a dev tool run only on the lint
+        # host (Linux), and its deps aren't worth cross-compiling to 6 targets.
+        run: cargo build --workspace --exclude xtask --target ${{ matrix.target }}
 
       - name: Unit tests
-        run: cargo test --workspace --target ${{ matrix.target }}
+        run: cargo test --workspace --exclude xtask --target ${{ matrix.target }}

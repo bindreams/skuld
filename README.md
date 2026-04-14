@@ -373,4 +373,4 @@ This project is licensed under the Apache 2.0 license. The license text can be f
 
 <img align="right" width="122px" height="180px" src="docs/src/_static/norns.jpg">
 
-**Skuld** is the youngest of the three Norns in Norse mythology — the weavers of fate who sit beneath the world-tree Yggdrasil. While her sisters Urðr and Verðanði govern the past and the present, Skuld presides over *what shall be*: obligations yet unfulfilled, debts yet unpaid. Her name shares its root with the English word *should*.
+**Skuld** is the youngest of the three Norns in Norse mythology — the weavers of fate who sit beneath the world-tree Yggdrasil. While her sisters Urðr and Verðanði govern the past and the present, Skuld presides over _what shall be_: obligations yet unfulfilled, debts yet unpaid. Her name shares its root with the English word _should_.
