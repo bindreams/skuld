@@ -312,7 +312,7 @@ impl TestRunner {
             let reasons: Vec<String> = def
                 .requires
                 .iter()
-                .chain(fixture_requires.into_iter())
+                .chain(fixture_requires)
                 .filter_map(|req| req.eval().err())
                 .collect();
 
