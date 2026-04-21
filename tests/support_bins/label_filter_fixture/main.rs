@@ -97,6 +97,17 @@ fn t_native_ignored_fast() {
     mark("t_native_ignored_fast");
 }
 
+#[skuld::test(labels = [FAST])]
+#[ignore = "reason-outer"]
+fn t_outer_reason_ignored_fast() {
+    mark("t_outer_reason_ignored_fast");
+}
+
+#[skuld::test(labels = [FAST], ignore = "reason-native")]
+fn t_native_reason_ignored_fast() {
+    mark("t_native_reason_ignored_fast");
+}
+
 #[skuld::test(labels = [FAST], requires = [always_ok])]
 fn t_req_fast() {
     mark("t_req_fast");

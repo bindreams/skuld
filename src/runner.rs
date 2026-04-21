@@ -135,6 +135,32 @@ fn run_with_observability(name: &str, capture: bool, serial_filter: &str, labels
     }
 }
 
+/// Build a libtest-mimic [`Trial`] for an inventory-registered test.
+///
+/// When `ignored` is true, libtest-mimic skips the trial by default but
+/// runs the real body under `--ignored` / `--include-ignored`. The real
+/// body is always passed in — the ignored flag gates execution, not
+/// construction. Mirrors the dynamic-tests path.
+fn build_inventory_trial(
+    trial_name: &'static str,
+    labels: Vec<Label>,
+    effective_serial: String,
+    body: fn(),
+    capture: bool,
+    ignored: bool,
+) -> Trial {
+    let observed_name = trial_name.to_string();
+    let trial = Trial::test(trial_name, move || {
+        run_with_observability(&observed_name, capture, &effective_serial, &labels, body);
+        Ok(())
+    });
+    if ignored {
+        trial.with_ignored_flag(true)
+    } else {
+        trial
+    }
+}
+
 // Test runner =====================================================================================
 
 /// A dynamically-added test (registered at runtime, not via proc macro).
@@ -300,36 +326,43 @@ impl TestRunner {
             }
 
             let trial_name = def.display_name.unwrap_or(def.name);
+            let fixture_serial = collect_fixture_serial(def.fixture_names);
+            let effective_serial = merge_serial_filters(def.serial, &fixture_serial);
 
-            // Static ignore — don't check preconditions, don't report as unavailable.
-            if !matches!(def.ignore, Ignore::No) {
-                trials.push(Trial::test(trial_name, || Ok(())).with_ignored_flag(true));
-                continue;
-            }
-
-            // Collect requirements from both explicit requires and fixture dependencies.
-            let fixture_requires = collect_fixture_requires(def.fixture_names);
-            let reasons: Vec<String> = def
-                .requires
-                .iter()
-                .chain(fixture_requires)
-                .filter_map(|req| req.eval().err())
-                .collect();
-
-            if reasons.is_empty() {
-                let body = def.body;
-                let fixture_serial = collect_fixture_serial(def.fixture_names);
-                let effective_serial = merge_serial_filters(def.serial, &fixture_serial);
-                let observed_name = trial_name.to_string();
-                let resolved_owned = resolved.clone();
-                trials.push(Trial::test(trial_name, move || {
-                    run_with_observability(&observed_name, capture, &effective_serial, &resolved_owned, body);
-                    Ok(())
-                }));
+            // Determine the ignored flag and the optional Unavailable reason.
+            // The ignored flag gates execution via libtest-mimic's --ignored /
+            // --include-ignored; when set, the real body still runs if those
+            // flags are passed.
+            let (ignored_flag, unavailable_reason) = if !matches!(def.ignore, Ignore::No) {
+                // Statically ignored: don't evaluate preconditions and don't
+                // add to the Unavailable report.
+                (true, None)
             } else {
-                let reason = reasons.join("; ");
+                let fixture_requires = collect_fixture_requires(def.fixture_names);
+                let reasons: Vec<String> = def
+                    .requires
+                    .iter()
+                    .chain(fixture_requires)
+                    .filter_map(|req| req.eval().err())
+                    .collect();
+                if reasons.is_empty() {
+                    (false, None)
+                } else {
+                    (true, Some(reasons.join("; ")))
+                }
+            };
+
+            trials.push(build_inventory_trial(
+                trial_name,
+                resolved.clone(),
+                effective_serial,
+                def.body,
+                capture,
+                ignored_flag,
+            ));
+
+            if let Some(reason) = unavailable_reason {
                 unavailable.push((trial_name.to_string(), reason));
-                trials.push(Trial::test(trial_name, || Ok(())).with_ignored_flag(true));
             }
         }
     }
