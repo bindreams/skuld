@@ -279,6 +279,8 @@ fn all_tests() -> &'static [&'static str] {
         "t_dup_fast",
         "t_outer_ignored_fast",
         "t_native_ignored_fast",
+        "t_outer_reason_ignored_fast",
+        "t_native_reason_ignored_fast",
         "t_req_fast",
         "t_req_unmet_fast",
         "t_serial_fast",
@@ -303,10 +305,21 @@ fn ignored_when_unfiltered() -> &'static [&'static str] {
     &[
         "t_outer_ignored_fast",
         "t_native_ignored_fast",
+        "t_outer_reason_ignored_fast",
+        "t_native_reason_ignored_fast",
         "t_req_unmet_fast",
         "dyn_slow_ignored",
     ]
 }
+
+/// Names of statically-ignored inventory tests (all four `Ignore::{Yes, WithReason}`
+/// variants × outer-attribute / macro-arg spellings).
+const STATICALLY_IGNORED_INVENTORY: &[&str] = &[
+    "t_outer_ignored_fast",
+    "t_native_ignored_fast",
+    "t_outer_reason_ignored_fast",
+    "t_native_reason_ignored_fast",
+];
 
 // Group A — Baseline =====================================================================================
 
@@ -639,67 +652,84 @@ fn e3_dyn_filtered_out_not_ignored() {
     }
 }
 
+#[test]
+fn e4_dyn_slow_ignored_executes_under_include_ignored() {
+    // Regression guard: the dynamic-test path already handles --include-ignored
+    // correctly. This test locks that in so the inventory-path fix for #31
+    // doesn't accidentally change dynamic semantics.
+    let out = run_fixture(Some("slow"), &["--include-ignored"]);
+    assert!(
+        out.ran("dyn_slow_ignored"),
+        "dynamic ignored body must execute under --include-ignored. markers={:?}",
+        out.markers
+    );
+    assert!(
+        out.passed.contains(&"dyn_slow_ignored".to_string()),
+        "dyn_slow_ignored expected in passed; got {:?}",
+        out.passed
+    );
+}
+
 // Group F — #[ignore] interaction ========================================================================
 
 #[test]
 fn f1_outer_ignore_matching_appears_ignored() {
     let out = run_fixture(Some("fast"), &[]);
     assert_ignored_and_absent_marker(&out, "t_outer_ignored_fast");
+    assert_ignored_and_absent_marker(&out, "t_outer_reason_ignored_fast");
 }
 
 #[test]
 fn f2_native_ignore_matching_appears_ignored() {
     let out = run_fixture(Some("fast"), &[]);
     assert_ignored_and_absent_marker(&out, "t_native_ignored_fast");
+    assert_ignored_and_absent_marker(&out, "t_native_reason_ignored_fast");
 }
 
 #[test]
 fn f3_ignore_nonmatching_absent_not_ignored() {
     let out = run_fixture(Some("slow"), &[]);
-    assert_absent(&out, "t_outer_ignored_fast");
-    assert_absent(&out, "t_native_ignored_fast");
+    for name in STATICALLY_IGNORED_INVENTORY {
+        assert_absent(&out, name);
+    }
 }
 
 #[test]
-fn f4_include_ignored_does_not_execute_body() {
-    // Locks in CURRENT skuld behavior: the static-ignore branch at
-    // src/runner.rs:306 replaces the test body with `|| Ok(())` before
-    // libtest-mimic sees it. `--include-ignored` toggles the ignored
-    // flag, but the closure it runs is the no-op stub — the real body
-    // never executes and no marker is written. Tracked in issue #31;
-    // likely the customer-reported confusion. Behavior change is out of
-    // scope for the e2e-coverage PR.
+fn f4_include_ignored_executes_body() {
+    // Fix for issue #31: --include-ignored must execute the real body of
+    // statically-ignored tests, not a stub. Covers all four variants
+    // (outer attribute / macro arg × plain / with reason).
     let out = run_fixture(Some("fast"), &["--include-ignored"]);
-    for name in ["t_outer_ignored_fast", "t_native_ignored_fast"] {
+    for name in STATICALLY_IGNORED_INVENTORY {
         assert!(
-            out.passed.contains(&name.to_string()),
-            "expected {name} in passed (no-op stub); got {:?}",
-            out.passed
+            out.ran(name),
+            "{name} body must execute under --include-ignored. markers={:?}",
+            out.markers
         );
         assert!(
-            !out.ran(name),
-            "{name} body should NOT have executed (no-op stub). markers={:?}",
-            out.markers
+            out.passed.contains(&(*name).to_string()),
+            "{name} expected in passed; got {:?}",
+            out.passed
         );
     }
 }
 
 #[test]
-fn f5_ignored_flag_only_runs_ignored_stubs() {
-    // Same underlying issue as f4: with `--ignored`, only the ignored
-    // tests' no-op stubs "run" (reported ok); non-ignored tests are
-    // filtered out by libtest-mimic's own name/ignore filter.
+fn f5_ignored_flag_executes_bodies() {
+    // Fix for issue #31: --ignored must execute the real body of
+    // statically-ignored tests, and filter out non-ignored ones. Covers
+    // all four variants (outer attribute / macro arg × plain / with reason).
     let out = run_fixture(Some("fast"), &["--ignored"]);
-    for name in ["t_outer_ignored_fast", "t_native_ignored_fast"] {
+    for name in STATICALLY_IGNORED_INVENTORY {
         assert!(
-            out.passed.contains(&name.to_string()),
-            "expected {name} in passed (no-op stub); got {:?}",
-            out.passed
+            out.ran(name),
+            "{name} body must execute under --ignored. markers={:?}",
+            out.markers
         );
         assert!(
-            !out.ran(name),
-            "{name} body should NOT have executed. markers={:?}",
-            out.markers
+            out.passed.contains(&(*name).to_string()),
+            "{name} expected in passed; got {:?}",
+            out.passed
         );
     }
     // Non-ignored fast tests don't appear at all under --ignored.
@@ -738,6 +768,53 @@ fn g3_requires_unmet_filtered_out_absent() {
         "expected t_req_unmet_fast to be absent from stderr.\nstderr:\n{}",
         out.stderr
     );
+}
+
+#[test]
+fn g4_requires_unmet_executes_under_include_ignored() {
+    // Fix for issue #31: preconditions failing at collection time must
+    // not gate --include-ignored from running the real body.
+    let out = run_fixture(Some("fast"), &["--include-ignored"]);
+    assert!(
+        out.ran("t_req_unmet_fast"),
+        "body must execute under --include-ignored even though requires failed. markers={:?}",
+        out.markers
+    );
+    assert!(
+        out.passed.contains(&"t_req_unmet_fast".to_string()),
+        "t_req_unmet_fast expected in passed; got {:?}",
+        out.passed
+    );
+    // The collection-time Unavailable summary is still accurate and still reported.
+    assert!(
+        out.stderr.contains("Unavailable") && out.stderr.contains("t_req_unmet_fast"),
+        "Unavailable stderr block must still report the collection-time failure.\nstderr:\n{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn g5_requires_unmet_executes_under_ignored() {
+    // Fix for issue #31: same as g4, but under --ignored (which also filters
+    // out non-ignored tests).
+    let out = run_fixture(Some("fast"), &["--ignored"]);
+    assert!(
+        out.ran("t_req_unmet_fast"),
+        "body must execute under --ignored even though requires failed. markers={:?}",
+        out.markers
+    );
+    assert!(
+        out.passed.contains(&"t_req_unmet_fast".to_string()),
+        "t_req_unmet_fast expected in passed; got {:?}",
+        out.passed
+    );
+    assert!(
+        out.stderr.contains("Unavailable") && out.stderr.contains("t_req_unmet_fast"),
+        "Unavailable stderr block must still report the collection-time failure.\nstderr:\n{}",
+        out.stderr
+    );
+    // --ignored filters non-ignored tests out.
+    assert_absent(&out, "t_fast");
 }
 
 // Group H — serial interaction ===========================================================================
@@ -826,9 +903,10 @@ fn k4_list_flag_respects_label_filter() {
     // --list enumerates every trial that passed label filtering, including
     // ignored ones (they appear in the trial list with `with_ignored_flag(true)`).
     let mut expected: HashSet<String> = FAST_RUNS_UNDER_POSITIVE_FILTER.iter().map(|s| s.to_string()).collect();
-    for ignored in ["t_outer_ignored_fast", "t_native_ignored_fast", "t_req_unmet_fast"] {
-        expected.insert(ignored.to_string());
+    for name in STATICALLY_IGNORED_INVENTORY {
+        expected.insert((*name).to_string());
     }
+    expected.insert("t_req_unmet_fast".to_string());
     assert_eq!(listed, expected, "--list output mismatch\nstdout:\n{}", out.stdout);
 }
 
@@ -885,21 +963,6 @@ fn l2_unknown_label_matches_nothing() {
         out.markers
     );
     assert!(out.failed.is_empty(), "no failures expected");
-}
-
-/// Dynamic `ignored = true` + `--include-ignored`. The dynamic registration
-/// path at src/runner.rs:351-361 wraps the real body (not a stub), so
-/// `--include-ignored` SHOULD execute the dynamic body — unlike the static
-/// case (see f4). Locks in the difference for documentation in issue #31.
-#[test]
-fn l3_include_ignored_runs_dynamic_body() {
-    let out = run_fixture(Some("slow"), &["--include-ignored"]);
-    assert!(
-        out.ran("dyn_slow_ignored"),
-        "expected dynamic ignored test body to run under --include-ignored. markers={:?}\nstdout:\n{}",
-        out.markers,
-        out.stdout
-    );
 }
 
 /// Pest error content must be preserved through the panic message. A3-A7
