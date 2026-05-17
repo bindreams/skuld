@@ -331,6 +331,43 @@ SKULD_DEBUG=1 cargo test
 
 If your test code or code under test pulls in `tracing-subscriber` directly, **do not enable its `tracing-log` feature**. The feature auto-installs a `log::Log` shim on the first subscriber `init`, which mutates `log::max_level` globally. Downstream projects have hit Windows CI timeout regressions from this — see bindreams/hole#147. If you need the `log`→`tracing` bridge, call `tracing_log::LogTracer::init()` yourself in the test that needs it, and accept that doing so is a process-wide, one-time operation.
 
+### Capturing `tracing::*!` events from code under test
+
+Skuld's FD-level capture transparently includes output from any global `tracing_subscriber` that writes to `stderr` — pass on test success, dump under `---- captured ----` on test failure. To get the diagnostic events from production code into your CI failure output:
+
+1. **Install a process-global subscriber once per test binary**, before the first test runs (via the `ctor` crate, or a custom test main, or any pre-`main` mechanism). Use the bare `tracing::subscriber::set_global_default(dispatch)` function — **not** `SubscriberInitExt::try_init()` or `tracing_subscriber::fmt().init()`. The `*InitExt::try_init` family calls `tracing_log::LogTracer::init()` as a side effect, mutating `log::max_level=Trace` and routing every `log::*!` macro from third-party crates (shadowsocks-service, tokio, mio, hyper) through `tracing-log`'s per-event allocation path. See `bindreams/hole#147` for the regression that motivated this distinction.
+
+1. **Default the `EnvFilter` to a restrictive shape** — catch-all `info`, your own crates pinned to `debug`. Even if `LogTracer` ends up installed by some other code path, noisy third-party `log::trace!` calls are level-rejected at `Dispatch::enabled()` before `tracing-log` allocates.
+
+Recommended pattern (using the `ctor` crate; works with any pre-`main` mechanism):
+
+```rust,ignore
+use std::sync::Once;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::EnvFilter;
+
+#[ctor::ctor]
+fn install_test_subscriber() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let filter = EnvFilter::new("info,my_project_crate=debug");
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(false),
+            );
+        // Bare function — does NOT install LogTracer.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+```
+
+**Multi-crate workspace tip.** When the ctor is defined in a shared rlib that the test crate depends on but does not reference any symbol of, the linker may DCE the `#[ctor]`-generated `#[used]` static. Define the `#[ctor::ctor]` block IN the test crate (e.g., from a macro the shared rlib exports), not in the shared rlib itself, so the static lives in the test binary's own object file.
+
+Per-test thread-local subscribers via `tracing::subscriber::with_default` / `set_default` (the bare functions in the `tracing` crate, not `SubscriberInitExt::set_default`) shadow the global default on the calling thread and remain safe to use for assertion-target tests that need their own subscriber.
+
 ## Output
 
 When all requirements are met:
