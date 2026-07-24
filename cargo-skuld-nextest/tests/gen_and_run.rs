@@ -165,10 +165,12 @@ fn run_serializes_the_cross_binary_conflict_via_generated_tool_config() {
     // Positive case: with the generated tool-config, nextest must not
     // launch the second process until the first has fully exited.
     let real_dir = tempfile::tempdir().expect("tempdir");
+    let output_dir = tempfile::tempdir().expect("tempdir");
     let status = Command::new(bin())
         .current_dir(fixture_root())
         .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", real_dir.path())
-        .arg("run")
+        .args(["run", "--output"])
+        .arg(output_dir.path().join("skuld-nextest.toml"))
         .status()
         .expect("spawn cargo-skuld-nextest run");
     assert!(
@@ -190,10 +192,12 @@ fn run_serializes_the_cross_binary_conflict_via_generated_tool_config() {
 #[test]
 fn run_correctly_selects_tests_with_special_characters_in_their_names() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let output_dir = tempfile::tempdir().expect("tempdir");
     let status = Command::new(bin())
         .current_dir(fixture_root())
         .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", dir.path())
-        .arg("run")
+        .args(["run", "--output"])
+        .arg(output_dir.path().join("skuld-nextest.toml"))
         .status()
         .expect("spawn run");
     assert!(status.success());
