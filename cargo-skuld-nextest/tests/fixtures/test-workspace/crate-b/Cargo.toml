@@ -1,0 +1,12 @@
+[package]
+name = "fixture-crate-b"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[test]]
+name = "main"
+harness = false
+
+[dependencies]
+skuld = { path = "../../../../.." }

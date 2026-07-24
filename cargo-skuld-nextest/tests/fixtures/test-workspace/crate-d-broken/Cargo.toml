@@ -1,0 +1,35 @@
+[package]
+name = "fixture-crate-d-broken"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "broken-nonzero-exit"
+path = "src/bin/broken_nonzero_exit.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "broken-bad-json"
+path = "src/bin/broken_bad_json.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "broken-dir-dump"
+path = "src/bin/broken_dir_dump.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "broken-hangs"
+path = "src/bin/broken_hangs.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "broken-bad-serial-filter"
+path = "src/bin/broken_bad_serial_filter.rs"
+test = false
+doc = false
