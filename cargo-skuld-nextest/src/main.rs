@@ -61,7 +61,11 @@ fn main() -> anyhow::Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&output, rendered)?;
-            let mut cmd = cargo_skuld_nextest::command::build_nextest_run_command(&output, &nextest_args);
+            // `cargo nextest run --tool-config-file` requires an absolute
+            // path; `output` may be relative (e.g. the default
+            // `target/skuld/nextest.toml`).
+            let absolute_output = std::fs::canonicalize(&output)?;
+            let mut cmd = cargo_skuld_nextest::command::build_nextest_run_command(&absolute_output, &nextest_args);
             let status = cmd.status()?;
             std::process::exit(status.code().unwrap_or(1));
         }

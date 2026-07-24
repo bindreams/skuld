@@ -46,6 +46,10 @@ fn conflicts(a: &TestMetadata, b: &TestMetadata) -> bool {
 /// a 32-bit CRC, with a collision space wide enough that an accidental
 /// collision at realistic test-suite scale is not a practical concern (the
 /// same standard used for e.g. git object naming), not merely "unlikely."
+///
+/// Prefixed with `@tool:skuld:`: nextest requires every test-group defined
+/// by a tool-provided config (`--tool-config-file skuld:<path>`) to carry
+/// that namespace prefix, and rejects the config outright otherwise.
 fn group_name(members: &[(String, String)]) -> String {
     let mut buf = Vec::new();
     for (binary_id, name) in members {
@@ -54,7 +58,7 @@ fn group_name(members: &[(String, String)]) -> String {
         buf.extend_from_slice(name.as_bytes());
         buf.push(0u8);
     }
-    format!("skuld_group_{}", &blake3::hash(&buf).to_hex()[..16])
+    format!("@tool:skuld:skuld_group_{}", &blake3::hash(&buf).to_hex()[..16])
 }
 
 pub fn build_groups(tests: &[TestMetadata]) -> Vec<TestGroup> {
