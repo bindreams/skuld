@@ -835,6 +835,24 @@ fn canon_matches_extra_labels() {
     assert!(LabelFilter::parse("!a").unwrap().matches(&[b, c]));
 }
 
+// matches_names -----
+
+#[test]
+fn matches_names_mirrors_matches() {
+    let filter = LabelFilter::parse("a & !b").unwrap();
+    assert!(filter.matches_names(&["a"]));
+    assert!(!filter.matches_names(&["a", "b"]));
+    assert!(!filter.matches_names(&["b"]));
+    assert!(!filter.matches_names(&[]));
+}
+
+#[test]
+fn matches_names_tautology_ignores_names() {
+    let filter = LabelFilter::parse("true").unwrap();
+    assert!(filter.matches_names(&[]));
+    assert!(filter.matches_names(&["anything"]));
+}
+
 // SQL for constants -----
 
 #[test]

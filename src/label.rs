@@ -513,6 +513,17 @@ impl LabelFilter {
         matches_expr(&self.expr, labels)
     }
 
+    /// Evaluate the filter against a set of already-lowercase label names
+    /// (as produced by [`Label::name`]), without needing to reconstruct
+    /// [`Label`] values. Equivalent to [`LabelFilter::matches`] — same
+    /// evaluation, same case-sensitivity contract.
+    ///
+    /// Intended for external tooling that only has label names from a
+    /// serialized dump, not live `Label` instances.
+    pub fn matches_names(&self, names: &[&str]) -> bool {
+        self.expr.evaluate_with(|t: &String| names.contains(&t.as_str()))
+    }
+
     /// Compile the filter to a SQL WHERE fragment for correlated subqueries.
     ///
     /// The result is a SQL expression suitable for:
