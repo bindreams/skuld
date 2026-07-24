@@ -1,16 +1,25 @@
 //! Subject of subprocess invocation in `tests/coordination_debug_cli.rs`.
-//! Two globally-serial dynamic tests: run with real thread concurrency,
-//! whichever starts second is guaranteed to hit a genuine coordination
-//! wait on its first attempt — no scheduler-timing bet involved, since
-//! global-serial blocks against anything already running by definition.
+//! `hold_a` is globally serial and, once registered, prints a line and
+//! blocks on stdin until told to release — this lets the driver guarantee
+//! (not merely hope) that `hold_b`'s first coordinate() attempt happens
+//! while `hold_a` is still registered, without any sleep/timing bet.
+//! `hold_b` is globally serial with a trivial body: the interesting part
+//! (the coordination wait) happens inside coordinate(), before its closure
+//! ever runs.
+
+use std::io::{BufRead, Write};
 
 fn main() {
     let mut runner = skuld::TestRunner::new();
     runner.add_serial("hold_a", &[], false, || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        println!("REGISTERED");
+        std::io::stdout().flush().expect("flush stdout");
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .expect("read RELEASE from stdin");
     });
-    runner.add_serial("hold_b", &[], false, || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    });
+    runner.add_serial("hold_b", &[], false, || {});
     runner.run();
 }
