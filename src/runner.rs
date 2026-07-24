@@ -51,6 +51,51 @@ macro_rules! skuld_debug_eprintln {
     };
 }
 
+// Nextest metadata dump ================================================================================
+
+/// Per-test metadata exposed to external nextest-integration tooling via
+/// [`SKULD_NEXTEST_METADATA_PATH_ENV`]. `pub` and `Deserialize` so a
+/// consumer in the same workspace can deserialize the dump directly into
+/// this type instead of maintaining its own mirror.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NextestTestMetadata {
+    pub name: String,
+    pub labels: Vec<String>,
+    pub serial_filter: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct NextestMetadataDump {
+    tests: Vec<NextestTestMetadata>,
+}
+
+const SKULD_NEXTEST_METADATA_PATH_ENV: &str = "SKULD_NEXTEST_METADATA_PATH";
+
+/// Write `tests` as JSON to `path`. Pure — no env access — so it's directly
+/// unit-testable without mutating process-global state.
+pub(crate) fn write_nextest_metadata(path: &std::path::Path, tests: Vec<NextestTestMetadata>) {
+    let dump = NextestMetadataDump { tests };
+    let json =
+        serde_json::to_string(&dump).unwrap_or_else(|e| panic!("skuld: failed to serialize nextest metadata: {e}"));
+    std::fs::write(path, json).unwrap_or_else(|e| panic!("skuld: failed to write nextest metadata to {path:?}: {e}"));
+}
+
+/// Write `tests` to the path named by [`SKULD_NEXTEST_METADATA_PATH_ENV`],
+/// if that env var is set and valid Unicode. Distinguishes "unset" (silent
+/// no-op — the common case) from "set but not valid UTF-8" (a genuine
+/// misconfiguration — warned, not silently dropped).
+fn dump_nextest_metadata_if_requested(tests: Vec<NextestTestMetadata>) {
+    match std::env::var(SKULD_NEXTEST_METADATA_PATH_ENV) {
+        Ok(path) => write_nextest_metadata(std::path::Path::new(&path), tests),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            eprintln!(
+                "[skuld] warning: {SKULD_NEXTEST_METADATA_PATH_ENV} is set but not valid UTF-8 ({raw:?}); skipping nextest metadata dump"
+            );
+        }
+    }
+}
+
 // Per-test observability ==============================================================================
 
 /// Run one test body with per-test observability and serial coordination.
@@ -279,6 +324,7 @@ impl TestRunner {
 
         let mut trials = Vec::new();
         let mut unavailable: Vec<(String, String)> = Vec::new();
+        let mut nextest_metadata: Vec<NextestTestMetadata> = Vec::new();
 
         // Collect module-level default labels.
         let module_defaults: Vec<&ModuleLabels> = inventory::iter::<ModuleLabels>.into_iter().collect();
@@ -289,8 +335,13 @@ impl TestRunner {
             capture,
             &mut trials,
             &mut unavailable,
+            &mut nextest_metadata,
         );
-        self.collect_dynamic_tests(label_filter.as_ref(), capture, &mut trials);
+        self.collect_dynamic_tests(label_filter.as_ref(), capture, &mut trials, &mut nextest_metadata);
+
+        if args.list {
+            dump_nextest_metadata_if_requested(nextest_metadata);
+        }
 
         let conclusion = libtest_mimic::run(&args, trials);
 
@@ -307,13 +358,14 @@ impl TestRunner {
         conclusion
     }
 
-    fn collect_inventory_tests(
+    pub(crate) fn collect_inventory_tests(
         &self,
         label_filter: Option<&LabelFilter>,
         module_defaults: &[&ModuleLabels],
         capture: bool,
         trials: &mut Vec<Trial>,
         unavailable: &mut Vec<(String, String)>,
+        metadata: &mut Vec<NextestTestMetadata>,
     ) {
         for def in inventory::iter::<TestDef> {
             let resolved = resolve_labels(def, module_defaults);
@@ -352,6 +404,21 @@ impl TestRunner {
                 }
             };
 
+            // Ignored/unavailable tests never call coordinate() under a
+            // normal run — including them here would over-serialize real
+            // tests that only "conflict" through this never-executed one.
+            if !ignored_flag {
+                // Canonicalize via the same to_storage() the coordination DB uses, so
+                // the JSON dump's serial_filter matches the DB's canonical-form
+                // invariant instead of leaking a raw, possibly-mixed-case declaration
+                // (e.g. `serial = FAST` from a user-declared label identifier).
+                metadata.push(NextestTestMetadata {
+                    name: trial_name.to_string(),
+                    labels: resolved.iter().map(|l| l.name().to_string()).collect(),
+                    serial_filter: crate::coordination::to_storage(&effective_serial),
+                });
+            }
+
             trials.push(build_inventory_trial(
                 trial_name,
                 resolved.clone(),
@@ -367,7 +434,13 @@ impl TestRunner {
         }
     }
 
-    fn collect_dynamic_tests(self, label_filter: Option<&LabelFilter>, capture: bool, trials: &mut Vec<Trial>) {
+    pub(crate) fn collect_dynamic_tests(
+        self,
+        label_filter: Option<&LabelFilter>,
+        capture: bool,
+        trials: &mut Vec<Trial>,
+        metadata: &mut Vec<NextestTestMetadata>,
+    ) {
         for dyn_test in self.dynamic {
             if let Some(filter) = label_filter {
                 if !filter.matches(&dyn_test.labels) {
@@ -381,6 +454,18 @@ impl TestRunner {
             // Intentional leak: dynamic test names need 'static lifetime for enter_test_scope.
             // Acceptable because the harness runs once per process.
             let name_static: &'static str = Box::leak(dyn_test.name.into_boxed_str());
+
+            if !dyn_test.ignored {
+                // Canonicalize via the same to_storage() the coordination DB uses, so
+                // the JSON dump's serial_filter matches the DB's canonical-form
+                // invariant instead of leaking a raw declaration string.
+                metadata.push(NextestTestMetadata {
+                    name: name_static.to_string(),
+                    labels: labels.iter().map(|l| l.name().to_string()).collect(),
+                    serial_filter: crate::coordination::to_storage(&serial),
+                });
+            }
+
             trials.push(
                 Trial::test(name_static, move || {
                     run_with_observability(name_static, capture, &serial, &labels, move || {
