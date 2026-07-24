@@ -1,5 +1,6 @@
 [workspace]
-members = [".", "macros", "xtask"]
+members = [".", "macros", "xtask", "cargo-skuld-nextest"]
+exclude = ["cargo-skuld-nextest/tests/fixtures/test-workspace"]
 
 [package]
 name = "skuld"
