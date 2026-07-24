@@ -6,6 +6,7 @@ Fixtures \<fixtures.md>
 Labels \<labels.md>
 Serial Tests \<serial.md>
 Dynamic Tests \<dynamic-tests.md>
+Nextest Integration \<nextest.md>
 License \<license.md>
 GitHub Repository <https://github.com/AZhukova/skuld>
 :::
