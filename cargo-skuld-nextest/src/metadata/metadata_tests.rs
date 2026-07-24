@@ -74,6 +74,16 @@ fn non_skuld_binary_is_silently_skipped_without_error() {
 }
 
 #[test]
+fn spawn_failure_contributes_nothing_and_does_not_error() {
+    let binaries = vec![DiscoveredBinary {
+        binary_id: "nonexistent".into(),
+        binary_path: PathBuf::from("this/path/does/not/exist/at/all"),
+    }];
+    let metadata = collect_metadata(&binaries).expect("must not error, only warn");
+    assert!(metadata.is_empty());
+}
+
+#[test]
 fn nonzero_exit_binary_contributes_nothing_and_does_not_error() {
     let path = build_and_locate_broken_binary("broken-nonzero-exit");
     let binaries = vec![DiscoveredBinary {
