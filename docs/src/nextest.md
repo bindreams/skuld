@@ -12,7 +12,13 @@ cargo skuld-nextest run          # always-fresh: regenerates + runs
 # or:
 cargo skuld-nextest gen          # write .config/skuld-nextest.toml to commit
 cargo skuld-nextest gen --check  # CI: fail if the committed file is stale
+cargo nextest run --tool-config-file "skuld:$PWD/.config/skuld-nextest.toml"  # consume the committed file
 ```
+
+`--tool-config-file` requires an absolute path — nextest rejects relative
+ones — so `$PWD` (or an equivalent absolute path) is required here. Unlike
+`.config/nextest.toml`, `.config/skuld-nextest.toml` is not auto-discovered;
+nextest only reads it when passed explicitly via `--tool-config-file`.
 
 ## Keeping `gen` output in sync with a pre-commit hook
 
