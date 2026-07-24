@@ -39,11 +39,23 @@ pub fn discover_binaries(manifest_dir: &Path) -> anyhow::Result<Vec<DiscoveredBi
             "json",
         ])
         .output()?;
-    anyhow::ensure!(
-        output.status.success(),
-        "cargo nextest list failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // A virtual workspace with zero members is a legitimate, if
+        // degenerate, workspace shape (e.g. a freshly scaffolded
+        // `[workspace]\nmembers = []`) — `cargo metadata` itself refuses to
+        // proceed at all in that case ("the manifest is virtual, and the
+        // workspace has no members"), before any package- or binary-level
+        // logic runs. Zero packages trivially implies zero binaries, so we
+        // treat this one documented cargo condition as an empty result
+        // rather than a hard failure. Any other failure (nextest missing,
+        // a malformed manifest, etc.) still propagates as an error.
+        anyhow::ensure!(
+            stderr.contains("the workspace has no members"),
+            "cargo nextest list failed: {stderr}"
+        );
+        return Ok(Vec::new());
+    }
     let parsed: BinariesOnlyList = serde_json::from_slice(&output.stdout)?;
     Ok(parsed
         .rust_binaries
