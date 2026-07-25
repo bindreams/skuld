@@ -28,13 +28,13 @@ libtest-mimic = "0.8"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
-serde_yml = "0.0.12"
+serde_yml = "0.0.13"
 serde_json = "1"
 # Cross-platform anonymous pipe primitive, used by the per-test FD capture in
 # src/capture.rs. Avoids reimplementing pipe()/CreatePipe() ourselves.
 os_pipe = "1.2"
 # Cross-process test coordination database for serial test scheduling.
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 pest = "2"
 pest_derive = "2"
 # Boolean algebra primitives backing the canonical form of LabelFilter (BDD-based
