@@ -3,5 +3,7 @@ error[E0308]: mismatched types
   |
 1 | #[skuld::label]
   | ^^^^^^^^^^^^^^^ expected `u32`, found `Label`
+2 | const BAD: u32;
+  |            --- expected because of the type of the constant
   |
   = note: this error originates in the attribute macro `skuld::label` (in Nightly builds, run with -Z macro-backtrace for more info)
