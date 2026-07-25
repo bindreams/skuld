@@ -1,6 +1,6 @@
 [package]
 name = "cargo-skuld-nextest"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 authors = ["Anna Zhukova"]
 description = "Generate nextest test-groups from Skuld's serial test coordination metadata"
@@ -13,7 +13,7 @@ name = "cargo-skuld-nextest"
 path = "src/main.rs"
 
 [dependencies]
-skuld = { version = "=0.2.1", path = ".." }
+skuld = { version = "=0.3.0", path = ".." }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
