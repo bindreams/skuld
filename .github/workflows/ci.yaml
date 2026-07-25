@@ -75,6 +75,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
       - name: Build workspace
         # Exclude xtask from the matrix: it's a dev tool run only on the lint
         # host (Linux), and its deps aren't worth cross-compiling to 6 targets.

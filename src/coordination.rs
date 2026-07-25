@@ -211,7 +211,7 @@ fn scrub_serial_filters_v1(conn: &rusqlite::Connection) {
 /// returned, with `Const(true)` collapsed to `SERIAL_ALL` and `Const(false)`
 /// collapsed to `SERIAL_NONE` so two semantically-equivalent declarations
 /// (e.g. `serial = "a | !a"` and `serial = "*"`) share storage representation.
-fn to_storage(serial_filter: &str) -> String {
+pub(crate) fn to_storage(serial_filter: &str) -> String {
     if serial_filter == SERIAL_NONE || serial_filter == SERIAL_ALL {
         return serial_filter.to_string();
     }
@@ -424,6 +424,7 @@ pub(crate) fn coordinate(
     let warn_after = Duration::from_secs(60);
     let started = Instant::now();
     let mut warned = false;
+    let mut logged_first_wait = false;
 
     loop {
         let txn = || -> Result<Option<i64>, rusqlite::Error> {
@@ -446,7 +447,17 @@ pub(crate) fn coordinate(
                     db_path: db_path.to_path_buf(),
                 };
             }
-            Ok(None) => { /* serial conflict — fall through to backoff */ }
+            Ok(None) => {
+                if !logged_first_wait {
+                    logged_first_wait = true;
+                    skuld_debug_eprintln!(
+                        "coordination: {name} is blocked on a serial constraint and will wait \
+                         (if this run used a generated nextest tool-config-file, this means \
+                         nextest scheduled it concurrently with a conflicting test anyway — the \
+                         config may be stale; re-run `cargo skuld-nextest gen --check`)"
+                    );
+                }
+            }
             Err(ref e) if is_retryable(e) => {
                 // Best-effort rollback. If the inner ROLLBACK already ran (e.g.
                 // a row-iteration failed after the closure's ROLLBACK on the

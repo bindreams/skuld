@@ -33,7 +33,7 @@ pub use fixtures::temp_dir::{temp_dir, TempDir};
 pub use fixtures::test_name::{test_name, TestName};
 pub use label::{Label, LabelEntry, LabelFilter, ModuleLabels};
 pub use metadata::{FixtureMetadata, RequirementInfo, TestMetadata};
-pub use runner::{run_all, TestRunner};
+pub use runner::{run_all, NextestTestMetadata, TestRunner};
 
 use std::cell::Cell;
 use std::collections::HashMap;

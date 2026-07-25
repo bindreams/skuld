@@ -1,5 +1,6 @@
 [workspace]
-members = [".", "macros", "xtask"]
+members = [".", "macros", "xtask", "cargo-skuld-nextest"]
+exclude = ["cargo-skuld-nextest/tests/fixtures/test-workspace"]
 
 [package]
 name = "skuld"
@@ -28,6 +29,7 @@ clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_yml = "0.0.13"
+serde_json = "1"
 # Cross-platform anonymous pipe primitive, used by the per-test FD capture in
 # src/capture.rs. Avoids reimplementing pipe()/CreatePipe() ourselves.
 os_pipe = "1.2"
@@ -131,3 +133,13 @@ name = "label_filter_fixture"
 path = "tests/support_bins/label_filter_fixture/main.rs"
 test = false
 doc = false
+
+# Subject fixture for coordination_debug_cli.rs. Two globally-serial
+# dynamic tests, run with real thread concurrency, to deterministically
+# exercise coordinate()'s first-genuine-wait debug diagnostic. Kept
+# separate from label_filter_fixture to avoid coupling this test to that
+# fixture's much larger, already-asserted-on test catalog.
+[[bin]]
+name = "coordination_debug_fixture"
+path = "tests/support_bins/coordination_debug_fixture/main.rs"
+test = false
