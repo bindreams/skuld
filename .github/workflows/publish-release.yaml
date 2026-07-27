@@ -75,7 +75,7 @@ jobs:
           fi
           echo "commit_sha=$TARGET" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ steps.release.outputs.commit_sha }}
           # fetch-depth: 0 so `cargo xtask version --check --exact` sees
