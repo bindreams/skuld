@@ -29,7 +29,7 @@ runs:
         restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
 
     - name: Configure sccache
-      uses: mozilla-actions/sccache-action@v0.0.10
+      uses: mozilla-actions/sccache-action@v0.0.11
 
     - name: Enable sccache for cargo
       shell: bash
