@@ -32,7 +32,7 @@ jobs:
       # locally as pre-commit hooks. prek-action runs `prek run --all-files`
       # with `--show-diff-on-failure --color=always`, so fmt / mdformat /
       # mixed-line-ending failures surface as a diff in CI logs.
-      - uses: j178/prek-action@v2
+      - uses: j178/prek-action@v3.0.0
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
