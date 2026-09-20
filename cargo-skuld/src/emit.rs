@@ -61,7 +61,7 @@ struct OverrideEntry {
 /// unescaped `)` in a name would prematurely close that wrapping paren.
 /// Verified end-to-end (not just by string assertion) against a real
 /// `cargo nextest run --tool-config-file` invocation — see
-/// `cargo-skuld-nextest/tests/gen_and_run.rs`.
+/// `cargo-skuld/tests/gen_and_run.rs`.
 fn escape_nextest_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {

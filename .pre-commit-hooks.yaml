@@ -1,8 +1,10 @@
 - id: skuld-nextest-gen
-  name: skuld-nextest gen
+  name: skuld nextest gen
   description: Regenerate the nextest test-groups config from Skuld's serial test metadata.
   language: rust
-  entry: cargo-skuld-nextest
-  args: [gen]
+  # The fixed prefix lives in `entry`, not `args`: a consumer's `args:` replaces
+  # the hook's outright, so keeping it here lets them write `args: ["--check"]`
+  # without restating the subcommand path.
+  entry: cargo-skuld nextest gen
   pass_filenames: false
   files: '\.rs$'

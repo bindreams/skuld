@@ -58,9 +58,14 @@ fn invalid_minor_without_patch_reset() {
 // workspace_version ===================================================================================================
 
 fn write_workspace(dir: &std::path::Path, root: &str, macros: &str) {
-    fs::create_dir_all(dir.join("macros")).unwrap();
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::create_dir_all(dir.join("macros/src")).unwrap();
     fs::write(dir.join("Cargo.toml"), root).unwrap();
     fs::write(dir.join("macros/Cargo.toml"), macros).unwrap();
+    // `cargo metadata` refuses a manifest with no targets, and the pin check
+    // runs through it.
+    fs::write(dir.join("src/lib.rs"), "").unwrap();
+    fs::write(dir.join("macros/src/lib.rs"), "").unwrap();
 }
 
 const MACROS_OK: &str = r#"
@@ -145,7 +150,7 @@ skuld-macros = { version = "=0.1.0-beta", path = "macros" }
 }
 
 #[test]
-fn missing_macros_dep() {
+fn an_absent_sibling_dependency_is_not_a_version_error() {
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(
         tmp.path(),
@@ -163,11 +168,10 @@ edition = "2021"
 "#,
         MACROS_OK,
     );
-    let err = workspace_version(tmp.path()).unwrap_err().to_string();
-    assert!(
-        err.contains("missing the skuld-macros dependency"),
-        "unexpected error: {err}"
-    );
+    // The pin check constrains the dependencies a member declares; it does not
+    // mandate that a particular one exists.  The compiler already
+    // enforces presence — skuld does not build without its macros.
+    assert_eq!(workspace_version(tmp.path()).unwrap(), v("0.1.0"));
 }
 
 #[test]
@@ -190,7 +194,10 @@ skuld-macros = { version = "=0.0.9", path = "macros" }
         MACROS_OK,
     );
     let err = workspace_version(tmp.path()).unwrap_err().to_string();
-    assert!(err.contains("skuld-macros dep pin"), "unexpected error: {err}");
+    assert!(
+        err.contains("is pinned '=0.0.9', expected '=0.1.0'"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -429,4 +436,92 @@ fn integration_prerelease_ignored() {
     git(tmp.path(), &["tag", "v1.0.0-beta"]);
     let nearest = nearest_ancestor_version_tags(tmp.path()).unwrap();
     assert_eq!(tag_name_set(&nearest), vec!["v0.9.0".to_string()]);
+}
+
+// Intra-workspace pin checks ==========================================================================================
+
+/// A root manifest declaring its dependency on `skuld-macros` in `table`.
+fn root_with(table: &str, dep: &str) -> String {
+    format!(
+        r#"
+[workspace]
+members = [".", "macros"]
+
+[package]
+name = "skuld"
+version = "0.1.0"
+edition = "2021"
+
+[{table}]
+{dep}
+"#
+    )
+}
+
+fn pin_result(table: &str, dep: &str) -> Result<Version, String> {
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(tmp.path(), &root_with(table, dep), MACROS_OK);
+    workspace_version(tmp.path()).map_err(|e| e.to_string())
+}
+
+#[test]
+fn an_exact_pin_on_a_sibling_passes() {
+    let got = pin_result(
+        "dependencies",
+        r#"skuld-macros = { version = "=0.1.0", path = "macros" }"#,
+    );
+    assert_eq!(got.unwrap(), v("0.1.0"));
+}
+
+#[test]
+fn a_loose_pin_on_a_sibling_is_rejected() {
+    // The gap this check exists to close: a loose pin builds and tests fine
+    // against the path dependency, so nothing else in the pipeline catches it.
+    let err = pin_result("dependencies", r#"skuld-macros = { version = "0.1", path = "macros" }"#).unwrap_err();
+    assert!(err.contains("is pinned '^0.1', expected '=0.1.0'"), "{err}");
+}
+
+#[test]
+fn a_target_specific_dependency_is_checked() {
+    // Not hypothetical: this repo's own root manifest carries two
+    // `[target.'cfg(...)'.dependencies]` tables, so a sibling moved into one
+    // would sail past a check that only reads `[dependencies]`.
+    let err = pin_result(
+        r#"target.'cfg(unix)'.dependencies"#,
+        r#"skuld-macros = { version = "0.1", path = "macros" }"#,
+    )
+    .unwrap_err();
+    assert!(err.contains("is pinned"), "{err}");
+}
+
+#[test]
+fn a_build_dependency_is_checked() {
+    let err = pin_result(
+        "build-dependencies",
+        r#"skuld-macros = { version = "0.1", path = "macros" }"#,
+    )
+    .unwrap_err();
+    assert!(err.contains("is pinned"), "{err}");
+}
+
+#[test]
+fn a_renamed_dependency_is_checked_under_its_real_name() {
+    let err = pin_result(
+        "dependencies",
+        r#"macros-alias = { package = "skuld-macros", version = "0.1", path = "macros" }"#,
+    )
+    .unwrap_err();
+    assert!(err.contains("'skuld-macros'"), "{err}");
+}
+
+#[test]
+fn a_dev_dependency_is_not_constrained() {
+    // A dependency's dev-deps are never resolved downstream, so their pins
+    // cannot affect a consumer. The real root also carries a dev-dep on itself,
+    // reported as `*`, which no pin could satisfy.
+    let got = pin_result(
+        "dev-dependencies",
+        r#"skuld-macros = { version = "0.1", path = "macros" }"#,
+    );
+    assert_eq!(got.unwrap(), v("0.1.0"));
 }

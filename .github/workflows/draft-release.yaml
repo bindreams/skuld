@@ -7,6 +7,11 @@ on:
         description: "Release version (e.g. 1.0.0)"
         required: true
         type: string
+      first-publish-ok:
+        description: "Acknowledge that a member is publishing for the first time (its crate scope must be on the Deploy token)"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: draft-release-${{ inputs.version }}
@@ -67,7 +72,7 @@ jobs:
         run: git tag "v${VERSION}"
 
       - name: Validate workspace version and dep pin against tag
-        # Runs workspace_version() (agreement + skuld-macros pin match) AND
+        # Runs workspace_version() (version agreement + every intra-workspace pin) AND
         # nearest-tag comparison with --exact. Fails on any inconsistency.
         # Catches operator mistypes: if input version != Cargo.toml version,
         # the newly-created local tag disagrees with Cargo.toml and --exact
@@ -95,12 +100,40 @@ jobs:
       - uses: ./.github/actions/setup-rust
 
       - name: Dry-run publish workspace
-        # cargo 1.84+ dry-run for multi-package. Packages in topological order.
-        # For dry-run, skuld-macros is NOT actually published, so skuld's
-        # verify step cannot resolve it from the registry — use --no-verify
-        # to skip the build check. Packaging errors (missing metadata,
-        # malformed manifest) still surface for both.
-        run: cargo publish -p skuld-macros -p skuld --dry-run --locked --no-verify
+        # cargo 1.90+ dry-runs multi-package publishes in topological order.
+        #
+        # Verification stays on. Multi-package publishing — `--workspace` or
+        # `-p a -p b` alike — builds a temporary overlay registry from the
+        # packaged siblings, so each crate's verify step resolves its
+        # intra-workspace deps without them being on crates.io. Keeping verification on means stage 1 actually rehearses
+        # stage 2, compiling each crate as packaged rather than as checked out.
+        run: cargo publish --workspace --dry-run --locked
+
+      # `--dry-run` never authenticates, so nothing up to this point has
+      # exercised the Deploy token's crate scope — and a member publishing for
+      # the first time publishes last, so a scope miss lands the worst partial
+      # state. Detect first-publishes here, in the reversible stage, and make
+      # the operator confirm the scope rather than discover it mid-upload.
+      - name: Flag first-time publishes
+        env:
+          VERSION: ${{ inputs.version }}
+          ACK: ${{ inputs.first-publish-ok }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          new=()
+          while read -r c; do
+            prefix=$(printf '%s' "$c" | sed -E 's|^(..)(..).*|\1/\2|')
+            curl -sfX GET "https://index.crates.io/$prefix/$c" >/dev/null || new+=("$c")
+          done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
+          if [ ${#new[@]} -eq 0 ]; then
+            echo "All publishable members already exist on crates.io."
+          elif [ "$ACK" = "true" ]; then
+            echo "::notice::First publish for: ${new[*]} — acknowledged."
+          else
+            echo "::error::First publish for: ${new[*]}. Confirm the Deploy token's crate scope covers these, then re-run with first-publish-ok=true."
+            exit 1
+          fi
 
   release:
     name: Create draft release

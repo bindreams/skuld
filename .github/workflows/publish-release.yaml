@@ -95,14 +95,14 @@ jobs:
           git tag "$TAG"
           cargo xtask version --check --exact
 
-      - name: Publish skuld-macros and skuld
+      - name: Publish the workspace to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        # cargo 1.84+ publishes multiple workspace members in topological order
-        # (skuld-macros first, then skuld) and waits for each to appear on the
+        # cargo 1.90+ publishes multiple workspace members in topological order
+        # (skuld-macros, then skuld, then cargo-skuld) and waits for each to appear on the
         # sparse index before publishing the next. This replaces the manual
         # publish-wait-publish dance.
-        run: cargo publish -p skuld-macros -p skuld --locked
+        run: cargo publish --workspace --locked
 
       - name: Publish GitHub release
         env:

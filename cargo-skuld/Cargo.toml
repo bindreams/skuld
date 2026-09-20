@@ -1,19 +1,24 @@
 [package]
-name = "cargo-skuld-nextest"
-version = "0.3.0"
+name = "cargo-skuld"
+version = "0.3.1"
 edition = "2021"
 authors = ["Anna Zhukova"]
 description = "Generate nextest test-groups from Skuld's serial test coordination metadata"
 license = "Apache-2.0"
-license-file = "../LICENSE.md"
 repository = "https://github.com/bindreams/skuld"
+homepage = "https://skuld.readthedocs.io"
+documentation = "https://skuld.readthedocs.io/en/stable/nextest.html"
+readme = "README.md"
+exclude = ["tests/**"]
+categories = ["development-tools::cargo-plugins", "development-tools::testing"]
+keywords = ["cargo", "nextest", "testing", "test-harness"]
 
 [[bin]]
-name = "cargo-skuld-nextest"
+name = "cargo-skuld"
 path = "src/main.rs"
 
 [dependencies]
-skuld = { version = "=0.3.0", path = ".." }
+skuld = { version = "=0.3.1", path = ".." }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

@@ -40,7 +40,7 @@ id = "cargo-xtask-version"
 name = "cargo xtask version --check"
 # Asserts:
 #   1. workspace members agree on a strict MAJOR.MINOR.PATCH version
-#   2. skuld-macros dep pin matches
+#   2. every intra-workspace dep pin matches
 #   3. Cargo.toml version == or one-bump-after some nearest ancestor tag
 #      (prevents main from drifting ahead of released tags without a release)
 entry = "cargo xtask version --check"
