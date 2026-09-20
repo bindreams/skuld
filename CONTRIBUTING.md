@@ -73,8 +73,8 @@ done
 
 **Nothing published.** crates.io is untouched and there is nothing to undo. What to do next depends on why it stopped:
 
-- *Environmental* (token expired or mis-scoped, registry outage): fix it and re-run **stage 2** with the same version.
-- *Tree* (packaging, verification, or the version re-check): stage 2 checks out the draft's pinned commit, so re-running replays the identical failure. Delete the draft with `gh release delete "vX.Y.Z" --yes`, push the fix, then re-run **stage 1** and stage 2. Stage 1 refuses to create a draft while a release with that tag exists, which is why the delete comes first.
+- _Environmental_ (token expired or mis-scoped, registry outage): fix it and re-run **stage 2** with the same version.
+- _Tree_ (packaging, verification, or the version re-check): stage 2 checks out the draft's pinned commit, so re-running replays the identical failure. Delete the draft with `gh release delete "vX.Y.Z" --yes`, push the fix, then re-run **stage 1** and stage 2. Stage 1 refuses to create a draft while a release with that tag exists, which is why the delete comes first.
 
 **Only `skuld-macros` published:**
 
