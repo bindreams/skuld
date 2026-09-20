@@ -10,6 +10,25 @@ fn bin() -> &'static str {
 }
 
 #[test]
+fn cargo_shaped_argv_strips_the_subcommand_name() {
+    // `cargo skuld nextest gen` execs this binary with argv[1] == "skuld";
+    // running `cargo-skuld` directly does not. main() strips the former and
+    // must leave the latter alone. Nesting the commands is what made that
+    // strip necessary, and nothing else here covers it.
+    let out_dir = tempfile::tempdir().expect("tempdir");
+    let output = out_dir.path().join("skuld-nextest.toml");
+
+    let status = Command::new(bin())
+        .current_dir(fixture_root())
+        .args(["skuld", "nextest", "gen", "--output"])
+        .arg(&output)
+        .status()
+        .expect("spawn gen");
+    assert!(status.success(), "cargo-shaped argv was rejected");
+    assert!(output.exists(), "no config written via the cargo-shaped argv");
+}
+
+#[test]
 fn gen_writes_groups_for_the_shared_resource_and_weird_name_conflicts() {
     let out_dir = tempfile::tempdir().expect("tempdir");
     let output = out_dir.path().join("skuld-nextest.toml");

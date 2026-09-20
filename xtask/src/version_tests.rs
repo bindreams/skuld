@@ -169,8 +169,7 @@ edition = "2021"
         MACROS_OK,
     );
     // The pin check constrains the dependencies a member declares; it does not
-    // mandate that a particular one exists. Requiring skuld-macros by name is
-    // what this check was generalized away from, and the compiler already
+    // mandate that a particular one exists.  The compiler already
     // enforces presence — skuld does not build without its macros.
     assert_eq!(workspace_version(tmp.path()).unwrap(), v("0.1.0"));
 }

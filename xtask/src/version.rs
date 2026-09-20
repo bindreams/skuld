@@ -7,8 +7,7 @@
 //!   `=<workspace-version>`; otherwise stage 2 would publish a crate against a
 //!   stale sibling (or fail at crates.io verify). Derived from the member list
 //!   rather than named explicitly, so a new member is covered on the day it is
-//!   added — the opposite of the hand-maintained lists that kept `cargo-skuld`
-//!   unpublished.
+//!   added.
 //! - **Nearest ancestor tag set**: the set of version tags matching
 //!   `v[0-9]+.[0-9]+.[0-9]+` that are ancestors of HEAD and have no
 //!   tagged descendants in HEAD's history. Computed by BFS from HEAD
@@ -22,61 +21,66 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use gix::ObjectId;
 use semver::Version;
-use serde::Deserialize;
 
 /// Read all publishable workspace member Cargo.tomls, assert agreement on a
 /// strict MAJOR.MINOR.PATCH version, assert every intra-workspace dependency
 /// is pinned to `=<that-version>`, and return the shared version.
 pub fn workspace_version(repo_root: &Path) -> Result<Version> {
-    let root_toml_path = repo_root.join("Cargo.toml");
-    let root_toml = read_toml::<RootManifest>(&root_toml_path)?;
-    let members = root_toml
-        .workspace
-        .ok_or_else(|| anyhow!("no [workspace] in {}", root_toml_path.display()))?
-        .members;
+    let metadata = workspace_metadata(repo_root)?;
+    let publishable = publishable_members(&metadata);
 
-    let mut shared: Option<Version> = None;
-    let mut shared_source: String = String::new();
-
-    for member in &members {
-        let cargo_path = repo_root.join(member).join("Cargo.toml");
-        let manifest = read_toml::<MemberManifest>(&cargo_path)?;
-
-        let Some(package) = manifest.package else {
-            continue;
-        };
-        if matches!(package.publish, Some(false)) {
-            continue;
-        }
-        let Some(v_str) = package.version else {
-            return Err(anyhow!("no [package] version in {}", cargo_path.display()));
-        };
-        let v = Version::parse(&v_str)
-            .with_context(|| format!("{} version '{v_str}' is not valid semver", cargo_path.display()))?;
+    let mut shared: Option<&cargo_metadata::Package> = None;
+    for package in &publishable {
+        let v = &package.version;
         if !v.pre.is_empty() || !v.build.is_empty() {
             return Err(anyhow!(
                 "{} version must be strict MAJOR.MINOR.PATCH (no pre-release/build): {v}",
-                cargo_path.display()
+                package.manifest_path
             ));
         }
-        match &shared {
-            None => {
-                shared = Some(v);
-                shared_source = cargo_path.display().to_string();
-            }
-            Some(existing) if existing != &v => {
+        match shared {
+            None => shared = Some(package),
+            Some(first) if first.version != *v => {
                 return Err(anyhow!(
-                    "workspace members disagree on version:\n  {shared_source}: {existing}\n  {}: {v}",
-                    cargo_path.display()
+                    "workspace members disagree on version:\n  {}: {}\n  {}: {v}",
+                    first.manifest_path,
+                    first.version,
+                    package.manifest_path
                 ));
             }
             Some(_) => {}
         }
     }
 
-    let shared = shared.ok_or_else(|| anyhow!("no publishable workspace members"))?;
-    assert_intra_workspace_pins(repo_root, &shared)?;
+    let shared = shared
+        .ok_or_else(|| anyhow!("no publishable workspace members"))?
+        .version
+        .clone();
+    assert_intra_workspace_pins(&publishable, &shared)?;
     Ok(shared)
+}
+
+/// Workspace members and their manifests, as cargo resolves them.
+///
+/// One source of truth for "what is in this workspace and which of it
+/// publishes". Reading the manifests directly would mean a second
+/// implementation of member globbing, `publish` semantics and dependency-table
+/// shapes — and the two would drift.
+fn workspace_metadata(repo_root: &Path) -> Result<cargo_metadata::Metadata> {
+    cargo_metadata::MetadataCommand::new()
+        .manifest_path(repo_root.join("Cargo.toml"))
+        .no_deps()
+        .exec()
+        .with_context(|| format!("failed to read cargo metadata for {}", repo_root.display()))
+}
+
+/// `publish = false` deserializes as an empty registry list.
+fn publishable_members(metadata: &cargo_metadata::Metadata) -> Vec<&cargo_metadata::Package> {
+    metadata
+        .packages
+        .iter()
+        .filter(|p| p.publish.as_deref() != Some(&[]))
+        .collect()
 }
 
 /// Assert every intra-workspace dependency carries `=<expected>`.
@@ -97,23 +101,11 @@ pub fn workspace_version(repo_root: &Path) -> Result<Version> {
 /// A loose pin builds and tests fine against the path dependency, so nothing
 /// else in the pipeline catches it — but the published crate would be free to
 /// resolve any compatible sibling across a metadata protocol the two share.
-pub(crate) fn assert_intra_workspace_pins(repo_root: &Path, expected: &Version) -> Result<()> {
-    let metadata = cargo_metadata::MetadataCommand::new()
-        .manifest_path(repo_root.join("Cargo.toml"))
-        .no_deps()
-        .exec()
-        .with_context(|| format!("failed to read cargo metadata for {}", repo_root.display()))?;
-
-    // `publish = false` deserializes as an empty registry list.
-    let publishable: Vec<_> = metadata
-        .packages
-        .iter()
-        .filter(|p| p.publish.as_deref() != Some(&[]))
-        .collect();
+pub(crate) fn assert_intra_workspace_pins(publishable: &[&cargo_metadata::Package], expected: &Version) -> Result<()> {
     let names: HashSet<&str> = publishable.iter().map(|p| p.name.as_ref()).collect();
     let want = format!("={expected}");
 
-    for package in &publishable {
+    for package in publishable {
         for dep in &package.dependencies {
             if dep.kind == cargo_metadata::DependencyKind::Development {
                 continue;
@@ -268,32 +260,4 @@ pub fn is_valid_next(tag: &Version, cur: &Version) -> bool {
         || (cur.major == tag.major && cur.minor == tag.minor && cur.patch == tag.patch + 1)
         || (cur.major == tag.major && cur.minor == tag.minor + 1 && cur.patch == 0)
         || (cur.major == tag.major + 1 && cur.minor == 0 && cur.patch == 0)
-}
-
-// TOML shapes ========================================================================================================
-
-#[derive(Deserialize)]
-struct RootManifest {
-    workspace: Option<Workspace>,
-}
-
-#[derive(Deserialize)]
-struct Workspace {
-    members: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct MemberManifest {
-    package: Option<Package>,
-}
-
-#[derive(Deserialize)]
-struct Package {
-    version: Option<String>,
-    publish: Option<bool>,
-}
-
-fn read_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
