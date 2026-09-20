@@ -91,5 +91,5 @@ jobs:
       # not a shipped artifact), so without this its tests run nowhere — including
       # the version and pin checks that gate an irreversible publish.
       - name: Test xtask
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'linux' && matrix.arch == 'amd64'
         run: cargo test -p xtask
