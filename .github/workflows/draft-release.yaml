@@ -67,7 +67,7 @@ jobs:
         run: git tag "v${VERSION}"
 
       - name: Validate workspace version and dep pin against tag
-        # Runs workspace_version() (agreement + skuld-macros pin match) AND
+        # Runs workspace_version() (version agreement + every intra-workspace pin) AND
         # nearest-tag comparison with --exact. Fails on any inconsistency.
         # Catches operator mistypes: if input version != Cargo.toml version,
         # the newly-created local tag disagrees with Cargo.toml and --exact
@@ -95,12 +95,15 @@ jobs:
       - uses: ./.github/actions/setup-rust
 
       - name: Dry-run publish workspace
-        # cargo 1.84+ dry-run for multi-package. Packages in topological order.
-        # For dry-run, skuld-macros is NOT actually published, so skuld's
-        # verify step cannot resolve it from the registry — use --no-verify
-        # to skip the build check. Packaging errors (missing metadata,
-        # malformed manifest) still surface for all three.
-        run: cargo publish --workspace --dry-run --locked --no-verify
+        # cargo 1.90+ dry-runs multi-package publishes in topological order.
+        #
+        # Verification stays on. A workspace publish builds a temporary overlay
+        # registry from the packaged siblings, so each crate's verify step
+        # resolves its intra-workspace deps without them being on crates.io —
+        # which a `-p a -p b` publish could not do, and is why this once passed
+        # --no-verify. Keeping it on means stage 1 actually rehearses stage 2,
+        # compiling each crate as packaged rather than as checked out.
+        run: cargo publish --workspace --dry-run --locked
 
   release:
     name: Create draft release

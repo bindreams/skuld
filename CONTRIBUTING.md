@@ -54,7 +54,7 @@ This workflow:
 
 ### Recovery
 
-Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` — so stage 2 has two partial states. Yank whatever landed and cut a new version.
+Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` — and `cargo publish` is not atomic, so a server-side error part-way through leaves the workspace partially published. Stage 2 therefore has two partial states, plus one state where publishing finished and only the GitHub release failed.
 
 If it failed after `skuld-macros`:
 
@@ -69,11 +69,9 @@ cargo yank skuld-macros@X.Y.Z
 cargo yank skuld@X.Y.Z
 ```
 
-If instead **all three published** and the "Publish GitHub release" step failed, nothing is wrong on crates.io. Do **not** yank. Flip the draft release to published by hand; that creates the tag and completes the release.
+**In either partial case above**: bump `Cargo.toml` + `macros/Cargo.toml` + `cargo-skuld/Cargo.toml` to `X.Y.Z+1`, fix the root cause, then re-run both workflows with the new version. Because the bump is lockstep, `cargo-skuld` then has no `X.Y.Z` at all — a gap in its version line is the accepted cost of a shared workspace version, not a problem to work around.
 
-Because the bump below is lockstep, `cargo-skuld` then has no `X.Y.Z` at all. A gap in its version line is the accepted cost of a shared workspace version, not a problem to work around.
-
-Bump `Cargo.toml` + `macros/Cargo.toml` + `cargo-skuld/Cargo.toml` to `X.Y.Z+1`, fix the root cause, then re-run both workflows with the new version.
+If instead **all three published** and only the "Publish GitHub release" step failed, nothing is wrong on crates.io. Do **not** yank, and do **not** bump: the release is complete apart from its tag. Flip the draft release to published by hand, which creates the tag.
 
 ### Useful commands during a release
 

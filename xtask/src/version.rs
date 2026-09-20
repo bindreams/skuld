@@ -2,8 +2,8 @@
 //!
 //! - **Workspace version**: the strict `MAJOR.MINOR.PATCH` declared in each
 //!   publishable member's `Cargo.toml`. All publishable members must agree.
-//! - **Dep pins**: every `[dependencies]` entry of a publishable member that
-//!   names another publishable member must carry exact pin
+//! - **Dep pins**: every dependency of a publishable member that names another
+//!   publishable member must carry exact pin
 //!   `=<workspace-version>`; otherwise stage 2 would publish a crate against a
 //!   stale sibling (or fail at crates.io verify). Derived from the member list
 //!   rather than named explicitly, so a new member is covered on the day it is
@@ -25,8 +25,8 @@ use semver::Version;
 use serde::Deserialize;
 
 /// Read all publishable workspace member Cargo.tomls, assert agreement on a
-/// strict MAJOR.MINOR.PATCH version, assert skuld's skuld-macros dep is
-/// pinned to `=<that-version>`, and return the shared version.
+/// strict MAJOR.MINOR.PATCH version, assert every intra-workspace dependency
+/// is pinned to `=<that-version>`, and return the shared version.
 pub fn workspace_version(repo_root: &Path) -> Result<Version> {
     let root_toml_path = repo_root.join("Cargo.toml");
     let root_toml = read_toml::<RootManifest>(&root_toml_path)?;
