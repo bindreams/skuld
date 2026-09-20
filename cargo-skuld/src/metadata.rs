@@ -67,7 +67,7 @@ fn collect_metadata_with_timeout(
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
-                    "[cargo-skuld-nextest] warning: failed to spawn {:?}: {e}; skipping",
+                    "[cargo-skuld] warning: failed to spawn {:?}: {e}; skipping",
                     binary.binary_path
                 );
                 continue;
@@ -80,14 +80,14 @@ fn collect_metadata_with_timeout(
                 let _ = child.kill();
                 let _ = child.wait();
                 eprintln!(
-                    "[cargo-skuld-nextest] warning: {:?} did not exit within {timeout:?} on --list; killed and skipped",
+                    "[cargo-skuld] warning: {:?} did not exit within {timeout:?} on --list; killed and skipped",
                     binary.binary_path
                 );
                 continue;
             }
             Err(e) => {
                 eprintln!(
-                    "[cargo-skuld-nextest] warning: failed to wait on {:?}: {e}; skipping",
+                    "[cargo-skuld] warning: failed to wait on {:?}: {e}; skipping",
                     binary.binary_path
                 );
                 continue;
@@ -97,7 +97,7 @@ fn collect_metadata_with_timeout(
         if !status.success() {
             let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
             eprintln!(
-                "[cargo-skuld-nextest] warning: {:?} exited with {:?} on --list; skipping (stderr: {stderr})",
+                "[cargo-skuld] warning: {:?} exited with {:?} on --list; skipping (stderr: {stderr})",
                 binary.binary_path,
                 status.code()
             );
@@ -112,7 +112,7 @@ fn collect_metadata_with_timeout(
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
-                    "[cargo-skuld-nextest] warning: failed to read metadata dump for {:?}: {e}; skipping",
+                    "[cargo-skuld] warning: failed to read metadata dump for {:?}: {e}; skipping",
                     binary.binary_path
                 );
                 continue;
@@ -122,7 +122,7 @@ fn collect_metadata_with_timeout(
             Ok(d) => d,
             Err(e) => {
                 eprintln!(
-                    "[cargo-skuld-nextest] warning: malformed metadata dump for {:?}: {e}; skipping",
+                    "[cargo-skuld] warning: malformed metadata dump for {:?}: {e}; skipping",
                     binary.binary_path
                 );
                 continue;
@@ -133,7 +133,7 @@ fn collect_metadata_with_timeout(
             if !m.serial_filter.is_empty() && m.serial_filter != "*" {
                 if let Err(e) = skuld::LabelFilter::parse(&m.serial_filter) {
                     eprintln!(
-                        "[cargo-skuld-nextest] warning: test {:?} in {:?} has an unparsable serial_filter {:?}: {e}; excluding it from the conflict graph",
+                        "[cargo-skuld] warning: test {:?} in {:?} has an unparsable serial_filter {:?}: {e}; excluding it from the conflict graph",
                         m.name, binary.binary_path, m.serial_filter
                     );
                     continue;

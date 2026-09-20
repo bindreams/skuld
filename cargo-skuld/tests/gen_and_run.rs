@@ -6,7 +6,7 @@ fn fixture_root() -> std::path::PathBuf {
 }
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_cargo-skuld-nextest")
+    env!("CARGO_BIN_EXE_cargo-skuld")
 }
 
 #[test]
@@ -16,7 +16,7 @@ fn gen_writes_groups_for_the_shared_resource_and_weird_name_conflicts() {
 
     let status = Command::new(bin())
         .current_dir(fixture_root())
-        .args(["gen", "--output"])
+        .args(["nextest", "gen", "--output"])
         .arg(&output)
         .status()
         .expect("spawn gen");
@@ -45,14 +45,14 @@ fn gen_check_matches_after_gen() {
     let output = out_dir.path().join("skuld-nextest.toml");
     let gen_status = Command::new(bin())
         .current_dir(fixture_root())
-        .args(["gen", "--output"])
+        .args(["nextest", "gen", "--output"])
         .arg(&output)
         .status()
         .expect("spawn gen");
     assert!(gen_status.success());
     let check_status = Command::new(bin())
         .current_dir(fixture_root())
-        .args(["gen", "--check", "--output"])
+        .args(["nextest", "gen", "--check", "--output"])
         .arg(&output)
         .status()
         .expect("spawn gen --check");
@@ -69,7 +69,7 @@ fn gen_check_fails_on_stale_file() {
     std::fs::write(&output, "# stale, does not match current test set\n").unwrap();
     let check_status = Command::new(bin())
         .current_dir(fixture_root())
-        .args(["gen", "--check", "--output"])
+        .args(["nextest", "gen", "--check", "--output"])
         .arg(&output)
         .status()
         .expect("spawn gen --check");
@@ -88,7 +88,7 @@ fn gen_on_a_workspace_with_no_skuld_binaries_is_a_harmless_noop() {
     let output = out_dir.path().join("skuld-nextest.toml");
     let status = Command::new(bin())
         .current_dir(empty_ws.path())
-        .args(["gen", "--output"])
+        .args(["nextest", "gen", "--output"])
         .arg(&output)
         .status()
         .expect("spawn gen");
@@ -126,7 +126,7 @@ fn negative_control_two_directly_spawned_processes_overlap() {
     // processes); the positive case below validates nextest's own
     // scheduling behavior separately.
     let timing_dir = tempfile::tempdir().expect("tempdir");
-    let binaries = cargo_skuld_nextest::discovery::discover_binaries(&fixture_root()).expect("discovery");
+    let binaries = cargo_skuld::discovery::discover_binaries(&fixture_root()).expect("discovery");
     let bin_a = &binaries
         .iter()
         .find(|b| b.binary_id.contains("fixture-crate-a"))
@@ -169,13 +169,13 @@ fn run_serializes_the_cross_binary_conflict_via_generated_tool_config() {
     let status = Command::new(bin())
         .current_dir(fixture_root())
         .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", real_dir.path())
-        .args(["run", "--output"])
+        .args(["nextest", "run", "--output"])
         .arg(output_dir.path().join("skuld-nextest.toml"))
         .status()
-        .expect("spawn cargo-skuld-nextest run");
+        .expect("spawn cargo-skuld run");
     assert!(
         status.success(),
-        "cargo-skuld-nextest run must succeed against the fixture workspace"
+        "cargo-skuld run must succeed against the fixture workspace"
     );
     let real_a = read_window(real_dir.path(), "a_uses_shared_resource");
     let real_b = read_window(real_dir.path(), "b_locks_shared_resource");
@@ -196,7 +196,7 @@ fn run_correctly_selects_tests_with_special_characters_in_their_names() {
     let status = Command::new(bin())
         .current_dir(fixture_root())
         .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", dir.path())
-        .args(["run", "--output"])
+        .args(["nextest", "run", "--output"])
         .arg(output_dir.path().join("skuld-nextest.toml"))
         .status()
         .expect("spawn run");

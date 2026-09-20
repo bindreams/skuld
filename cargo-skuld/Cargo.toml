@@ -1,5 +1,5 @@
 [package]
-name = "cargo-skuld-nextest"
+name = "cargo-skuld"
 version = "0.3.0"
 edition = "2021"
 authors = ["Anna Zhukova"]
@@ -7,9 +7,11 @@ description = "Generate nextest test-groups from Skuld's serial test coordinatio
 license = "Apache-2.0"
 license-file = "../LICENSE.md"
 repository = "https://github.com/bindreams/skuld"
+categories = ["development-tools::cargo-plugins", "development-tools::testing"]
+keywords = ["cargo", "nextest", "testing", "test-harness"]
 
 [[bin]]
-name = "cargo-skuld-nextest"
+name = "cargo-skuld"
 path = "src/main.rs"
 
 [dependencies]

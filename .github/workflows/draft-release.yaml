@@ -100,7 +100,7 @@ jobs:
         # verify step cannot resolve it from the registry — use --no-verify
         # to skip the build check. Packaging errors (missing metadata,
         # malformed manifest) still surface for both.
-        run: cargo publish -p skuld-macros -p skuld --dry-run --locked --no-verify
+        run: cargo publish -p skuld-macros -p skuld -p cargo-skuld --dry-run --locked --no-verify
 
   release:
     name: Create draft release

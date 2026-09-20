@@ -8,7 +8,7 @@ Releases go through two GitHub Actions workflows. Both are triggered by hand —
 
 - `Cargo.toml` and `macros/Cargo.toml` already have the intended release version (say `X.Y.Z`) on `main`.
 - You have the GitHub CLI (`gh`) authenticated for the `bindreams/skuld` repo.
-- A `Deploy` GitHub Environment is configured with a `CARGO_REGISTRY_TOKEN` scoped to `skuld` + `skuld-macros` with `publish-new` + `publish-update` permissions.
+- A `Deploy` GitHub Environment is configured with a `CARGO_REGISTRY_TOKEN` scoped to `skuld` + `skuld-macros` + `cargo-skuld` with `publish-new` + `publish-update` permissions. A token scoped to only the first two cannot publish `cargo-skuld` — that omission is why the CLI, added to the workspace in #48, was never released.
 
 ### Stage 1 — Draft Release
 

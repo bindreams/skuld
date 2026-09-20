@@ -1,8 +1,8 @@
 - id: skuld-nextest-gen
-  name: skuld-nextest gen
+  name: skuld nextest gen
   description: Regenerate the nextest test-groups config from Skuld's serial test metadata.
   language: rust
-  entry: cargo-skuld-nextest
-  args: [gen]
+  entry: cargo-skuld
+  args: [nextest, gen]
   pass_filenames: false
   files: '\.rs$'

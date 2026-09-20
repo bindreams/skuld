@@ -454,7 +454,7 @@ pub(crate) fn coordinate(
                         "coordination: {name} is blocked on a serial constraint and will wait \
                          (if this run used a generated nextest tool-config-file, this means \
                          nextest scheduled it concurrently with a conflicting test anyway — the \
-                         config may be stale; re-run `cargo skuld-nextest gen --check`)"
+                         config may be stale; re-run `cargo skuld nextest gen --check`)"
                     );
                 }
             }
