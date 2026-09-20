@@ -8,6 +8,7 @@ Releases go through two GitHub Actions workflows. Both are triggered by hand —
 
 - `Cargo.toml`, `macros/Cargo.toml` and `cargo-skuld/Cargo.toml` already have the intended release version (say `X.Y.Z`) on `main`, and the exact pins between them match it. `cargo xtask version --check --exact` enumerates workspace members dynamically, so it validates version agreement and every intra-workspace `=` pin across all three.
 - You have the GitHub CLI (`gh`) authenticated for the `bindreams/skuld` repo.
+- **For recovery only:** a personal crates.io token with the `yank` scope on all three crates, via `cargo login` or `cargo yank --token`. The `Deploy` token cannot yank — `publish-new`/`publish-update` do not grant that scope, and it lives in a GitHub Environment secret rather than on your machine. Without this, the first command of either partial-publish recovery fails on authentication.
 - A `Deploy` GitHub Environment is configured with a `CARGO_REGISTRY_TOKEN` scoped to `skuld` + `skuld-macros` + `cargo-skuld` with `publish-new` + `publish-update` permissions. A token scoped to only the first two cannot publish `cargo-skuld` — a second blocker that would have stopped the publish even once the command included it. The causal omission was the hand-written `-p` list, which never named the crate, so publishing was never attempted and the scope was never exercised.
 
 ### Stage 1 — Draft Release
@@ -63,13 +64,16 @@ Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` �
 ```sh
 for c in skuld-macros skuld cargo-skuld; do
   prefix=$(printf '%s' "$c" | sed -E 's|^(..)(..).*|\1/\2|')
-  if curl -sfX GET "https://index.crates.io/$prefix/$c" | grep -q '"vers":"X.Y.Z"'; then
+  line=$(curl -sfX GET "https://index.crates.io/$prefix/$c" | grep '"vers":"X.Y.Z"')
+  if [ -n "$line" ] && ! printf '%s' "$line" | grep -q '"yanked":true'; then
     printf '%-14s X.Y.Z: PUBLISHED\n' "$c"
   else
     printf '%-14s X.Y.Z: absent\n' "$c"
   fi
 done
 ```
+
+A yanked version stays in the index, so the `yanked` check keeps a re-run after a partial yank from reporting `PUBLISHED`. If a crate reads `absent` immediately after a successful-looking upload, wait a minute and re-check before yanking anything — index propagation lags.
 
 **Nothing published.** crates.io is untouched and there is nothing to undo. What to do next depends on why it stopped:
 
@@ -92,9 +96,11 @@ cargo yank skuld@X.Y.Z
 **In either partial case above**, capture the commit before deleting the draft — the draft is its only source:
 
 ```sh
-SHA=$(gh release view "vX.Y.Z" --json targetCommitish -q .targetCommitish)
-git tag "vX.Y.Z" "$SHA" && git push origin "vX.Y.Z"
-gh release delete "vX.Y.Z" --yes   # NOT --cleanup-tag: that deletes the tag just pushed
+SHA=$(gh release view "vX.Y.Z" --json targetCommitish -q .targetCommitish) &&
+  git fetch origin &&
+  git tag "vX.Y.Z" "$SHA" &&
+  git push origin "vX.Y.Z" &&
+  gh release delete "vX.Y.Z" --yes   # NOT --cleanup-tag: that deletes the tag just pushed
 ```
 
 The tag has to be created by hand because only the final GitHub-release flip creates it, and that never ran — so the newest tag is still `vX.Y.(Z-1)` and `cargo xtask version --check` would reject `X.Y.Z+1` as a two-step jump, blocking the bump commit both locally and in Lint.
@@ -120,6 +126,7 @@ gh run view --log
 # See the draft release
 gh release view vX.Y.Z
 
-# Delete a draft (e.g. to re-run stage 1)
+# Delete a draft (e.g. to re-run stage 1). Omit --cleanup-tag if you created the
+# tag by hand during recovery — it would delete it.
 gh release delete vX.Y.Z --yes --cleanup-tag
 ```
