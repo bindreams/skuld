@@ -93,3 +93,11 @@ jobs:
       - name: Test xtask
         if: matrix.os == 'linux' && matrix.arch == 'amd64'
         run: cargo test -p xtask
+
+      # The fixture workspace under cargo-skuld resolves independently and
+      # path-depends on the workspace version, so its lock goes stale at every
+      # bump — and the tests silently rewrite it. Nothing else notices: no job
+      # runs --locked there. On main it had been stale for two releases.
+      - name: Fixture lock is current
+        if: matrix.os == 'linux' && matrix.arch == 'amd64'
+        run: git diff --exit-code -- cargo-skuld/tests/fixtures/test-workspace/Cargo.lock

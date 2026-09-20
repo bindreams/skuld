@@ -54,24 +54,42 @@ This workflow:
 
 ### Recovery
 
-Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` — and `cargo publish` is not atomic, so a server-side error part-way through leaves the workspace partially published. Stage 2 therefore has two partial states, plus one state where publishing finished and only the GitHub release failed.
+Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` — and `cargo publish` is not atomic, so a server-side error part-way through leaves the workspace partially published.
 
-If it failed after `skuld-macros`:
+**First, establish which state you are in.** The workflow log says where it stopped; crates.io is authoritative:
+
+```sh
+gh run view <run-id> --log | grep -E "Uploading|error"
+for c in skuld-macros skuld cargo-skuld; do
+  curl -sX GET "https://crates.io/api/v1/crates/$c" | grep -o "\"max_version\":\"[^\"]*\""
+done
+```
+
+**Nothing published** — it failed while packaging or verifying, or in the version re-check. crates.io is untouched and there is nothing to undo. Fix the cause and re-run stage 2 with the **same** version.
+
+**Only `skuld-macros` published:**
 
 ```sh
 cargo yank skuld-macros@X.Y.Z
 ```
 
-If it failed after `skuld` (the likelier one: `cargo-skuld` publishes last, and its token scope is the one historically missing):
+**`skuld-macros` and `skuld` published** (the likelier partial: `cargo-skuld` publishes last, and its token scope is the one historically missing):
 
 ```sh
 cargo yank skuld-macros@X.Y.Z
 cargo yank skuld@X.Y.Z
 ```
 
-**In either partial case above**: bump `Cargo.toml` + `macros/Cargo.toml` + `cargo-skuld/Cargo.toml` to `X.Y.Z+1`, fix the root cause, then re-run both workflows with the new version. Because the bump is lockstep, `cargo-skuld` then has no `X.Y.Z` at all — a gap in its version line is the accepted cost of a shared workspace version, not a problem to work around.
+**In either partial case above**, three things follow. First, create the tag by hand — the `vX.Y.Z` tag is created only by the final GitHub-release flip, which never ran, so the last tag in the repo is still `vX.Y.(Z-1)` and `cargo xtask version --check` would reject `X.Y.Z+1` as a two-step jump, blocking the bump commit locally and in Lint:
 
-If instead **all three published** and only the "Publish GitHub release" step failed, nothing is wrong on crates.io. Do **not** yank, and do **not** bump: the release is complete apart from its tag. Flip the draft release to published by hand, which creates the tag.
+```sh
+git tag "vX.Y.Z" <release-commit-sha> && git push origin "vX.Y.Z"
+gh release delete "vX.Y.Z" --yes   # the draft now points at yanked crates
+```
+
+Then bump `Cargo.toml` + `macros/Cargo.toml` + `cargo-skuld/Cargo.toml` to `X.Y.Z+1`, fix the root cause, and re-run both workflows with the new version. Because the bump is lockstep, `cargo-skuld` then has no `X.Y.Z` at all — a gap in its version line is the accepted cost of a shared workspace version, not a problem to work around.
+
+**All three published, only the "Publish GitHub release" step failed** — nothing is wrong on crates.io. Do **not** yank, and do **not** bump: the release is complete apart from its tag. Flip the draft release to published by hand, which creates the tag.
 
 ### Useful commands during a release
 

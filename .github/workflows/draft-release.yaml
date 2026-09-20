@@ -97,12 +97,13 @@ jobs:
       - name: Dry-run publish workspace
         # cargo 1.90+ dry-runs multi-package publishes in topological order.
         #
-        # Verification stays on. A workspace publish builds a temporary overlay
-        # registry from the packaged siblings, so each crate's verify step
-        # resolves its intra-workspace deps without them being on crates.io —
-        # which a `-p a -p b` publish could not do, and is why this once passed
-        # --no-verify. Keeping it on means stage 1 actually rehearses stage 2,
-        # compiling each crate as packaged rather than as checked out.
+        # Verification stays on. Multi-package publishing — `--workspace` or
+        # `-p a -p b` alike — builds a temporary overlay registry from the
+        # packaged siblings, so each crate's verify step resolves its
+        # intra-workspace deps without them being on crates.io. The --no-verify
+        # this once carried was unnecessary rather than a workaround for the
+        # `-p` form. Keeping verification on means stage 1 actually rehearses
+        # stage 2, compiling each crate as packaged rather than as checked out.
         run: cargo publish --workspace --dry-run --locked
 
   release:
