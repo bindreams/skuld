@@ -6,7 +6,7 @@ Releases go through two GitHub Actions workflows. Both are triggered by hand —
 
 ### Prerequisites
 
-- `Cargo.toml`, `macros/Cargo.toml` and `cargo-skuld/Cargo.toml` already have the intended release version (say `X.Y.Z`) on `main`, and the exact pins between them match it. `cargo xtask version --check --exact` enumerates workspace members dynamically, so it validates version agreement and every intra-workspace `=` pin across all three — but the lists in this document do not, so keep them in step when a member is added.
+- `Cargo.toml`, `macros/Cargo.toml` and `cargo-skuld/Cargo.toml` already have the intended release version (say `X.Y.Z`) on `main`, and the exact pins between them match it. `cargo xtask version --check --exact` enumerates workspace members dynamically, so it validates version agreement and every intra-workspace `=` pin across all three.
 - You have the GitHub CLI (`gh`) authenticated for the `bindreams/skuld` repo.
 - A `Deploy` GitHub Environment is configured with a `CARGO_REGISTRY_TOKEN` scoped to `skuld` + `skuld-macros` + `cargo-skuld` with `publish-new` + `publish-update` permissions. A token scoped to only the first two cannot publish `cargo-skuld` — that omission is why the CLI, added to the workspace in #48, was never released.
 
@@ -23,7 +23,7 @@ This workflow:
 
 - Validates the input version and checks `Cargo.toml` versions agree (via `cargo xtask version --check --exact`).
 - Runs the full CI matrix (lint + 6-platform tests) against the release commit.
-- Runs `cargo publish --dry-run` for all three crates.
+- Runs `cargo publish --workspace --dry-run`, covering every publishable member.
 - Creates a **draft** GitHub release pinned to the exact commit SHA.
 
 Review the draft at:
@@ -49,7 +49,7 @@ This workflow:
 - Re-verifies the draft release exists and is pinned to a valid commit SHA.
 - Checks out that commit.
 - Re-runs `cargo xtask version --check --exact` against the checked-out tree.
-- Publishes all three crates to crates.io in one `cargo publish -p skuld-macros -p skuld -p cargo-skuld --locked` command (cargo handles topological ordering and index-visibility waiting).
+- Publishes every publishable member to crates.io in one `cargo publish --workspace --locked` command (cargo handles topological ordering and index-visibility waiting, and skips `publish = false` members). Deliberately not a hand-written `-p` list: omitting a member from one is what left `cargo-skuld` unpublished from #48 until 0.3.1.
 - Flips the GitHub release from draft to published, which creates the `vX.Y.Z` git tag.
 
 ### Recovery
@@ -59,15 +59,17 @@ Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` �
 If it failed after `skuld-macros`:
 
 ```sh
-cargo yank -p skuld-macros --version X.Y.Z
+cargo yank skuld-macros@X.Y.Z
 ```
 
 If it failed after `skuld` (the likelier one: `cargo-skuld` publishes last, and its token scope is the one historically missing):
 
 ```sh
-cargo yank -p skuld-macros --version X.Y.Z
-cargo yank -p skuld --version X.Y.Z
+cargo yank skuld-macros@X.Y.Z
+cargo yank skuld@X.Y.Z
 ```
+
+If instead **all three published** and the "Publish GitHub release" step failed, nothing is wrong on crates.io. Do **not** yank. Flip the draft release to published by hand; that creates the tag and completes the release.
 
 Because the bump below is lockstep, `cargo-skuld` then has no `X.Y.Z` at all. A gap in its version line is the accepted cost of a shared workspace version, not a problem to work around.
 

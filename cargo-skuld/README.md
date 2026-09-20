@@ -21,5 +21,5 @@ The generated file is not auto-discovered — pass it explicitly, with an absolu
 cargo nextest run --tool-config-file "skuld:$PWD/.config/skuld-nextest.toml"
 ```
 
-See the [nextest integration guide](https://skuld.readthedocs.io/en/latest/nextest.html) for
+See the [nextest integration guide](https://skuld.readthedocs.io/en/stable/nextest.html) for
 details, including keeping the generated file in sync with a pre-commit hook.

@@ -37,7 +37,6 @@ pub fn workspace_version(repo_root: &Path) -> Result<Version> {
 
     let mut shared: Option<Version> = None;
     let mut shared_source: String = String::new();
-    let mut publishable: Vec<MemberInfo> = Vec::new();
 
     for member in &members {
         let cargo_path = repo_root.join(member).join("Cargo.toml");
@@ -73,60 +72,62 @@ pub fn workspace_version(repo_root: &Path) -> Result<Version> {
             }
             Some(_) => {}
         }
-
-        publishable.push(MemberInfo {
-            path: cargo_path.display().to_string(),
-            name: package
-                .name
-                .clone()
-                .ok_or_else(|| anyhow!("no [package] name in {}", cargo_path.display()))?,
-            dependencies: manifest.dependencies.clone().unwrap_or_default(),
-        });
     }
 
     let shared = shared.ok_or_else(|| anyhow!("no publishable workspace members"))?;
-    assert_intra_workspace_pins(&publishable, &shared)?;
+    assert_intra_workspace_pins(repo_root, &shared)?;
     Ok(shared)
-}
-
-/// The version requirement a dependency declares, in either the shorthand
-/// (`dep = "1"`) or table (`dep = { version = "1" }`) form. `None` for a
-/// path-only dependency, which declares no requirement at all.
-pub(crate) fn dep_version_req(dep: &toml::Value) -> Option<String> {
-    match dep {
-        toml::Value::String(s) => Some(s.clone()),
-        toml::Value::Table(t) => t.get("version").and_then(|v| v.as_str()).map(str::to_string),
-        _ => None,
-    }
 }
 
 /// Assert every intra-workspace dependency carries `=<expected>`.
 ///
+/// Driven by `cargo metadata` rather than by reading manifests directly. That
+/// matters: cargo resolves `[target.'cfg(...)'.dependencies]`,
+/// `[build-dependencies]`, renamed deps (`alias = { package = "real" }`) and
+/// `{ workspace = true }` inheritance into one flat list with the real crate
+/// name and requirement on each entry. Deserializing `[dependencies]` by hand
+/// sees none of those — this repo's root manifest already carries two
+/// target-specific dependency tables, so a sibling moved into one would pass a
+/// hand-rolled check and ship unpinned.
+///
+/// Dev-dependencies are skipped deliberately: cargo strips the path-only ones
+/// on publish, and the root carries `skuld = { path = "." }` as a dev-dep on
+/// itself, which no pin could satisfy.
+///
 /// A loose pin builds and tests fine against the path dependency, so nothing
 /// else in the pipeline catches it — but the published crate would be free to
-/// resolve any compatible sibling version, across a metadata protocol the two
-/// share.
-pub(crate) fn assert_intra_workspace_pins(publishable: &[MemberInfo], expected: &Version) -> Result<()> {
-    let names: HashSet<&str> = publishable.iter().map(|m| m.name.as_str()).collect();
+/// resolve any compatible sibling across a metadata protocol the two share.
+pub(crate) fn assert_intra_workspace_pins(repo_root: &Path, expected: &Version) -> Result<()> {
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(repo_root.join("Cargo.toml"))
+        .no_deps()
+        .exec()
+        .with_context(|| format!("failed to read cargo metadata for {}", repo_root.display()))?;
+
+    // `publish = false` deserializes as an empty registry list.
+    let publishable: Vec<_> = metadata
+        .packages
+        .iter()
+        .filter(|p| p.publish.as_deref() != Some(&[]))
+        .collect();
+    let names: HashSet<&str> = publishable.iter().map(|p| p.name.as_ref()).collect();
     let want = format!("={expected}");
 
-    for member in publishable {
-        for (dep_name, dep) in &member.dependencies {
-            if !names.contains(dep_name.as_str()) {
+    for package in &publishable {
+        for dep in &package.dependencies {
+            if dep.kind == cargo_metadata::DependencyKind::Development {
                 continue;
             }
-            let Some(req) = dep_version_req(dep) else {
+            if !names.contains(dep.name.as_str()) {
+                continue;
+            }
+            if dep.req.to_string() != want {
                 return Err(anyhow!(
-                    "{}: dependency '{dep_name}' is another workspace member but declares no version; \
-                     it must be pinned '{want}' or it cannot be published",
-                    member.path
-                ));
-            };
-            if req != want {
-                return Err(anyhow!(
-                    "{}: dependency '{dep_name}' is pinned '{req}', expected '{want}' \
+                    "{}: dependency '{}' is pinned '{}', expected '{want}' \
                      (intra-workspace pins must match the workspace version exactly)",
-                    member.path
+                    package.manifest_path,
+                    dep.name,
+                    dep.req
                 ));
             }
         }
@@ -284,20 +285,10 @@ struct Workspace {
 #[derive(Deserialize)]
 struct MemberManifest {
     package: Option<Package>,
-    dependencies: Option<toml::value::Table>,
-}
-
-/// A publishable member, retained so pins can be checked once the shared
-/// version is known.
-pub(crate) struct MemberInfo {
-    pub(crate) path: String,
-    pub(crate) name: String,
-    pub(crate) dependencies: toml::value::Table,
 }
 
 #[derive(Deserialize)]
 struct Package {
-    name: Option<String>,
     version: Option<String>,
     publish: Option<bool>,
 }

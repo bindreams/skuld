@@ -1,6 +1,5 @@
 use crate::version::{
-    assert_intra_workspace_pins, dep_version_req, is_valid_next, nearest_ancestor_version_tags,
-    validate_cargo_against_nearest, workspace_version, MemberInfo, TagInfo,
+    is_valid_next, nearest_ancestor_version_tags, validate_cargo_against_nearest, workspace_version, TagInfo,
 };
 use gix::ObjectId;
 use semver::Version;
@@ -59,9 +58,14 @@ fn invalid_minor_without_patch_reset() {
 // workspace_version ===================================================================================================
 
 fn write_workspace(dir: &std::path::Path, root: &str, macros: &str) {
-    fs::create_dir_all(dir.join("macros")).unwrap();
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::create_dir_all(dir.join("macros/src")).unwrap();
     fs::write(dir.join("Cargo.toml"), root).unwrap();
     fs::write(dir.join("macros/Cargo.toml"), macros).unwrap();
+    // `cargo metadata` refuses a manifest with no targets, and the pin check
+    // runs through it.
+    fs::write(dir.join("src/lib.rs"), "").unwrap();
+    fs::write(dir.join("macros/src/lib.rs"), "").unwrap();
 }
 
 const MACROS_OK: &str = r#"
@@ -437,58 +441,87 @@ fn integration_prerelease_ignored() {
 
 // Intra-workspace pin checks ==========================================================================================
 
-fn member(name: &str, deps: &[(&str, toml::Value)]) -> MemberInfo {
-    MemberInfo {
-        path: format!("{name}/Cargo.toml"),
-        name: name.to_string(),
-        dependencies: deps.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
-    }
+/// A root manifest declaring its dependency on `skuld-macros` in `table`.
+fn root_with(table: &str, dep: &str) -> String {
+    format!(
+        r#"
+[workspace]
+members = [".", "macros"]
+
+[package]
+name = "skuld"
+version = "0.1.0"
+edition = "2021"
+
+[{table}]
+{dep}
+"#
+    )
 }
 
-#[test]
-fn dep_version_req_reads_both_declaration_forms() {
-    assert_eq!(
-        dep_version_req(&toml::Value::String("=1.2.3".into())),
-        Some("=1.2.3".into())
-    );
-    let mut t = toml::value::Table::new();
-    t.insert("version".into(), toml::Value::String("=1.2.3".into()));
-    t.insert("path".into(), toml::Value::String("..".into()));
-    assert_eq!(dep_version_req(&toml::Value::Table(t)), Some("=1.2.3".into()));
-}
-
-#[test]
-fn a_path_only_dependency_declares_no_requirement() {
-    let mut t = toml::value::Table::new();
-    t.insert("path".into(), toml::Value::String("..".into()));
-    assert_eq!(dep_version_req(&toml::Value::Table(t)), None);
+fn pin_result(table: &str, dep: &str) -> Result<Version, String> {
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(tmp.path(), &root_with(table, dep), MACROS_OK);
+    workspace_version(tmp.path()).map_err(|e| e.to_string())
 }
 
 #[test]
 fn an_exact_pin_on_a_sibling_passes() {
-    let members = vec![
-        member("lib", &[]),
-        member("cli", &[("lib", toml::Value::String("=1.2.3".into()))]),
-    ];
-    assert!(assert_intra_workspace_pins(&members, &v("1.2.3")).is_ok());
+    let got = pin_result(
+        "dependencies",
+        r#"skuld-macros = { version = "=0.1.0", path = "macros" }"#,
+    );
+    assert_eq!(got.unwrap(), v("0.1.0"));
 }
 
 #[test]
 fn a_loose_pin_on_a_sibling_is_rejected() {
     // The gap this check exists to close: a loose pin builds and tests fine
     // against the path dependency, so nothing else in the pipeline catches it.
-    let members = vec![
-        member("lib", &[]),
-        member("cli", &[("lib", toml::Value::String("1.2".into()))]),
-    ];
-    let err = assert_intra_workspace_pins(&members, &v("1.2.3"))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("pinned '1.2'"), "{err}");
+    let err = pin_result("dependencies", r#"skuld-macros = { version = "0.1", path = "macros" }"#).unwrap_err();
+    assert!(err.contains("is pinned '^0.1', expected '=0.1.0'"), "{err}");
 }
 
 #[test]
-fn a_dependency_outside_the_workspace_is_not_constrained() {
-    let members = vec![member("lib", &[("serde", toml::Value::String("1".into()))])];
-    assert!(assert_intra_workspace_pins(&members, &v("1.2.3")).is_ok());
+fn a_target_specific_dependency_is_checked() {
+    // Not hypothetical: this repo's own root manifest carries two
+    // `[target.'cfg(...)'.dependencies]` tables, so a sibling moved into one
+    // would sail past a check that only reads `[dependencies]`.
+    let err = pin_result(
+        r#"target.'cfg(unix)'.dependencies"#,
+        r#"skuld-macros = { version = "0.1", path = "macros" }"#,
+    )
+    .unwrap_err();
+    assert!(err.contains("is pinned"), "{err}");
+}
+
+#[test]
+fn a_build_dependency_is_checked() {
+    let err = pin_result(
+        "build-dependencies",
+        r#"skuld-macros = { version = "0.1", path = "macros" }"#,
+    )
+    .unwrap_err();
+    assert!(err.contains("is pinned"), "{err}");
+}
+
+#[test]
+fn a_renamed_dependency_is_checked_under_its_real_name() {
+    let err = pin_result(
+        "dependencies",
+        r#"macros-alias = { package = "skuld-macros", version = "0.1", path = "macros" }"#,
+    )
+    .unwrap_err();
+    assert!(err.contains("'skuld-macros'"), "{err}");
+}
+
+#[test]
+fn a_dev_dependency_is_not_constrained() {
+    // cargo strips path-only dev-deps on publish, and the real root carries a
+    // dev-dep on itself that no pin could satisfy.
+    let got = pin_result(
+        "dev-dependencies",
+        r#"skuld-macros = { version = "0.1", path = "macros" }"#,
+    );
+    assert_eq!(got.unwrap(), v("0.1.0"));
 }
