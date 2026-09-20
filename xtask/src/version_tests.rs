@@ -517,8 +517,9 @@ fn a_renamed_dependency_is_checked_under_its_real_name() {
 
 #[test]
 fn a_dev_dependency_is_not_constrained() {
-    // cargo strips path-only dev-deps on publish, and the real root carries a
-    // dev-dep on itself that no pin could satisfy.
+    // A dependency's dev-deps are never resolved downstream, so their pins
+    // cannot affect a consumer. The real root also carries a dev-dep on itself,
+    // reported as `*`, which no pin could satisfy.
     let got = pin_result(
         "dev-dependencies",
         r#"skuld-macros = { version = "0.1", path = "macros" }"#,
