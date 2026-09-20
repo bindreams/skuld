@@ -6,7 +6,7 @@ Releases go through two GitHub Actions workflows. Both are triggered by hand —
 
 ### Prerequisites
 
-- `Cargo.toml` and `macros/Cargo.toml` already have the intended release version (say `X.Y.Z`) on `main`.
+- `Cargo.toml`, `macros/Cargo.toml` and `cargo-skuld/Cargo.toml` already have the intended release version (say `X.Y.Z`) on `main`, and the exact pins between them match it. `cargo xtask version --check --exact` enumerates workspace members dynamically, so it validates all three — but the lists in this document do not, so keep them in step when a member is added.
 - You have the GitHub CLI (`gh`) authenticated for the `bindreams/skuld` repo.
 - A `Deploy` GitHub Environment is configured with a `CARGO_REGISTRY_TOKEN` scoped to `skuld` + `skuld-macros` + `cargo-skuld` with `publish-new` + `publish-update` permissions. A token scoped to only the first two cannot publish `cargo-skuld` — that omission is why the CLI, added to the workspace in #48, was never released.
 
@@ -60,7 +60,7 @@ If stage 2 fails between `skuld-macros` and `skuld` publishing successfully, the
 cargo yank -p skuld-macros --version X.Y.Z
 ```
 
-Bump `Cargo.toml` + `macros/Cargo.toml` to `X.Y.Z+1`, fix the root cause, then re-run both workflows with the new version.
+Bump `Cargo.toml` + `macros/Cargo.toml` + `cargo-skuld/Cargo.toml` to `X.Y.Z+1`, fix the root cause, then re-run both workflows with the new version.
 
 ### Useful commands during a release
 
