@@ -99,7 +99,7 @@ jobs:
         # For dry-run, skuld-macros is NOT actually published, so skuld's
         # verify step cannot resolve it from the registry — use --no-verify
         # to skip the build check. Packaging errors (missing metadata,
-        # malformed manifest) still surface for both.
+        # malformed manifest) still surface for all three.
         run: cargo publish -p skuld-macros -p skuld -p cargo-skuld --dry-run --locked --no-verify
 
   release:

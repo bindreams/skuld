@@ -2,9 +2,13 @@
 //!
 //! - **Workspace version**: the strict `MAJOR.MINOR.PATCH` declared in each
 //!   publishable member's `Cargo.toml`. All publishable members must agree.
-//! - **Dep pin**: `skuld`'s `skuld-macros` dependency must carry exact pin
-//!   `=<workspace-version>`; otherwise stage 2 would publish skuld against a
-//!   stale skuld-macros version (or fail at crates.io verify).
+//! - **Dep pins**: every `[dependencies]` entry of a publishable member that
+//!   names another publishable member must carry exact pin
+//!   `=<workspace-version>`; otherwise stage 2 would publish a crate against a
+//!   stale sibling (or fail at crates.io verify). Derived from the member list
+//!   rather than named explicitly, so a new member is covered on the day it is
+//!   added — the opposite of the hand-maintained lists that kept `cargo-skuld`
+//!   unpublished.
 //! - **Nearest ancestor tag set**: the set of version tags matching
 //!   `v[0-9]+.[0-9]+.[0-9]+` that are ancestors of HEAD and have no
 //!   tagged descendants in HEAD's history. Computed by BFS from HEAD
@@ -33,6 +37,7 @@ pub fn workspace_version(repo_root: &Path) -> Result<Version> {
 
     let mut shared: Option<Version> = None;
     let mut shared_source: String = String::new();
+    let mut publishable: Vec<MemberInfo> = Vec::new();
 
     for member in &members {
         let cargo_path = repo_root.join(member).join("Cargo.toml");
@@ -68,36 +73,63 @@ pub fn workspace_version(repo_root: &Path) -> Result<Version> {
             }
             Some(_) => {}
         }
+
+        publishable.push(MemberInfo {
+            path: cargo_path.display().to_string(),
+            name: package
+                .name
+                .clone()
+                .ok_or_else(|| anyhow!("no [package] name in {}", cargo_path.display()))?,
+            dependencies: manifest.dependencies.clone().unwrap_or_default(),
+        });
     }
 
     let shared = shared.ok_or_else(|| anyhow!("no publishable workspace members"))?;
-    assert_skuld_macros_pin(repo_root, &shared)?;
+    assert_intra_workspace_pins(&publishable, &shared)?;
     Ok(shared)
 }
 
-fn assert_skuld_macros_pin(repo_root: &Path, expected: &Version) -> Result<()> {
-    let path = repo_root.join("Cargo.toml");
-    let manifest = read_toml::<MemberManifest>(&path)?;
-    let Some(deps) = manifest.dependencies else {
-        return Err(anyhow!("{} has no [dependencies] table", path.display()));
-    };
-    let Some(dep) = deps.get("skuld-macros") else {
-        return Err(anyhow!("{} is missing the skuld-macros dependency", path.display()));
-    };
-    let req = match dep {
-        toml::Value::String(s) => s.clone(),
-        toml::Value::Table(t) => t
-            .get("version")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("skuld-macros dep in {} has no version field", path.display()))?
-            .to_string(),
-        _ => return Err(anyhow!("skuld-macros dep in {} has unexpected shape", path.display())),
-    };
+/// The version requirement a dependency declares, in either the shorthand
+/// (`dep = "1"`) or table (`dep = { version = "1" }`) form. `None` for a
+/// path-only dependency, which declares no requirement at all.
+pub(crate) fn dep_version_req(dep: &toml::Value) -> Option<String> {
+    match dep {
+        toml::Value::String(s) => Some(s.clone()),
+        toml::Value::Table(t) => t.get("version").and_then(|v| v.as_str()).map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Assert every intra-workspace dependency carries `=<expected>`.
+///
+/// A loose pin builds and tests fine against the path dependency, so nothing
+/// else in the pipeline catches it — but the published crate would be free to
+/// resolve any compatible sibling version, across a metadata protocol the two
+/// share.
+pub(crate) fn assert_intra_workspace_pins(publishable: &[MemberInfo], expected: &Version) -> Result<()> {
+    let names: HashSet<&str> = publishable.iter().map(|m| m.name.as_str()).collect();
     let want = format!("={expected}");
-    if req != want {
-        return Err(anyhow!(
-            "skuld-macros dep pin is '{req}', expected '{want}' (pin must match the workspace version exactly)"
-        ));
+
+    for member in publishable {
+        for (dep_name, dep) in &member.dependencies {
+            if !names.contains(dep_name.as_str()) {
+                continue;
+            }
+            let Some(req) = dep_version_req(dep) else {
+                return Err(anyhow!(
+                    "{}: dependency '{dep_name}' is another workspace member but declares no version; \
+                     it must be pinned '{want}' or it cannot be published",
+                    member.path
+                ));
+            };
+            if req != want {
+                return Err(anyhow!(
+                    "{}: dependency '{dep_name}' is pinned '{req}', expected '{want}' \
+                     (intra-workspace pins must match the workspace version exactly)",
+                    member.path
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -255,8 +287,17 @@ struct MemberManifest {
     dependencies: Option<toml::value::Table>,
 }
 
+/// A publishable member, retained so pins can be checked once the shared
+/// version is known.
+pub(crate) struct MemberInfo {
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) dependencies: toml::value::Table,
+}
+
 #[derive(Deserialize)]
 struct Package {
+    name: Option<String>,
     version: Option<String>,
     publish: Option<bool>,
 }

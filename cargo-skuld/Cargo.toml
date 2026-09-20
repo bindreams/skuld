@@ -5,8 +5,11 @@ edition = "2021"
 authors = ["Anna Zhukova"]
 description = "Generate nextest test-groups from Skuld's serial test coordination metadata"
 license = "Apache-2.0"
-license-file = "../LICENSE.md"
 repository = "https://github.com/bindreams/skuld"
+homepage = "https://skuld.readthedocs.io"
+documentation = "https://skuld.readthedocs.io/en/latest/nextest.html"
+readme = "README.md"
+exclude = ["tests/**"]
 categories = ["development-tools::cargo-plugins", "development-tools::testing"]
 keywords = ["cargo", "nextest", "testing", "test-harness"]
 

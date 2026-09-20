@@ -1,5 +1,6 @@
 use crate::version::{
-    is_valid_next, nearest_ancestor_version_tags, validate_cargo_against_nearest, workspace_version, TagInfo,
+    assert_intra_workspace_pins, dep_version_req, is_valid_next, nearest_ancestor_version_tags,
+    validate_cargo_against_nearest, workspace_version, MemberInfo, TagInfo,
 };
 use gix::ObjectId;
 use semver::Version;
@@ -145,7 +146,7 @@ skuld-macros = { version = "=0.1.0-beta", path = "macros" }
 }
 
 #[test]
-fn missing_macros_dep() {
+fn an_absent_sibling_dependency_is_not_a_version_error() {
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(
         tmp.path(),
@@ -163,11 +164,11 @@ edition = "2021"
 "#,
         MACROS_OK,
     );
-    let err = workspace_version(tmp.path()).unwrap_err().to_string();
-    assert!(
-        err.contains("missing the skuld-macros dependency"),
-        "unexpected error: {err}"
-    );
+    // The pin check constrains the dependencies a member declares; it does not
+    // mandate that a particular one exists. Requiring skuld-macros by name is
+    // what this check was generalized away from, and the compiler already
+    // enforces presence — skuld does not build without its macros.
+    assert_eq!(workspace_version(tmp.path()).unwrap(), v("0.1.0"));
 }
 
 #[test]
@@ -190,7 +191,10 @@ skuld-macros = { version = "=0.0.9", path = "macros" }
         MACROS_OK,
     );
     let err = workspace_version(tmp.path()).unwrap_err().to_string();
-    assert!(err.contains("skuld-macros dep pin"), "unexpected error: {err}");
+    assert!(
+        err.contains("is pinned '=0.0.9', expected '=0.1.0'"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -429,4 +433,62 @@ fn integration_prerelease_ignored() {
     git(tmp.path(), &["tag", "v1.0.0-beta"]);
     let nearest = nearest_ancestor_version_tags(tmp.path()).unwrap();
     assert_eq!(tag_name_set(&nearest), vec!["v0.9.0".to_string()]);
+}
+
+// Intra-workspace pin checks ==========================================================================================
+
+fn member(name: &str, deps: &[(&str, toml::Value)]) -> MemberInfo {
+    MemberInfo {
+        path: format!("{name}/Cargo.toml"),
+        name: name.to_string(),
+        dependencies: deps.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+    }
+}
+
+#[test]
+fn dep_version_req_reads_both_declaration_forms() {
+    assert_eq!(
+        dep_version_req(&toml::Value::String("=1.2.3".into())),
+        Some("=1.2.3".into())
+    );
+    let mut t = toml::value::Table::new();
+    t.insert("version".into(), toml::Value::String("=1.2.3".into()));
+    t.insert("path".into(), toml::Value::String("..".into()));
+    assert_eq!(dep_version_req(&toml::Value::Table(t)), Some("=1.2.3".into()));
+}
+
+#[test]
+fn a_path_only_dependency_declares_no_requirement() {
+    let mut t = toml::value::Table::new();
+    t.insert("path".into(), toml::Value::String("..".into()));
+    assert_eq!(dep_version_req(&toml::Value::Table(t)), None);
+}
+
+#[test]
+fn an_exact_pin_on_a_sibling_passes() {
+    let members = vec![
+        member("lib", &[]),
+        member("cli", &[("lib", toml::Value::String("=1.2.3".into()))]),
+    ];
+    assert!(assert_intra_workspace_pins(&members, &v("1.2.3")).is_ok());
+}
+
+#[test]
+fn a_loose_pin_on_a_sibling_is_rejected() {
+    // The gap this check exists to close: a loose pin builds and tests fine
+    // against the path dependency, so nothing else in the pipeline catches it.
+    let members = vec![
+        member("lib", &[]),
+        member("cli", &[("lib", toml::Value::String("1.2".into()))]),
+    ];
+    let err = assert_intra_workspace_pins(&members, &v("1.2.3"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("pinned '1.2'"), "{err}");
+}
+
+#[test]
+fn a_dependency_outside_the_workspace_is_not_constrained() {
+    let members = vec![member("lib", &[("serde", toml::Value::String("1".into()))])];
+    assert!(assert_intra_workspace_pins(&members, &v("1.2.3")).is_ok());
 }
