@@ -8,8 +8,18 @@ Releases go through two GitHub Actions workflows. Both are triggered by hand —
 
 - `Cargo.toml`, `macros/Cargo.toml` and `cargo-skuld/Cargo.toml` already have the intended release version (say `X.Y.Z`) on `main`, and the exact pins between them match it. `cargo xtask version --check --exact` enumerates workspace members dynamically, so it validates version agreement and every intra-workspace `=` pin across all three.
 - You have the GitHub CLI (`gh`) authenticated for the `bindreams/skuld` repo.
-- **For recovery only:** a personal crates.io token with the `yank` scope on all three crates, via `cargo login` or `cargo yank --token`. The `Deploy` token cannot yank — `publish-new`/`publish-update` do not grant that scope, and it lives in a GitHub Environment secret rather than on your machine. Without this, the first command of either partial-publish recovery fails on authentication.
-- A `Deploy` GitHub Environment is configured with a `CARGO_REGISTRY_TOKEN` scoped to `skuld` + `skuld-macros` + `cargo-skuld` with `publish-new` + `publish-update` permissions. A token scoped to only the first two cannot publish `cargo-skuld` — a second blocker that would have stopped the publish even once the command included it.
+- **For recovery only:** a personal crates.io token with the `yank` scope on every publishable member, via `cargo login` or `cargo yank --token`. Publishing no longer uses a token at all, so there is none to borrow. Without this, the first command of either partial-publish recovery fails on authentication.
+- Every publishable member has a **trusted publisher** configured on crates.io — GitHub, owner `bindreams`, repository `skuld`, workflow `publish-release.yaml`, environment `Deploy`. Stage 2 mints a short-lived token by OIDC and carries no long-lived secret. All four fields are matched exactly, so both the workflow **filename** and the environment name are load-bearing: renaming the file or dropping `environment: Deploy` breaks publishing, and neither is visible until the irreversible step.
+
+### Adding a publishable member
+
+A crate that does not exist on crates.io **cannot** have a trusted publisher configured, so stage 2 cannot publish it. Its first release is manual, once:
+
+1. **Before** bumping the workspace, publish it by hand at the **currently released** version `X.Y.(Z-1)`, with a temporary token scoped to that crate with `publish-new` (`cargo publish -p <crate> --locked`). Publishing it at the version you are about to release would leave stage 2 seeing one member published and the rest absent.
+2. Configure its trusted publisher with the four fields above, then **confirm it is listed** under the crate's Settings → Trusted Publishing. Nothing automated can check this: crates.io exposes no unauthenticated way to read a publisher config, so a missing one is invisible until stage 2 gets a 403 on that member — and since it publishes last, the others will already be up.
+3. Revoke the temporary token, once a release has gone out through stage 2.
+
+`draft-release.yaml` fails on any member that has never been published, which catches step 1 being skipped. It cannot catch step 2 being skipped — it verifies the crate exists, not that a publisher is configured for it.
 
 ### Stage 1 — Draft Release
 
@@ -57,6 +67,8 @@ This workflow:
 
 ### Recovery
 
+**Check the job summary first.** A red run whose summary says `RELEASE COMPLETE` is a finished release: the failure came from a post step that runs after the flip — most often the auth action revoking its short-lived token. Take no action: do not yank, bump, or re-dispatch. Everything below applies only to runs _without_ that marker.
+
 Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` — and `cargo publish` is not atomic, so a server-side error part-way through leaves the workspace partially published.
 
 **First, establish which state you are in.** The workflow log says where it stopped; the registry is authoritative. Use the sparse index, which needs no `User-Agent` — the crates.io JSON API answers `403` with an empty body to curl's default one, and `curl -s` without `--fail` exits `0`, so a bare query looks identical to "nothing published":
@@ -81,7 +93,7 @@ The member list is derived rather than written out, so it stays right as the wor
 
 **Nothing published** (every crate `absent`, none `YANKED`). crates.io is untouched and there is nothing to undo. What to do next depends on why it stopped:
 
-- _Environmental_ (token expired or mis-scoped, registry outage): fix it and re-run **stage 2** with the same version.
+- _Environmental_ (registry outage, or the job hitting its 15-minute timeout): fix it and re-run **stage 2** with the same version.
 - _Tree_ (packaging, verification, or the version re-check): stage 2 checks out the draft's pinned commit, so re-running replays the identical failure. Delete the draft with `gh release delete "vX.Y.Z" --yes`, push the fix, then re-run **stage 1** and stage 2. Stage 1 refuses to create a draft while a release with that tag exists, which is why the delete comes first.
 
 **Only `skuld-macros` published:**
