@@ -32,6 +32,7 @@ jobs:
 
       - name: Normalize and validate version
         id: version
+        timeout-minutes: 5
         # inputs.version is passed via env to avoid shell injection on
         # interpolation. GitHub's actionlint specifically flags direct
         # ${{ inputs.* }} interpolation in run: blocks.
@@ -46,14 +47,19 @@ jobs:
           # release — two runs of the same publish, in parallel, on an operation
           # that cannot be undone. One accepted spelling keeps key and meaning
           # in step.
-          if ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Invalid version: '${INPUT_VERSION}'. Use bare semver (1.2.3), with no leading 'v'."
+          # Leading zeros are rejected too: `01.2.3` is not valid semver, so
+          # `semver::Version::parse` fails on it and xtask's tag map silently
+          # skips such a tag — the one check tying input to manifest would
+          # no-op for exactly those spellings.
+          if ! [[ "$INPUT_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Invalid version: '${INPUT_VERSION}'. Expected three dot-separated numbers with no leading zeros, no leading 'v', and no pre-release or build suffix (e.g. 1.2.3)."
             exit 1
           fi
           V="$INPUT_VERSION"
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Fail if release tag already exists
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -101,6 +107,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
 
       - name: Dry-run publish workspace
+        timeout-minutes: 30
         # cargo 1.90+ dry-runs multi-package publishes in topological order.
         #
         # Verification stays on. Multi-package publishing — `--workspace` or
@@ -124,20 +131,40 @@ jobs:
       # exits 0, so without this check a re-dispatch of a published version
       # passes stage 1 and fails part-way through the irreversible upload.
       - name: Check crates.io state for every publishable member
+        timeout-minutes: 10
         env:
-          VERSION: ${{ needs.validate.outputs.version }}
+          INPUT_VERSION: ${{ needs.validate.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          # Read the member list into a variable rather than feeding the loop
-          # from a process substitution: `done < <(cargo metadata | jq)` discards
-          # the exit status of both commands, so a failure there would run the
-          # loop zero times and report every member as fine — this gate failing
-          # open in the stage that exists to catch exactly that. An assignment
-          # propagates the status and `set -e` stops.
-          members=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
+          # Read the member list into a variable rather than feeding a loop from
+          # a process substitution: `< <(cargo metadata | jq)` discards the exit
+          # status of both commands, so a failure there would run the loop zero
+          # times and report every member as fine — this gate failing open in
+          # the stage that exists to catch exactly that.
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          members=$(printf '%s' "$metadata" | jq -r '.packages[] | select(.publish != []) | .name')
           if [ -z "$members" ]; then
             echo "::error::No publishable workspace members found. Expected at least one."
+            exit 1
+          fi
+
+          # The version that gets uploaded is the manifest's, not the operator's
+          # input, and the two can differ: `cargo xtask version --check --exact`
+          # is satisfied by ANY version tag on HEAD, so when main already carries
+          # the last release tag it accepts a mistyped input. Checking the input
+          # would then clear a version nobody is publishing while the one cargo
+          # actually uploads goes unchecked.
+          versions=$(printf '%s' "$metadata" | jq -r '.packages[] | select(.publish != []) | .version' | sort -u)
+          version_count=$(printf '%s\n' "$versions" | wc -l)
+          if [ "$version_count" -ne 1 ]; then
+            version_list=$(printf '%s' "$versions" | tr '\n' ' ')
+            echo "::error::Publishable members disagree on version: ${version_list}"
+            exit 1
+          fi
+          VERSION="$versions"
+          if [ "$VERSION" != "$INPUT_VERSION" ]; then
+            echo "::error::Input version ${INPUT_VERSION} does not match the workspace manifest version ${VERSION}; cargo would publish ${VERSION}. Bump the manifests, or re-dispatch with ${VERSION}."
             exit 1
           fi
 
@@ -147,22 +174,28 @@ jobs:
             [ -n "$c" ] || continue
             path=$(.github/scripts/crate-index-path.sh "$c")
 
-            # `curl -f` collapses "404, never published" into the same non-zero
-            # exit as "the network broke", and the two need opposite handling: a
-            # blip must not announce a first publish and block the release, and
-            # this gate has no override to fall back on. `-f` also treats a 3xx
-            # as success, which would read a redirect as "published".
-            #
-            # curl writes its own `%{http_code}` (`000`) even when the transfer
-            # fails, so the fallback must not add a second one — that produced
-            # `000000`, which is not a status anyone can look up.
-            out=$(curl -s -w '\n%{http_code}' --retry 3 --retry-all-errors \
-              --max-time 30 -X GET "https://index.crates.io/$path") || out="${out:-000}"
-            code=$(printf '%s\n' "$out" | tail -n 1)
+            # Branch on curl's exit status, not on the status code it wrote.
+            # curl emits `%{http_code}` even when the transfer fails, and once
+            # response headers have arrived that value is 200 — so a connection
+            # cut mid-body yields "200" plus a SHORT body. The index lists
+            # versions in publication order, which puts the one being checked on
+            # the last line: exactly what a truncation drops. Trusting the
+            # written code would clear a version that is in fact taken.
+            if out=$(curl -sS --retry 3 --retry-all-errors --max-time 30 \
+                -w '\n%{http_code}' -X GET "https://index.crates.io/$path"); then
+              code=$(printf '%s\n' "$out" | tail -n 1)
+            else
+              code="000"
+            fi
 
+            # `-f` would collapse "404, never published" into the same non-zero
+            # exit as a network failure, and the two need opposite handling; it
+            # also treats a 3xx as success, reading a redirect as "published".
             case "$code" in
               200)
-                if printf '%s\n' "$out" | grep -q "\"vers\":\"${VERSION}\""; then
+                # -F: the version is a literal, and an unescaped `.` would match
+                # any character.
+                if printf '%s\n' "$out" | grep -qF "\"vers\":\"${VERSION}\""; then
                   taken+=("$c")
                 fi
                 ;;
