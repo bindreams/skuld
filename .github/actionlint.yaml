@@ -1,7 +1,0 @@
-# `windows-11-arm` is a real GitHub-hosted runner — the `Test (windows/arm64)`
-# leg has been green on it every run — but actionlint's built-in label list
-# has not caught up. Declaring it here silences the false positive without
-# disabling the runner-label check, which is worth keeping for genuine typos.
-self-hosted-runner:
-  labels:
-    - windows-11-arm

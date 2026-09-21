@@ -1,0 +1,14 @@
+# Two checks that shellcheck leaves optional, both of which this repo's release
+# pipeline has actually tripped over:
+#
+#   SC2249  a `case` with no default arm — an unmatched value falls through
+#           silently, which in a publish guard means a member classified as
+#           neither published nor absent.
+#   SC2312  a return value masked by a command substitution or process
+#           substitution — `set -e` does not see through either, so a script
+#           that refuses is read by its caller as one that succeeded.
+#
+# actionlint runs shellcheck with `--norc`, so this file does not apply to
+# workflow `run:` blocks. The Lint job passes the same options through
+# SHELLCHECK_OPTS; keep the two in step.
+enable=add-default-case,check-extra-masked-returns

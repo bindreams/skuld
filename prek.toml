@@ -72,21 +72,33 @@ hooks = [
 ]
 
 [[repos]]
-# The release pipeline is shell — two scripts plus embedded `run:` blocks —
-# and it gates the only irreversible operation in the repo. Nothing checked
-# it until now, and its failure modes are the quiet ones: a discarded exit
-# status, an unquoted expansion, a `case` with no default arm.
-repo = "https://github.com/koalaman/shellcheck-precommit"
-rev = "v0.11.0"
+# The release pipeline gates the only irreversible operation in the repo and
+# nothing checked its shell until now. Two of its historical failure modes —
+# a `case` with no default arm (SC2249) and a return masked by `< <(...)`
+# (SC2312) — are *optional* in shellcheck, so they are enabled in
+# `.shellcheckrc` rather than left to the defaults.
+#
+# shellcheck-py rather than the upstream Docker hook: this is a Rust repo and
+# a Docker daemon is a heavy thing to require of anyone running `prek` on a
+# staged shell script.
+repo = "https://github.com/shellcheck-py/shellcheck-py"
+rev = "v0.11.0.1"
 hooks = [
   { id = "shellcheck" },
 ]
 
 [[repos]]
-# Catches what shellcheck cannot see: workflow syntax, expression errors, and
-# `run:` blocks it extracts and shells out to shellcheck for.
+# Workflow syntax and expression errors, plus `run:` blocks, which actionlint
+# extracts and shells out to shellcheck for — conditional on shellcheck being
+# on PATH. actionlint disables that rule with only a verbose-only note when it
+# is missing, so CI installs shellcheck explicitly rather than relying on the
+# runner image happening to ship one.
+#
+# actionlint invokes shellcheck with `--norc`, so `.shellcheckrc` does not
+# reach `run:` blocks; the Lint job passes the same options via
+# SHELLCHECK_OPTS. The two levers must be kept in step.
 repo = "https://github.com/rhysd/actionlint"
-rev = "v1.7.7"
+rev = "v1.7.12"
 hooks = [
   { id = "actionlint" },
 ]
