@@ -123,11 +123,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          mapfile -t members < <(./.github/scripts/publishable-members.sh)
+          # Command substitution, not `mapfile < <(...)`: process substitution
+          # discards the script's exit status, so a fail-closed refusal inside
+          # it would arrive here as an empty list and read as "nothing to do".
+          members=$(./.github/scripts/publishable-members.sh)
+
           published=0
           absent=0
-          for c in "${members[@]}"; do
-            case "$(./.github/scripts/crate-state.sh "$c" "$VERSION")" in
+          total=0
+          for c in $members; do
+            total=$((total + 1))
+            # Likewise `$(...)` in an assignment, so a refusal aborts the step.
+            state=$(./.github/scripts/crate-state.sh "$c" "$VERSION")
+            case "$state" in
               published) published=$((published + 1)) ;;
               absent)    absent=$((absent + 1)) ;;
               yanked)
@@ -135,17 +143,23 @@ jobs:
                 echo "::error::Re-running cannot fix this. Follow the Recovery section of CONTRIBUTING.md (bump path)."
                 exit 1
                 ;;
+              *)
+                echo "::error::Unrecognized state '$state' for $c — refusing to continue."
+                exit 1
+                ;;
             esac
           done
 
-          if [ "$absent" -eq 0 ]; then
+          # Compared against the member count, not against zero: "absent is 0"
+          # would also be true if members went uncounted.
+          if [ "$published" -eq "$total" ]; then
             echo "already_published=true" >> "$GITHUB_OUTPUT"
-            echo "All ${#members[@]} members are already at ${VERSION}; skipping publish and finishing the release."
-          elif [ "$published" -eq 0 ]; then
+            echo "All $total members are already at ${VERSION}; skipping publish and finishing the release."
+          elif [ "$absent" -eq "$total" ]; then
             echo "already_published=false" >> "$GITHUB_OUTPUT"
-            echo "None of the ${#members[@]} members are at ${VERSION}; publishing."
+            echo "None of the $total members are at ${VERSION}; publishing."
           else
-            echo "::error::Partial publish: $published of ${#members[@]} members are at ${VERSION}."
+            echo "::error::Partial publish: $published of $total members are at ${VERSION}."
             echo "::error::Re-running cannot fix this. Follow the Recovery section of CONTRIBUTING.md."
             exit 1
           fi
@@ -173,3 +187,10 @@ jobs:
           set -euo pipefail
           gh release edit "$TAG" --draft=false
           echo "Release published: https://github.com/${REPO}/releases/tag/$TAG"
+
+          # Completion marker. `crates-io-auth-action`'s post step revokes the
+          # minted token and fails the job if that revoke fails — after every
+          # regular step, so after this one. A red run carrying this marker is
+          # a finished release: take no action. A red run without it stopped
+          # somewhere above, and Recovery in CONTRIBUTING.md applies.
+          echo "RELEASE COMPLETE: $TAG published to crates.io and GitHub. If this run is red, the failure came after this point and the release is done." >> "$GITHUB_STEP_SUMMARY"

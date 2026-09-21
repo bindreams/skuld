@@ -113,15 +113,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t members < <(./.github/scripts/publishable-members.sh)
-          new=()
-          for c in "${members[@]}"; do
-            [ "$(./.github/scripts/crate-state.sh "$c")" = "never-published" ] && new+=("$c")
+          members=$(./.github/scripts/publishable-members.sh)
+          new=""
+          for c in $members; do
+            # `$(...)` in an assignment so a refusal aborts rather than being
+            # compared as an empty string and silently passing.
+            state=$(./.github/scripts/crate-state.sh "$c")
+            case "$state" in
+              exists) ;;
+              never-published) new="$new $c" ;;
+              *) echo "::error::Unrecognized state '$state' for $c — refusing to continue."; exit 1 ;;
+            esac
           done
-          if [ ${#new[@]} -eq 0 ]; then
-            echo "All ${#members[@]} publishable members already exist on crates.io."
+          if [ -z "$new" ]; then
+            echo "Every publishable member already exists on crates.io."
           else
-            echo "::error::Never published: ${new[*]}. Stage 2 authenticates by trusted publishing, and a crate that does not exist cannot have a publisher configured — so it cannot publish these."
+            echo "::error::Never published:$new. Stage 2 authenticates by trusted publishing, and a crate that does not exist cannot have a publisher configured — so it cannot publish these."
             echo "::error::Follow \"Adding a publishable member\" in CONTRIBUTING.md, then re-run."
             exit 1
           fi

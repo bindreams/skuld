@@ -70,7 +70,7 @@ This workflow:
 
 Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` — and `cargo publish` is not atomic, so a server-side error part-way through leaves the workspace partially published.
 
-**First, establish which state you are in.** The workflow log says where it stopped; the registry is authoritative. Use the sparse index, which needs no `User-Agent` — the crates.io JSON API answers `403` with an empty body to curl's default one, and `curl -s` without `--fail` exits `0`, so a bare query looks identical to "nothing published":
+**First, establish which state you are in.** The workflow log says where it stopped; the registry is authoritative. These are the same scripts both release guards use, so the classification here is exactly the one that gated the publish:
 
 ```sh
 for c in $(./.github/scripts/publishable-members.sh); do
@@ -81,6 +81,8 @@ done
 These are the same scripts both release workflows use, so the classification here is exactly the one that gated the publish. They refuse rather than guess: a failed query is never reported as `absent`, because the recovery for `absent` is `cargo yank`, which spends the version slot permanently.
 
 **Any `YANKED` means the version slot is gone.** crates.io reserves a version permanently on publish; yanking hides it but never frees it, so stage 2 can never succeed at that version again. Go to the bump path below regardless of what the other crates report — stage 2 refuses a yanked member for the same reason.
+
+**A red run whose summary says `RELEASE COMPLETE`.** The release finished; the failure came afterwards, when the auth action revoked its short-lived token. Take no action — do not yank, bump, or re-dispatch. Only runs _without_ that marker need anything below.
 
 **Nothing published** (every crate `absent`, none `YANKED`). crates.io is untouched and there is nothing to undo. What to do next depends on why it stopped:
 
@@ -112,7 +114,7 @@ SHA=$(gh release view "vX.Y.Z" --json targetCommitish -q .targetCommitish) &&
 
 The tag has to be created by hand because only the final GitHub-release flip creates it, and that never ran — so the newest tag is still `vX.Y.(Z-1)` and `cargo xtask version --check` would reject `X.Y.Z+1` as a two-step jump, blocking the bump commit both locally and in Lint.
 
-Then bump every publishable member's manifest to `X.Y.Z+1` (`cargo metadata` above lists them; today that is `Cargo.toml`, `macros/Cargo.toml` and `cargo-skuld/Cargo.toml`), fix the root cause, and re-run both workflows with the new version. Because the bump is lockstep, `cargo-skuld` then has no `X.Y.Z` at all — a gap in its version line is the accepted cost of a shared workspace version, not a problem to work around.
+Then bump every publishable member's manifest to `X.Y.Z+1` (the script above lists them; today that is `Cargo.toml`, `macros/Cargo.toml` and `cargo-skuld/Cargo.toml`), fix the root cause, and re-run both workflows with the new version. Because the bump is lockstep, `cargo-skuld` then has no `X.Y.Z` at all — a gap in its version line is the accepted cost of a shared workspace version, not a problem to work around.
 
 **All three published.** Whatever failed afterwards — the GitHub-release flip, or `cargo publish` itself during the index-visibility wait — nothing is wrong on crates.io. Do **not** yank, and do **not** bump: the release is complete apart from its tag.
 
