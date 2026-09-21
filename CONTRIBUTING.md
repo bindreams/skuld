@@ -38,6 +38,7 @@ This workflow:
 - Validates the input version and checks `Cargo.toml` versions agree (via `cargo xtask version --check --exact`).
 - Runs the full CI matrix (lint + 6-platform tests) against the release commit.
 - Runs `cargo publish --workspace --dry-run`, covering every publishable member.
+- Checks crates.io for every publishable member: that each one already exists (a crate that does not cannot have a trusted publisher, so stage 2 could never publish it), and that the version about to be released is **not already taken**. The dry-run above does not catch the latter — it warns "already exists on crates.io" and still exits `0`. The version checked is the one in the manifests, which is also asserted to equal the dispatched input.
 - Creates a **draft** GitHub release pinned to the exact commit SHA.
 
 Review the draft at:
@@ -65,7 +66,8 @@ This workflow:
 - Re-verifies the draft release exists and is pinned to a valid commit SHA.
 - Checks out that commit.
 - Re-runs `cargo xtask version --check --exact` against the checked-out tree.
-- Publishes every publishable member to crates.io in one `cargo publish --workspace --locked` command (cargo handles topological ordering and index-visibility waiting, and skips `publish = false` members). Deliberately not a hand-written `-p` list.
+- Packages and verify-builds the publishable members, **before** minting the token. `cargo publish` would otherwise run that build inside the credential's ~30-minute life, and a cold build can consume most of it — expiring the token between uploads, which is a partial publish. The member list comes from `cargo metadata` rather than `--workspace`, which would also package `publish = false` members: a superset that both lengthens this build and enforces packaging rules on crates that are never packaged.
+- Publishes them with `cargo publish --workspace --locked --no-verify` (cargo handles topological ordering and index-visibility waiting, and skips `publish = false` members). Deliberately not a hand-written `-p` list. `--no-verify` is safe only because the step above just did that verification over exactly this member set.
 - Flips the GitHub release from draft to published, which creates the `vX.Y.Z` git tag.
 
 ### Recovery
@@ -76,7 +78,7 @@ Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` �
 
 **First, establish which state you are in.** The workflow log says where it stopped; the registry is authoritative. Use the sparse index, which needs no `User-Agent` — the crates.io JSON API answers `403` with an empty body to curl's default one.
 
-The snippet reads the status code separately from the body, and that is why it does not use `--fail`. `curl -s` alone exits `0` whatever the server said, so judging by the body only cannot tell a 404 from a 503; `--fail` collapses them the other way, into one non-zero exit. Either way a transient error reads as "absent", which reports an untouched registry and routes you into re-running stage 2 at a version that is in fact already taken. `%{http_code}` is what separates them. Any `UNKNOWN` line means re-run the check rather than act on it. The block runs in a subshell so a refusal cannot close your terminal.
+The snippet reads the status code separately from the body, and that is why it does not use `--fail`. `curl -s` alone exits `0` whatever the server said, so judging by the body only cannot tell a 404 from a 503; `--fail` collapses them the other way, into one non-zero exit. Either way a transient error reads as "absent", which reports an untouched registry and routes you into re-running stage 2 at a version that is in fact already taken. Reading `%{http_code}` is necessary but not sufficient: curl writes that value even when the transfer fails, and once response headers have arrived it reads `200`, so a connection cut mid-body yields `200` with a short body. The index lists versions in publication order, so the one you are asking about is the last line — exactly what a truncation drops. The snippet therefore branches on curl's **exit status** and only trusts the code when the transfer completed. Any `UNKNOWN` line means re-run the check rather than act on it. The block runs in a subshell so a refusal cannot close your terminal.
 
 ```bash
 (
@@ -98,10 +100,13 @@ for c in $members; do
   # where a crate lives in the index.
   path=$(.github/scripts/crate-index-path.sh "$c") || exit 1
 
-  out=$(curl -s -w '\n%{http_code}' --retry 3 --retry-all-errors --max-time 30 \
-    -X GET "https://index.crates.io/$path")
-  code=$(printf '%s\n' "$out" | tail -n 1)
-  line=$(printf '%s\n' "$out" | grep "\"vers\":\"$V\"" || true)
+  if out=$(curl -sS -w '\n%{http_code}' --retry 3 --retry-all-errors --max-time 30 \
+      -X GET "https://index.crates.io/$path"); then
+    code=$(printf '%s\n' "$out" | tail -n 1)
+  else
+    code=000   # transfer failed; the body may be truncated, so do not read it
+  fi
+  line=$(printf '%s\n' "$out" | grep -F "\"vers\":\"$V\"" || true)
 
   if [ "$code" != "200" ] && [ "$code" != "404" ]; then
     printf '%-14s %s: UNKNOWN (HTTP %s) — do not act on this line\n' "$c" "$V" "$code"
@@ -116,7 +121,7 @@ done
 )
 ```
 
-The member list is derived rather than written out, so it stays right as the workspace grows — recovery always runs from a checkout, so `cargo metadata` is available.
+The member list is derived rather than written out, so it stays right as the workspace grows. **Run this from the repository root**: it invokes `.github/scripts/crate-index-path.sh` by a root-relative path — the same helper the release workflow uses, so the two cannot disagree about where a crate lives in the index.
 
 **Any `YANKED` means the version slot is gone.** crates.io reserves a version permanently on publish; yanking hides it but never frees it, so stage 2 can never succeed at that version again. Go to the bump path below regardless of what the other crates report. If a crate reads `absent` immediately after a successful-looking upload, wait a minute and re-check before yanking anything — index propagation lags.
 
