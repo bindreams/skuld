@@ -7,11 +7,6 @@ on:
         description: "Release version (e.g. 1.0.0)"
         required: true
         type: string
-      first-publish-ok:
-        description: "Acknowledge that a member is publishing for the first time (its crate scope must be on the Deploy token)"
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   group: draft-release-${{ inputs.version }}
@@ -117,7 +112,6 @@ jobs:
       - name: Flag first-time publishes
         env:
           VERSION: ${{ inputs.version }}
-          ACK: ${{ inputs.first-publish-ok }}
         shell: bash
         run: |
           set -euo pipefail
@@ -128,10 +122,9 @@ jobs:
           done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
           if [ ${#new[@]} -eq 0 ]; then
             echo "All publishable members already exist on crates.io."
-          elif [ "$ACK" = "true" ]; then
-            echo "::notice::First publish for: ${new[*]} — acknowledged."
           else
-            echo "::error::First publish for: ${new[*]}. These cannot be published by stage 2 — see \"Adding a publishable member\" in CONTRIBUTING.md. Once handled, re-run with first-publish-ok=true."
+            echo "::error::Never published: ${new[*]}. Stage 2 authenticates by trusted publishing, and a crate that does not exist cannot have a publisher configured — so it cannot publish these."
+            echo "::error::Follow \"Adding a publishable member\" in CONTRIBUTING.md, then re-run. No flag is needed: once the crate exists, this check passes on its own."
             exit 1
           fi
 

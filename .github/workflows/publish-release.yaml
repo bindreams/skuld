@@ -16,6 +16,9 @@ jobs:
   publish:
     name: Verify and publish
     runs-on: ubuntu-latest
+    # The minted token lives 30 minutes; a stalled index-visibility wait would
+    # otherwise fail mid-publish with no budget left to retry.
+    timeout-minutes: 15
     # The Deploy environment is named in each crate's crates.io trusted-publisher
     # config, so the OIDC token minted below is only accepted from a run that
     # declares it. It also enforces any environment protection rules (required
@@ -105,31 +108,58 @@ jobs:
       # — fails again on "crate version already exists", so a finished release
       # looks broken twice. The sparse index is used rather than the JSON API
       # because the latter answers 403 to a request without a User-Agent.
+      # `crates-io-auth-action`'s post step can fail the job after the publish
+      # already succeeded. Without this check the obvious response — re-dispatch
+      # — fails again on "crate version already exists", so a finished release
+      # looks broken twice.
+      #
+      # Every branch fails closed. The release-flip step below carries no `if:`,
+      # so a wrong "already published" verdict would create the tag having
+      # published nothing — and an empty member list or a failed query must
+      # never reach that conclusion. The JSON API is used rather than the sparse
+      # index because the index is CDN-cached for 600s, and this check runs
+      # seconds after a publish; it needs a User-Agent, which the index does not.
       - name: Check whether this version is already on crates.io
         id: crates_check
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          CRATES_UA: "skuld-release-pipeline (https://github.com/bindreams/skuld)"
         shell: bash
         run: |
           set -euo pipefail
-          published=0 absent=0 names=""
-          while read -r c; do
-            names="$names $c"
-            prefix=$(printf '%s' "$c" | sed -E 's|^(..)(..).*|\1/\2|')
-            if curl -sfX GET "https://index.crates.io/$prefix/$c" | grep -q "\"vers\":\"${VERSION}\""; then
-              published=$((published + 1))
-            else
-              absent=$((absent + 1))
-            fi
-          done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
+
+          mapfile -t members < <(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.publish != []) | .name')
+          if [ "${#members[@]}" -eq 0 ]; then
+            echo "::error::No publishable workspace members found — refusing to guess."
+            exit 1
+          fi
+
+          published=0
+          absent=0
+          for c in "${members[@]}"; do
+            code=$(curl -sL -A "$CRATES_UA" -o /dev/null -w "%{http_code}" \
+              --retry 3 --retry-all-errors --max-time 30 \
+              "https://crates.io/api/v1/crates/${c}/${VERSION}")
+            case "$code" in
+              200) published=$((published + 1)) ;;
+              404) absent=$((absent + 1)) ;;
+              *)
+                echo "::error::Unexpected HTTP $code from crates.io for $c ${VERSION}."
+                echo "::error::Cannot tell whether this version is published; refusing to continue."
+                exit 1
+                ;;
+            esac
+          done
 
           if [ "$absent" -eq 0 ]; then
             echo "already_published=true" >> "$GITHUB_OUTPUT"
-            echo "All of$names are already at ${VERSION}; skipping publish and finishing the release."
+            echo "All ${#members[@]} members are already at ${VERSION}; skipping publish and finishing the release."
           elif [ "$published" -eq 0 ]; then
             echo "already_published=false" >> "$GITHUB_OUTPUT"
+            echo "None of the ${#members[@]} members are at ${VERSION}; publishing."
           else
-            echo "::error::Partial publish: $published of $((published + absent)) members are at ${VERSION}."
+            echo "::error::Partial publish: $published of ${#members[@]} members are at ${VERSION}."
             echo "::error::Re-running cannot fix this. Follow the Recovery section of CONTRIBUTING.md."
             exit 1
           fi

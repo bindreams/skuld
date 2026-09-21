@@ -15,11 +15,11 @@ Releases go through two GitHub Actions workflows. Both are triggered by hand —
 
 A crate that does not exist on crates.io **cannot** have a trusted publisher configured, so stage 2 cannot publish it. Its first release is manual, once:
 
-1. Publish it by hand with a temporary token scoped to that crate with `publish-new` (`cargo publish -p <crate> --locked`), at the same version as the rest of the workspace.
+1. **Before** bumping the workspace, publish it by hand at the **currently released** version `X.Y.(Z-1)`, with a temporary token scoped to that crate with `publish-new` (`cargo publish -p <crate> --locked`). Publishing it at the version you are about to release would leave stage 2 seeing one member published and the rest absent — which it correctly refuses as a partial publish, blocking the release.
 2. Configure its trusted publisher with the four fields above.
 3. Revoke the temporary token.
 
-From then on it rides the normal flow. `draft-release.yaml` detects first-time publishes and fails unless dispatched with `first-publish-ok=true`, so this cannot be discovered halfway through an irreversible stage 2.
+From then on it rides the normal flow. `draft-release.yaml` fails on any member that has never been published, so this cannot be discovered halfway through an irreversible stage 2. There is no override — once the crate exists the check passes by itself.
 
 ### Stage 1 — Draft Release
 
@@ -45,7 +45,7 @@ https://github.com/bindreams/skuld/releases
 
 Check the generated release notes, edit if needed. Do **not** manually publish the draft — stage 2 handles that.
 
-> **Before running stage 2**, confirm the `Deploy` token's crate scope includes every publishable member. `--dry-run` never authenticates, so nothing has verified the scope up to this point, and a new crate publishes **last** — a scope miss lands the maximum-damage partial state.
+> Stage 2 mints its own short-lived token by OIDC, so there is no scope to confirm — but the trusted-publisher config matches the workflow **filename** and the **environment** exactly. Renaming `publish-release.yaml` or dropping `environment: Deploy` breaks publishing, and neither is visible until the irreversible step.
 
 ### Stage 2 — Publish Release
 
@@ -62,6 +62,7 @@ This workflow:
 - Re-verifies the draft release exists and is pinned to a valid commit SHA.
 - Checks out that commit.
 - Re-runs `cargo xtask version --check --exact` against the checked-out tree.
+- Checks whether the version is already on crates.io and skips the publish if every member is, so a re-dispatch after a post-publish failure completes the release instead of failing on "version already exists". A partial state is refused rather than guessed at.
 - Publishes every publishable member to crates.io in one `cargo publish --workspace --locked` command (cargo handles topological ordering and index-visibility waiting, and skips `publish = false` members). Deliberately not a hand-written `-p` list.
 - Flips the GitHub release from draft to published, which creates the `vX.Y.Z` git tag.
 
@@ -91,7 +92,7 @@ The member list is derived rather than written out, so it stays right as the wor
 
 **Nothing published** (every crate `absent`, none `YANKED`). crates.io is untouched and there is nothing to undo. What to do next depends on why it stopped:
 
-- _Environmental_ (token expired or mis-scoped, registry outage): fix it and re-run **stage 2** with the same version.
+- _Environmental_ (registry outage, or the minted token expiring on a stalled run): fix it and re-run **stage 2** with the same version.
 - _Tree_ (packaging, verification, or the version re-check): stage 2 checks out the draft's pinned commit, so re-running replays the identical failure. Delete the draft with `gh release delete "vX.Y.Z" --yes`, push the fix, then re-run **stage 1** and stage 2. Stage 1 refuses to create a draft while a release with that tag exists, which is why the delete comes first.
 
 **Only `skuld-macros` published:**
