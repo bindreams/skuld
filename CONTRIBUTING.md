@@ -10,6 +10,7 @@ Releases go through two GitHub Actions workflows. Both are triggered by hand —
 - You have the GitHub CLI (`gh`) authenticated for the `bindreams/skuld` repo.
 - **For recovery only:** a personal crates.io token with the `yank` scope on every publishable member, via `cargo login` or `cargo yank --token`. Publishing mints its own short-lived token inside the job, so there is none to borrow. Without this, the first command of either partial-publish recovery fails on authentication.
 - Every publishable member has a **trusted publisher** configured on crates.io — GitHub, owner `bindreams`, repository `skuld`, workflow `publish-release.yaml`, environment `Deploy`. Stage 2 mints a short-lived token by OIDC and carries no long-lived secret. All four fields are matched exactly, so both the workflow **filename** and the environment name are load-bearing: renaming the file or dropping `environment: Deploy` breaks publishing, and neither is visible until the irreversible step.
+- The `Deploy` environment has a **deployment branch policy limiting it to `main`**. A trusted-publisher config has no ref field — it matches only the four values above — so GitHub's branch policy is the one place a ref restriction can live. Without it, any branch carrying this workflow filename and environment name can mint a token valid for all three crates and publish from unreviewed code, going around `main`'s protection. Set it under Settings → Environments → Deploy → Deployment branches.
 
 ### Adding a publishable member
 
@@ -76,18 +77,36 @@ Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` �
 **First, establish which state you are in.** The workflow log says where it stopped; the registry is authoritative. Use the sparse index, which needs no `User-Agent` — the crates.io JSON API answers `403` with an empty body to curl's default one, and `curl -s` without `--fail` exits `0`, so a bare query looks identical to "nothing published":
 
 ```sh
+V=X.Y.Z   # the version you were publishing — the only thing to edit
+
 for c in $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name'); do
-  prefix=$(printf '%s' "$c" | sed -E 's|^(..)(..).*|\1/\2|')
-  line=$(curl -sfX GET "https://index.crates.io/$prefix/$c" | grep '"vers":"X.Y.Z"')
-  if [ -z "$line" ]; then
-    printf '%-14s X.Y.Z: absent\n' "$c"
+  # Index paths encode the name's length and are lowercased.
+  lc=$(printf '%s' "$c" | tr '[:upper:]' '[:lower:]')
+  case ${#lc} in
+    1) prefix="1" ;;
+    2) prefix="2" ;;
+    3) prefix="3/${lc:0:1}" ;;
+    *) prefix="${lc:0:2}/${lc:2:2}" ;;
+  esac
+
+  out=$(curl -s -w '\n%{http_code}' --retry 3 --retry-all-errors --max-time 30 \
+    -X GET "https://index.crates.io/$prefix/$lc")
+  code=$(printf '%s\n' "$out" | tail -n 1)
+  line=$(printf '%s\n' "$out" | grep "\"vers\":\"$V\"" || true)
+
+  if [ "$code" != "200" ] && [ "$code" != "404" ]; then
+    printf '%-14s %s: UNKNOWN (HTTP %s) — do not act on this line\n' "$c" "$V" "$code"
+  elif [ -z "$line" ]; then
+    printf '%-14s %s: absent\n' "$c" "$V"
   elif printf '%s' "$line" | grep -q '"yanked":true'; then
-    printf '%-14s X.Y.Z: YANKED — slot consumed, bump\n' "$c"
+    printf '%-14s %s: YANKED — slot consumed, bump\n' "$c" "$V"
   else
-    printf '%-14s X.Y.Z: PUBLISHED\n' "$c"
+    printf '%-14s %s: PUBLISHED\n' "$c" "$V"
   fi
 done
 ```
+
+The status code is read separately from the body because a transient error is not "absent": conflating them reports an untouched registry, which routes you to re-running stage 2 at a version that is in fact already taken. Any `UNKNOWN` line means re-run the check rather than proceeding.
 
 The member list is derived rather than written out, so it stays right as the workspace grows — recovery always runs from a checkout, so `cargo metadata` is available.
 
@@ -95,7 +114,7 @@ The member list is derived rather than written out, so it stays right as the wor
 
 **Nothing published** (every crate `absent`, none `YANKED`). crates.io is untouched and there is nothing to undo. What to do next depends on why it stopped:
 
-- _Environmental_ (registry outage, or the job hitting its 15-minute timeout): fix it and re-run **stage 2** with the same version.
+- _Environmental_ (registry outage, runner failure): re-run **stage 2** with the same version once the cause has cleared. The draft's pinned commit is still correct, so nothing else needs doing. Note that a cause you can only fix by committing is a _tree_ cause, not this one — a commit changes the tree, so it takes the path below.
 - _Tree_ (packaging, verification, or the version re-check): stage 2 checks out the draft's pinned commit, so re-running replays the identical failure. Delete the draft with `gh release delete "vX.Y.Z" --yes`, push the fix, then re-run **stage 1** and stage 2. Stage 1 refuses to create a draft while a release with that tag exists, which is why the delete comes first.
 
 **Only `skuld-macros` published:**

@@ -16,13 +16,28 @@ jobs:
   publish:
     name: Verify and publish
     runs-on: ubuntu-latest
-    # A clean cancellation well before the minted token's 30-minute life could
-    # expire mid-upload. The real run takes ~70s, so this is ~13x headroom.
-    timeout-minutes: 15
+    # Deliberately no `timeout-minutes`. A deadline cannot span the publish
+    # step: crates.io commits each upload server-side, so cancelling part-way
+    # through leaves the workspace partially published with no tag — the exact
+    # state a timeout would be there to avoid, now caused by it. Nor would the
+    # arithmetic work. A job timer starts before the token is minted, and the
+    # only scenario where it could matter is a cold cache (`cargo publish
+    # --workspace` runs a full verification build of all three crates, and
+    # `rusqlite`'s bundled SQLite is not fast), which also makes every pre-auth
+    # step slower — so it would fire earliest exactly when it is least wanted.
+    # GitHub's own job limit remains the backstop against a hung run.
+    #
     # The Deploy environment is named in each crate's crates.io trusted-publisher
     # config, so the OIDC token minted below is only accepted from a run that
-    # declares it. It also enforces any environment protection rules (required
-    # reviewers, wait timers) configured in the repo.
+    # declares it.
+    #
+    # It is not, today, an authorization control. The environment has no
+    # protection rules and no deployment branch policy, and a trusted-publisher
+    # config matches on owner, repo, workflow filename and environment — it has
+    # no ref field. So any branch carrying this filename and this environment
+    # name can mint a publish token, routing around main's branch protection.
+    # Setting a `main`-only deployment branch policy closes that; see
+    # "Publishing" in CONTRIBUTING.md.
     #
     # Real preflight (version validation, CI matrix, cargo publish dry-run)
     # happens in draft-release.yaml before a draft can exist. This workflow
