@@ -145,10 +145,16 @@ jobs:
             # `curl -f` collapses "404, never published" into the same non-zero
             # exit as "the network broke", and the two need opposite handling:
             # a blip must not announce a first publish and block the release,
-            # with no override left now that first-publish-ok is gone. Read the
-            # status code and refuse to guess on anything that is not 200 or 404.
+            # and this gate has no override to fall back on. Read the status
+            # code and refuse to guess on anything that is not 200 or 404.
+            # `-f` also treats a 3xx as success, which would read a redirect as
+            # "published"; the *) arm below stops that too.
+            #
+            # curl emits its own `%{http_code}` (`000`) even when the transfer
+            # fails, so the `||` must not echo a second one — that produced
+            # `000000`, which is not a status any reader can look up.
             code=$(curl -s -o /dev/null -w '%{http_code}' --retry 3 --retry-all-errors \
-              --max-time 30 -X GET "https://index.crates.io/$prefix/$lc" || echo "000")
+              --max-time 30 -X GET "https://index.crates.io/$prefix/$lc") || code="${code:-000}"
             case "$code" in
               200) ;;
               404) new+=("$c") ;;

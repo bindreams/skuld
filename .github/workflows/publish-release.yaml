@@ -16,16 +16,24 @@ jobs:
   publish:
     name: Verify and publish
     runs-on: ubuntu-latest
-    # Deliberately no `timeout-minutes`. A deadline cannot span the publish
-    # step: crates.io commits each upload server-side, so cancelling part-way
-    # through leaves the workspace partially published with no tag — the exact
-    # state a timeout would be there to avoid, now caused by it. Nor would the
-    # arithmetic work. A job timer starts before the token is minted, and the
-    # only scenario where it could matter is a cold cache (`cargo publish
+    # Deliberately no *job-level* `timeout-minutes` — the steps before the
+    # upload carry their own instead. A job deadline spans the publish step,
+    # and crates.io commits each upload server-side, so cancelling part-way
+    # through leaves the workspace partially published with no tag: the state
+    # the timeout would exist to avoid, caused by the timeout. The arithmetic
+    # argued the same way. A job timer starts before the token is minted, and
+    # the only case where it could bite is a cold cache (`cargo publish
     # --workspace` runs a full verification build of all three crates, and
-    # `rusqlite`'s bundled SQLite is not fast), which also makes every pre-auth
-    # step slower — so it would fire earliest exactly when it is least wanted.
-    # GitHub's own job limit remains the backstop against a hung run.
+    # rusqlite's bundled SQLite is not fast) — which also slows every step
+    # ahead of it, so it would arrive earliest exactly when least wanted.
+    #
+    # Two deadlines remain, and neither is removable here: the minted token
+    # lives ~30 minutes from the auth step, and GitHub caps any job at 6 hours.
+    # Both span the upload, so a slow enough cold build can still expire the
+    # token between crates — a step timeout cannot prevent that, only keeping
+    # the publish step's own work short can. If it happens, the run stops
+    # without the RELEASE COMPLETE marker and CONTRIBUTING.md's recovery
+    # section covers it.
     #
     # The Deploy environment is named in each crate's crates.io trusted-publisher
     # config, so the OIDC token minted below is only accepted from a run that
@@ -74,6 +82,10 @@ jobs:
 
       - name: Verify draft release exists and resolve commit SHA
         id: release
+        # Every step ahead of the upload is bounded, so a hung run cannot sit on
+        # the concurrency group until GitHub's 6-hour cap. The upload itself and
+        # the draft flip are deliberately unbounded: see the note on the job.
+        timeout-minutes: 5
         env:
           TAG: ${{ steps.version.outputs.tag }}
         shell: bash
@@ -99,6 +111,7 @@ jobs:
           echo "commit_sha=$TARGET" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
+        timeout-minutes: 10
         with:
           ref: ${{ steps.release.outputs.commit_sha }}
           # fetch-depth: 0 so `cargo xtask version --check --exact` sees
@@ -106,8 +119,10 @@ jobs:
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-rust
+        timeout-minutes: 15
 
       - name: Re-verify workspace version matches release
+        timeout-minutes: 20
         # Belt-and-suspenders: the checked-out commit's Cargo.toml must agree
         # with the version being published.
         env:
@@ -118,8 +133,10 @@ jobs:
           git tag "$TAG"
           cargo xtask version --check --exact
 
-      - uses: rust-lang/crates-io-auth-action@v1
+      - name: Mint a short-lived crates.io token by OIDC
+        uses: rust-lang/crates-io-auth-action@v1
         id: auth
+        timeout-minutes: 5
 
       - name: Publish the workspace to crates.io
         env:
