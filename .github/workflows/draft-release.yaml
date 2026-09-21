@@ -106,12 +106,10 @@ jobs:
 
       # Stage 2 authenticates by trusted publishing, and a crate that does not
       # yet exist on crates.io cannot have a trusted publisher configured — so
-      # stage 2 simply cannot publish a new member. It would also publish last,
-      # landing the worst partial state. Detect that here, in the reversible
+      # stage 2 simply cannot publish a new member. A leaf member also publishes after its
+      # dependencies, landing the worst partial state. Detect that here, in the reversible
       # stage; see "Adding a publishable member" in CONTRIBUTING.md.
       - name: Flag first-time publishes
-        env:
-          VERSION: ${{ inputs.version }}
         shell: bash
         run: |
           set -euo pipefail
