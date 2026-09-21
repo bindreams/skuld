@@ -128,15 +128,38 @@ jobs:
 
       - name: Re-verify workspace version matches release
         timeout-minutes: 20
-        # Belt-and-suspenders: the checked-out commit's Cargo.toml must agree
-        # with the version being published.
         env:
           TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
           git tag "$TAG"
           cargo xtask version --check --exact
+
+          # `--exact` alone does not tie the input to the manifest. It is
+          # satisfied by ANY version tag on the nearest tagged ancestor, so once
+          # that commit carries a tag matching the manifest, the tag created
+          # just above is merely one more alternative and any input passes.
+          # That is live today: main sits on the v0.3.1 commit.
+          #
+          # Stage 1 gates this, but stage 1's verdict is only transitive — it
+          # applies to the commit the draft recorded, and this job already
+          # treats the draft's target as mutable (which is why the flip below
+          # re-asserts the SHA). Re-assert the version against the tree that is
+          # actually about to be uploaded; this is the irreversible stage.
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          versions=$(printf '%s' "$metadata" | jq -r '.packages[] | select(.publish != []) | .version' | sort -u)
+          version_count=$(printf '%s\n' "$versions" | wc -l)
+          if [ "$version_count" -ne 1 ]; then
+            version_list=$(printf '%s' "$versions" | tr '\n' ' ')
+            echo "::error::Publishable members disagree on version: ${version_list}"
+            exit 1
+          fi
+          if [ "$versions" != "$VERSION" ]; then
+            echo "::error::The commit this release points at has manifest version ${versions}, but this run is publishing ${VERSION}. cargo would upload ${versions} under the tag ${TAG}. Recreate the draft from a commit whose manifests say ${VERSION}."
+            exit 1
+          fi
 
       # The verification build runs BEFORE the token exists. `cargo publish`
       # would otherwise do it inside the credential's ~30-minute window, and on

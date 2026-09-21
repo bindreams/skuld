@@ -67,7 +67,7 @@ This workflow:
 - Checks out that commit.
 - Re-runs `cargo xtask version --check --exact` against the checked-out tree.
 - Packages and verify-builds the publishable members, **before** minting the token. `cargo publish` would otherwise run that build inside the credential's ~30-minute life, and a cold build can consume most of it — expiring the token between uploads, which is a partial publish. The member list comes from `cargo metadata` rather than `--workspace`, which would also package `publish = false` members: a superset that both lengthens this build and enforces packaging rules on crates that are never packaged.
-- Publishes them with `cargo publish --workspace --locked --no-verify` (cargo handles topological ordering and index-visibility waiting, and skips `publish = false` members). Deliberately not a hand-written `-p` list. `--no-verify` is safe only because the step above just did that verification over exactly this member set.
+- Publishes them with `cargo publish --workspace --locked --no-verify` (cargo handles topological ordering and index-visibility waiting, and skips `publish = false` members). Deliberately not a hand-written `-p` list. `--no-verify` is safe only because the step above just did that verification over exactly this member set; what it still skips is the registry-side checks cargo makes at upload time, such as the size cap.
 - Flips the GitHub release from draft to published, which creates the `vX.Y.Z` git tag.
 
 ### Recovery
@@ -104,8 +104,9 @@ for c in $members; do
       -X GET "https://index.crates.io/$path"); then
     code=$(printf '%s\n' "$out" | tail -n 1)
   else
-    code=000   # transfer failed; the body may be truncated, so do not read it
+    code=000   # transfer failed: $out may be truncated, so code gates its use
   fi
+  # Only consulted on the 200 branch below, where the transfer completed.
   line=$(printf '%s\n' "$out" | grep -F "\"vers\":\"$V\"" || true)
 
   if [ "$code" != "200" ] && [ "$code" != "404" ]; then
