@@ -8,8 +8,18 @@ Releases go through two GitHub Actions workflows. Both are triggered by hand —
 
 - `Cargo.toml`, `macros/Cargo.toml` and `cargo-skuld/Cargo.toml` already have the intended release version (say `X.Y.Z`) on `main`, and the exact pins between them match it. `cargo xtask version --check --exact` enumerates workspace members dynamically, so it validates version agreement and every intra-workspace `=` pin across all three.
 - You have the GitHub CLI (`gh`) authenticated for the `bindreams/skuld` repo.
-- **For recovery only:** a personal crates.io token with the `yank` scope on all three crates, via `cargo login` or `cargo yank --token`. The `Deploy` token cannot yank — `publish-new`/`publish-update` do not grant that scope, and it lives in a GitHub Environment secret rather than on your machine. Without this, the first command of either partial-publish recovery fails on authentication.
-- A `Deploy` GitHub Environment is configured with a `CARGO_REGISTRY_TOKEN` scoped to `skuld` + `skuld-macros` + `cargo-skuld` with `publish-new` + `publish-update` permissions. A token scoped to only the first two cannot publish `cargo-skuld` — a second blocker that would have stopped the publish even once the command included it.
+- **For recovery only:** a personal crates.io token with the `yank` scope on every publishable member, via `cargo login` or `cargo yank --token`. Publishing no longer uses a token at all, so there is none to borrow. Without this, the first command of either partial-publish recovery fails on authentication.
+- Every publishable member has a **trusted publisher** configured on crates.io — GitHub, owner `bindreams`, repository `skuld`, workflow `publish-release.yaml`, environment `Deploy`. Stage 2 mints a short-lived token via OIDC and carries no long-lived secret. All four fields are matched, so the environment name is load-bearing: removing `environment: Deploy` from the job would break publishing.
+
+### Adding a publishable member
+
+A crate that does not exist on crates.io **cannot** have a trusted publisher configured, so stage 2 cannot publish it. Its first release is manual, once:
+
+1. Publish it by hand with a temporary token scoped to that crate with `publish-new` (`cargo publish -p <crate> --locked`), at the same version as the rest of the workspace.
+2. Configure its trusted publisher with the four fields above.
+3. Revoke the temporary token.
+
+From then on it rides the normal flow. `draft-release.yaml` detects first-time publishes and fails unless dispatched with `first-publish-ok=true`, so this cannot be discovered halfway through an irreversible stage 2.
 
 ### Stage 1 — Draft Release
 
