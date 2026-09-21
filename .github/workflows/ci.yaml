@@ -29,28 +29,26 @@ jobs:
           components: rustfmt, clippy
 
       # Single source of truth for lint is prek.toml — the same checks run
-      # locally, with one documented exception: SHELLCHECK_OPTS below. actionlint
-      # invokes shellcheck with `--norc`, so .shellcheckrc cannot reach workflow
-      # `run:` blocks and prek has no per-hook env. Locally those blocks are
-      # checked with shellcheck's defaults; here they get the same options as
-      # standalone scripts. Keep the two lists identical.
-      # Single source of truth for lint is prek.toml — the same checks run
-      # locally as pre-commit hooks. prek-action runs `prek run --all-files`
-      # with `--show-diff-on-failure --color=always`, so fmt / mdformat /
-      # mixed-line-ending failures surface as a diff in CI logs.
-      # actionlint shells out to shellcheck for `run:` blocks and silently
-      # disables that rule when the binary is absent, so it is installed
-      # explicitly rather than inherited from whatever the runner image ships.
-      # `--norc` means .shellcheckrc does not reach those blocks; these options
-      # mirror it and must be kept in step with it.
+      # locally as pre-commit hooks, shellcheck's optional checks included:
+      # the actionlint hook carries them as its own `env`, so there is no
+      # CI-only lint setting to keep in step. prek-action runs
+      # `prek run --all-files` with `--show-diff-on-failure --color=always`,
+      # so fmt / mixed-line-ending failures surface as a diff in CI logs.
+      #
+      # actionlint shells out to shellcheck for `run:` blocks and *silently*
+      # disables that rule when the binary is missing — it says so only under
+      # -verbose, which means the capability can vanish while this job stays
+      # green. Install it explicitly rather than inheriting whatever the runner
+      # image ships, then assert it is really there.
       - name: Install shellcheck
         uses: taiki-e/install-action@v2
         with:
           tool: shellcheck@0.11.0
 
+      - name: Assert shellcheck is available to actionlint
+        run: shellcheck --version
+
       - uses: j178/prek-action@v2
-        env:
-          SHELLCHECK_OPTS: --enable=add-default-case,check-extra-masked-returns
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})

@@ -1,5 +1,6 @@
-# Two checks that shellcheck leaves optional, both of which this repo's release
-# pipeline has actually tripped over:
+# Two checks that shellcheck leaves optional. SC2312 fired on this repo's own
+# draft-release workflow; SC2249 recurred across review rounds on the publish
+# workflow. Neither is on by default:
 #
 #   SC2249  a `case` with no default arm — an unmatched value falls through
 #           silently, which in a publish guard means a member classified as
@@ -9,6 +10,7 @@
 #           that refuses is read by its caller as one that succeeded.
 #
 # actionlint runs shellcheck with `--norc`, so this file does not apply to
-# workflow `run:` blocks. The Lint job passes the same options through
-# SHELLCHECK_OPTS; keep the two in step.
+# workflow `run:` blocks. The actionlint hook in prek.toml carries the same
+# options as its own `env` instead; keep the two lists in step. This file
+# governs standalone shell scripts, in CI and locally alike.
 enable=add-default-case,check-extra-masked-returns

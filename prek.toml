@@ -73,10 +73,11 @@ hooks = [
 
 [[repos]]
 # The release pipeline gates the only irreversible operation in the repo and
-# nothing checked its shell until now. Two of its historical failure modes —
-# a `case` with no default arm (SC2249) and a return masked by `< <(...)`
-# (SC2312) — are *optional* in shellcheck, so they are enabled in
-# `.shellcheckrc` rather than left to the defaults.
+# nothing checked its shell until now. Two failure modes it has produced are
+# *optional* checks in shellcheck rather than defaults, so they are enabled in
+# `.shellcheckrc`: a return masked by `< <(...)` (SC2312), which this repo's
+# own draft-release workflow tripped over, and a `case` with no default arm
+# (SC2249), which recurred across review rounds on the publish workflow.
 #
 # shellcheck-py rather than the upstream Docker hook: this is a Rust repo and
 # a Docker daemon is a heavy thing to require of anyone running `prek` on a
@@ -94,13 +95,17 @@ hooks = [
 # is missing, so CI installs shellcheck explicitly rather than relying on the
 # runner image happening to ship one.
 #
-# actionlint invokes shellcheck with `--norc`, so `.shellcheckrc` does not
-# reach `run:` blocks; the Lint job passes the same options via
-# SHELLCHECK_OPTS. The two levers must be kept in step.
+# actionlint invokes shellcheck with `--norc`, so `.shellcheckrc` cannot reach
+# `run:` blocks. The options are therefore set as this hook's own environment,
+# which keeps them in the same file as every other lint setting and applies
+# identically in CI and locally. (`env` is not in prek's documented config
+# schema, but it is implemented — verified against both prek 0.3.6 and the
+# 0.5.3 that prek-action resolves.) Keep this list in step with
+# `.shellcheckrc`, which governs standalone scripts.
 repo = "https://github.com/rhysd/actionlint"
 rev = "v1.7.12"
 hooks = [
-  { id = "actionlint" },
+  { id = "actionlint", env = { SHELLCHECK_OPTS = "--enable=add-default-case,check-extra-masked-returns" } },
 ]
 
 [[repos]]
