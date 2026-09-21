@@ -16,8 +16,8 @@ jobs:
   publish:
     name: Verify and publish
     runs-on: ubuntu-latest
-    # The minted token lives 30 minutes; a stalled index-visibility wait would
-    # otherwise fail mid-publish with no budget left to retry.
+    # A clean cancellation well before the minted token's 30-minute life could
+    # expire mid-upload. The real run takes ~70s, so this is ~13x headroom.
     timeout-minutes: 15
     # The Deploy environment is named in each crate's crates.io trusted-publisher
     # config, so the OIDC token minted below is only accepted from a run that
@@ -103,50 +103,36 @@ jobs:
           git tag "$TAG"
           cargo xtask version --check --exact
 
-      # `crates-io-auth-action`'s post step can fail the job after the publish
-      # already succeeded. Without this check the obvious response — re-dispatch
-      # — fails again on "crate version already exists", so a finished release
-      # looks broken twice. The sparse index is used rather than the JSON API
-      # because the latter answers 403 to a request without a User-Agent.
-      # `crates-io-auth-action`'s post step can fail the job after the publish
-      # already succeeded. Without this check the obvious response — re-dispatch
-      # — fails again on "crate version already exists", so a finished release
-      # looks broken twice.
+      # Lets a re-dispatch finish a release whose publish already succeeded.
       #
-      # Every branch fails closed. The release-flip step below carries no `if:`,
-      # so a wrong "already published" verdict would create the tag having
-      # published nothing — and an empty member list or a failed query must
-      # never reach that conclusion. The JSON API is used rather than the sparse
-      # index because the index is CDN-cached for 600s, and this check runs
-      # seconds after a publish; it needs a User-Agent, which the index does not.
+      # The reachable cases are the flip step itself failing, and the job being
+      # cancelled or timing out between the publish and the flip. Not the auth
+      # action's post step: GitHub runs post steps after every regular step, so
+      # by then the flip has happened and a re-dispatch stops earlier, at the
+      # "release already published" check.
+      #
+      # Every branch fails closed. The flip step below carries no `if:`, so a
+      # wrong "already published" verdict would tag a release having published
+      # nothing — an empty member list, a failed query, or a yanked version must
+      # never reach that conclusion.
       - name: Check whether this version is already on crates.io
         id: crates_check
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          CRATES_UA: "skuld-release-pipeline (https://github.com/bindreams/skuld)"
         shell: bash
         run: |
           set -euo pipefail
 
-          mapfile -t members < <(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.publish != []) | .name')
-          if [ "${#members[@]}" -eq 0 ]; then
-            echo "::error::No publishable workspace members found — refusing to guess."
-            exit 1
-          fi
-
+          mapfile -t members < <(./.github/scripts/publishable-members.sh)
           published=0
           absent=0
           for c in "${members[@]}"; do
-            code=$(curl -sL -A "$CRATES_UA" -o /dev/null -w "%{http_code}" \
-              --retry 3 --retry-all-errors --max-time 30 \
-              "https://crates.io/api/v1/crates/${c}/${VERSION}")
-            case "$code" in
-              200) published=$((published + 1)) ;;
-              404) absent=$((absent + 1)) ;;
-              *)
-                echo "::error::Unexpected HTTP $code from crates.io for $c ${VERSION}."
-                echo "::error::Cannot tell whether this version is published; refusing to continue."
+            case "$(./.github/scripts/crate-state.sh "$c" "$VERSION")" in
+              published) published=$((published + 1)) ;;
+              absent)    absent=$((absent + 1)) ;;
+              yanked)
+                echo "::error::$c ${VERSION} is published but YANKED — that version slot is spent."
+                echo "::error::Re-running cannot fix this. Follow the Recovery section of CONTRIBUTING.md (bump path)."
                 exit 1
                 ;;
             esac

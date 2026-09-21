@@ -16,10 +16,10 @@ Releases go through two GitHub Actions workflows. Both are triggered by hand —
 A crate that does not exist on crates.io **cannot** have a trusted publisher configured, so stage 2 cannot publish it. Its first release is manual, once:
 
 1. **Before** bumping the workspace, publish it by hand at the **currently released** version `X.Y.(Z-1)`, with a temporary token scoped to that crate with `publish-new` (`cargo publish -p <crate> --locked`). Publishing it at the version you are about to release would leave stage 2 seeing one member published and the rest absent — which it correctly refuses as a partial publish, blocking the release.
-2. Configure its trusted publisher with the four fields above.
-3. Revoke the temporary token.
+2. Configure its trusted publisher with the four fields above, then **confirm it is listed** under the crate's Settings → Trusted Publishing. Nothing automated can check this: crates.io exposes no unauthenticated way to read a publisher config, so a missing one is invisible until stage 2 gets a 403 on that member — and since it publishes last, the others will already be up.
+3. Revoke the temporary token, once a release has gone out through stage 2.
 
-From then on it rides the normal flow. `draft-release.yaml` fails on any member that has never been published, so this cannot be discovered halfway through an irreversible stage 2. There is no override — once the crate exists the check passes by itself.
+From then on it rides the normal flow. `draft-release.yaml` fails on any member that has never been published, which catches step 1 being skipped. It cannot catch step 2 being skipped — it verifies the crate exists, not that a publisher is configured for it.
 
 ### Stage 1 — Draft Release
 
@@ -73,22 +73,14 @@ Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` �
 **First, establish which state you are in.** The workflow log says where it stopped; the registry is authoritative. Use the sparse index, which needs no `User-Agent` — the crates.io JSON API answers `403` with an empty body to curl's default one, and `curl -s` without `--fail` exits `0`, so a bare query looks identical to "nothing published":
 
 ```sh
-for c in $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name'); do
-  prefix=$(printf '%s' "$c" | sed -E 's|^(..)(..).*|\1/\2|')
-  line=$(curl -sfX GET "https://index.crates.io/$prefix/$c" | grep '"vers":"X.Y.Z"')
-  if [ -z "$line" ]; then
-    printf '%-14s X.Y.Z: absent\n' "$c"
-  elif printf '%s' "$line" | grep -q '"yanked":true'; then
-    printf '%-14s X.Y.Z: YANKED — slot consumed, bump\n' "$c"
-  else
-    printf '%-14s X.Y.Z: PUBLISHED\n' "$c"
-  fi
+for c in $(./.github/scripts/publishable-members.sh); do
+  printf '%-14s X.Y.Z: %s\n' "$c" "$(./.github/scripts/crate-state.sh "$c" X.Y.Z)"
 done
 ```
 
-The member list is derived rather than written out, so it stays right as the workspace grows — recovery always runs from a checkout, so `cargo metadata` is available.
+These are the same scripts both release workflows use, so the classification here is exactly the one that gated the publish. They refuse rather than guess: a failed query is never reported as `absent`, because the recovery for `absent` is `cargo yank`, which spends the version slot permanently.
 
-**Any `YANKED` means the version slot is gone.** crates.io reserves a version permanently on publish; yanking hides it but never frees it, so stage 2 can never succeed at that version again. Go to the bump path below regardless of what the other crates report. If a crate reads `absent` immediately after a successful-looking upload, wait a minute and re-check before yanking anything — index propagation lags.
+**Any `YANKED` means the version slot is gone.** crates.io reserves a version permanently on publish; yanking hides it but never frees it, so stage 2 can never succeed at that version again. Go to the bump path below regardless of what the other crates report — stage 2 refuses a yanked member for the same reason.
 
 **Nothing published** (every crate `absent`, none `YANKED`). crates.io is untouched and there is nothing to undo. What to do next depends on why it stopped:
 

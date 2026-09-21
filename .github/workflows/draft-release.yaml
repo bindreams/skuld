@@ -110,21 +110,19 @@ jobs:
       # landing the worst partial state. Detect first-publishes here, in the
       # reversible stage; see "Adding a publishable member" in CONTRIBUTING.md.
       - name: Flag first-time publishes
-        env:
-          VERSION: ${{ inputs.version }}
         shell: bash
         run: |
           set -euo pipefail
+          mapfile -t members < <(./.github/scripts/publishable-members.sh)
           new=()
-          while read -r c; do
-            prefix=$(printf '%s' "$c" | sed -E 's|^(..)(..).*|\1/\2|')
-            curl -sfX GET "https://index.crates.io/$prefix/$c" >/dev/null || new+=("$c")
-          done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
+          for c in "${members[@]}"; do
+            [ "$(./.github/scripts/crate-state.sh "$c")" = "never-published" ] && new+=("$c")
+          done
           if [ ${#new[@]} -eq 0 ]; then
-            echo "All publishable members already exist on crates.io."
+            echo "All ${#members[@]} publishable members already exist on crates.io."
           else
             echo "::error::Never published: ${new[*]}. Stage 2 authenticates by trusted publishing, and a crate that does not exist cannot have a publisher configured — so it cannot publish these."
-            echo "::error::Follow \"Adding a publishable member\" in CONTRIBUTING.md, then re-run. No flag is needed: once the crate exists, this check passes on its own."
+            echo "::error::Follow \"Adding a publishable member\" in CONTRIBUTING.md, then re-run."
             exit 1
           fi
 
