@@ -113,35 +113,46 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Read the member list into a variable rather than piping a process
-          # substitution into the loop: `done < <(cargo metadata | jq)` discards
+          # Read the member list into a variable rather than feeding the loop
+          # from a process substitution: `done < <(cargo metadata | jq)` discards
           # the exit status of both commands, so a metadata or jq failure would
-          # feed the loop zero names and report every crate as already published.
-          # An assignment propagates the failure, and `set -e` stops the step.
+          # run the loop zero times and report every member as already
+          # published — this gate failing open in the stage that exists to catch
+          # exactly that. An assignment propagates the status and `set -e` stops.
           members=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
           if [ -z "$members" ]; then
             echo "::error::No publishable workspace members found. Expected at least one."
             exit 1
           fi
 
-          # PR #60 replaces this whole step with crate-state.sh, which
-          # classifies via the JSON API properly. Fixed here regardless since
-          # #60 isn't merged and this step has to be correct in the meantime.
           new=()
           while read -r c; do
-            prefix=$(printf '%s' "$c" | sed -E 's|^(..)(..).*|\1/\2|')
-            # -f would make any non-2xx exit the same way as a network
-            # failure, which is the same masking this step's comment above
-            # already calls out for the metadata|jq pipeline: a transient
-            # DNS/5xx/rate-limit hit would be relabeled as "first publish".
-            # Branch on the status code instead; a real transport failure
-            # still exits curl non-zero and `set -e` stops the step.
-            code=$(curl -sS -o /dev/null -w '%{http_code}' "https://index.crates.io/$prefix/$c")
+            [ -n "$c" ] || continue
+
+            # Sparse-index paths encode the name's length and are lowercased:
+            # 1/a, 2/ab, 3/a/abc, ab/cd/abcdef. One sed assuming 4+ characters
+            # builds `log/log` for a three-character name, which 404s and reads
+            # as "never published" — permanently, for any such future member.
+            lc=$(printf '%s' "$c" | tr '[:upper:]' '[:lower:]')
+            case ${#lc} in
+              1) prefix="1" ;;
+              2) prefix="2" ;;
+              3) prefix="3/${lc:0:1}" ;;
+              *) prefix="${lc:0:2}/${lc:2:2}" ;;
+            esac
+
+            # `curl -f` collapses "404, never published" into the same non-zero
+            # exit as "the network broke", and the two need opposite handling:
+            # a blip must not announce a first publish and block the release,
+            # with no override left now that first-publish-ok is gone. Read the
+            # status code and refuse to guess on anything that is not 200 or 404.
+            code=$(curl -s -o /dev/null -w '%{http_code}' --retry 3 --retry-all-errors \
+              --max-time 30 -X GET "https://index.crates.io/$prefix/$lc" || echo "000")
             case "$code" in
-              200) ;; # already published
+              200) ;;
               404) new+=("$c") ;;
               *)
-                echo "::error::Unexpected HTTP $code checking $c on crates.io index"
+                echo "::error::Unexpected HTTP $code from the crates.io index for '$c'. Refusing to guess whether it is published; re-run when the registry is reachable."
                 exit 1
                 ;;
             esac
