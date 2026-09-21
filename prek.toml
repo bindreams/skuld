@@ -72,6 +72,26 @@ hooks = [
 ]
 
 [[repos]]
+# The release pipeline is shell — two scripts plus embedded `run:` blocks —
+# and it gates the only irreversible operation in the repo. Nothing checked
+# it until now, and its failure modes are the quiet ones: a discarded exit
+# status, an unquoted expansion, a `case` with no default arm.
+repo = "https://github.com/koalaman/shellcheck-precommit"
+rev = "v0.11.0"
+hooks = [
+  { id = "shellcheck" },
+]
+
+[[repos]]
+# Catches what shellcheck cannot see: workflow syntax, expression errors, and
+# `run:` blocks it extracts and shells out to shellcheck for.
+repo = "https://github.com/rhysd/actionlint"
+rev = "v1.7.7"
+hooks = [
+  { id = "actionlint" },
+]
+
+[[repos]]
 repo = "https://github.com/editorconfig-checker/editorconfig-checker.python"
 rev = "3.2.1"
 hooks = [
