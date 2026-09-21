@@ -40,11 +40,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          V="${INPUT_VERSION#v}"
-          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Invalid version: '${INPUT_VERSION}'"
+          # Reject a leading `v` rather than stripping it. The raw input is the
+          # concurrency key, so if `1.2.3` and `v1.2.3` both normalized to one
+          # version they would land in *different* groups while naming the same
+          # release — two runs of the same publish, in parallel, on an operation
+          # that cannot be undone. One accepted spelling keeps key and meaning
+          # in step.
+          if ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version: '${INPUT_VERSION}'. Use bare semver (1.2.3), with no leading 'v'."
             exit 1
           fi
+          V="$INPUT_VERSION"
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Fail if release tag already exists
@@ -104,22 +110,32 @@ jobs:
         # stage 2, compiling each crate as packaged rather than as checked out.
         run: cargo publish --workspace --dry-run --locked
 
-      # Stage 2 authenticates by trusted publishing, and a crate that does not
-      # yet exist on crates.io cannot have a trusted publisher configured — so
-      # stage 2 simply cannot publish a new member. A leaf member also publishes after its
-      # dependencies, landing the worst partial state. Detect that here, in the reversible
-      # stage; see "Adding a publishable member" in CONTRIBUTING.md.
-      - name: Flag first-time publishes
+      # Two questions must be settled before a draft can exist, and the
+      # dry-run above answers neither.
+      #
+      # A crate that does not yet exist on crates.io cannot have a trusted
+      # publisher configured, so stage 2 cannot publish a new member at all —
+      # and a leaf publishes after its dependencies, landing the worst partial
+      # state. See "Adding a publishable member" in CONTRIBUTING.md.
+      #
+      # A version already on crates.io can never be published again: the
+      # registry reserves it permanently and yanking does not free it.
+      # `cargo publish --dry-run` warns "already exists on crates.io" and still
+      # exits 0, so without this check a re-dispatch of a published version
+      # passes stage 1 and fails part-way through the irreversible upload.
+      - name: Check crates.io state for every publishable member
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
 
           # Read the member list into a variable rather than feeding the loop
           # from a process substitution: `done < <(cargo metadata | jq)` discards
-          # the exit status of both commands, so a metadata or jq failure would
-          # run the loop zero times and report every member as already
-          # published — this gate failing open in the stage that exists to catch
-          # exactly that. An assignment propagates the status and `set -e` stops.
+          # the exit status of both commands, so a failure there would run the
+          # loop zero times and report every member as fine — this gate failing
+          # open in the stage that exists to catch exactly that. An assignment
+          # propagates the status and `set -e` stops.
           members=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
           if [ -z "$members" ]; then
             echo "::error::No publishable workspace members found. Expected at least one."
@@ -127,50 +143,51 @@ jobs:
           fi
 
           new=()
+          taken=()
           while read -r c; do
             [ -n "$c" ] || continue
-
-            # Sparse-index paths encode the name's length and are lowercased:
-            # 1/a, 2/ab, 3/a/abc, ab/cd/abcdef. One sed assuming 4+ characters
-            # builds `log/log` for a three-character name, which 404s and reads
-            # as "never published" — permanently, for any such future member.
-            lc=$(printf '%s' "$c" | tr '[:upper:]' '[:lower:]')
-            case ${#lc} in
-              1) prefix="1" ;;
-              2) prefix="2" ;;
-              3) prefix="3/${lc:0:1}" ;;
-              *) prefix="${lc:0:2}/${lc:2:2}" ;;
-            esac
+            path=$(.github/scripts/crate-index-path.sh "$c")
 
             # `curl -f` collapses "404, never published" into the same non-zero
-            # exit as "the network broke", and the two need opposite handling:
-            # a blip must not announce a first publish and block the release,
-            # and this gate has no override to fall back on. Read the status
-            # code and refuse to guess on anything that is not 200 or 404.
-            # `-f` also treats a 3xx as success, which would read a redirect as
-            # "published"; the *) arm below stops that too.
+            # exit as "the network broke", and the two need opposite handling: a
+            # blip must not announce a first publish and block the release, and
+            # this gate has no override to fall back on. `-f` also treats a 3xx
+            # as success, which would read a redirect as "published".
             #
-            # curl emits its own `%{http_code}` (`000`) even when the transfer
-            # fails, so the `||` must not echo a second one — that produced
-            # `000000`, which is not a status any reader can look up.
-            code=$(curl -s -o /dev/null -w '%{http_code}' --retry 3 --retry-all-errors \
-              --max-time 30 -X GET "https://index.crates.io/$prefix/$lc") || code="${code:-000}"
+            # curl writes its own `%{http_code}` (`000`) even when the transfer
+            # fails, so the fallback must not add a second one — that produced
+            # `000000`, which is not a status anyone can look up.
+            out=$(curl -s -w '\n%{http_code}' --retry 3 --retry-all-errors \
+              --max-time 30 -X GET "https://index.crates.io/$path") || out="${out:-000}"
+            code=$(printf '%s\n' "$out" | tail -n 1)
+
             case "$code" in
-              200) ;;
+              200)
+                if printf '%s\n' "$out" | grep -q "\"vers\":\"${VERSION}\""; then
+                  taken+=("$c")
+                fi
+                ;;
               404) new+=("$c") ;;
               *)
-                echo "::error::Unexpected HTTP $code from the crates.io index for '$c'. Refusing to guess whether it is published; re-run when the registry is reachable."
+                echo "::error::Unexpected HTTP $code from the crates.io index for '$c'. Refusing to guess; re-run when the registry is reachable."
                 exit 1
                 ;;
             esac
           done <<< "$members"
-          if [ ${#new[@]} -eq 0 ]; then
-            echo "Every publishable member already exists on crates.io."
-          else
-            echo "::error::Never published: ${new[*]}. Stage 2 authenticates by trusted publishing, and a crate that does not exist cannot have a publisher configured — so it cannot publish these."
-            echo "::error::Follow \"Adding a publishable member\" in CONTRIBUTING.md, then re-run."
-            exit 1
+
+          # Report both problems in one run rather than one per re-dispatch.
+          fail=0
+          if [ ${#new[@]} -ne 0 ]; then
+            echo "::error::Never published: ${new[*]}. Stage 2 authenticates by trusted publishing, and a crate that does not exist cannot have a publisher configured. Follow \"Adding a publishable member\" in CONTRIBUTING.md, then re-run."
+            fail=1
           fi
+          if [ ${#taken[@]} -ne 0 ]; then
+            echo "::error::crates.io already has ${VERSION} for: ${taken[*]}. That version is reserved permanently and can never be republished. Bump and re-run."
+            fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+
+          echo "All publishable members exist, and none has ${VERSION} yet."
 
   release:
     name: Create draft release

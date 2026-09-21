@@ -20,32 +20,26 @@ jobs:
     # upload carry their own instead. A job deadline spans the publish step,
     # and crates.io commits each upload server-side, so cancelling part-way
     # through leaves the workspace partially published with no tag: the state
-    # the timeout would exist to avoid, caused by the timeout. The arithmetic
-    # argued the same way. A job timer starts before the token is minted, and
+    # the timeout would exist to avoid, caused by the timeout. A job timer starts before the token is minted, and
     # the only case where it could bite is a cold cache (`cargo publish
     # --workspace` runs a full verification build of all three crates, and
     # rusqlite's bundled SQLite is not fast) — which also slows every step
     # ahead of it, so it would arrive earliest exactly when least wanted.
     #
-    # Two deadlines remain, and neither is removable here: the minted token
-    # lives ~30 minutes from the auth step, and GitHub caps any job at 6 hours.
-    # Both span the upload, so a slow enough cold build can still expire the
-    # token between crates — a step timeout cannot prevent that, only keeping
-    # the publish step's own work short can. If it happens, the run stops
-    # without the RELEASE COMPLETE marker and CONTRIBUTING.md's recovery
-    # section covers it.
+    # Two deadlines remain that no timeout setting here can remove: the minted
+    # token lives ~30 minutes, and GitHub caps any job at 6 hours. Both span
+    # the upload. What keeps them from mattering is the step order below — the
+    # verification build runs before the token is minted, so only the uploads
+    # themselves race the credential. Should one still expire mid-upload, the
+    # run stops without the RELEASE COMPLETE marker, and CONTRIBUTING.md's
+    # recovery section covers that state.
     #
     # The Deploy environment is named in each crate's crates.io trusted-publisher
     # config, so the OIDC token minted below is only accepted from a run that
     # declares it.
     #
-    # It is not, today, an authorization control. The environment has no
-    # protection rules and no deployment branch policy, and a trusted-publisher
-    # config matches on owner, repo, workflow filename and environment — it has
-    # no ref field. So any branch carrying this filename and this environment
-    # name can mint a publish token, routing around main's branch protection.
-    # Setting a `main`-only deployment branch policy closes that; see
-    # "Publishing" in CONTRIBUTING.md.
+    # It has no protection rules or deployment branch policy today, so it is
+    # not an authorization control — see "Open action item" in CONTRIBUTING.md.
     #
     # Real preflight (version validation, CI matrix, cargo publish dry-run)
     # happens in draft-release.yaml before a draft can exist. This workflow
@@ -67,16 +61,23 @@ jobs:
     steps:
       - name: Normalize and validate version
         id: version
+        timeout-minutes: 5
         env:
           INPUT_VERSION: ${{ inputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          V="${INPUT_VERSION#v}"
-          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Invalid version: '${INPUT_VERSION}'"
+          # Reject a leading `v` rather than stripping it. The raw input is the
+          # concurrency key, so if `1.2.3` and `v1.2.3` both normalized to one
+          # version they would land in *different* groups while naming the same
+          # release — two runs of the same publish, in parallel, on an operation
+          # that cannot be undone. One accepted spelling keeps key and meaning
+          # in step.
+          if ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version: '${INPUT_VERSION}'. Use bare semver (1.2.3), with no leading 'v'."
             exit 1
           fi
+          V="$INPUT_VERSION"
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "tag=v${V}" >> "$GITHUB_OUTPUT"
 
@@ -133,6 +134,16 @@ jobs:
           git tag "$TAG"
           cargo xtask version --check --exact
 
+      # The verification build runs BEFORE the token exists. `cargo publish`
+      # would otherwise do it inside the credential's ~30-minute window, and on
+      # a cold cache compiling all three crates (rusqlite builds SQLite from C)
+      # can consume most of that — expiring the token part-way through the
+      # uploads, which is precisely a partial publish. Doing it here leaves only
+      # the upload inside the window.
+      - name: Package and verify the workspace
+        timeout-minutes: 30
+        run: cargo package --workspace --locked
+
       - name: Mint a short-lived crates.io token by OIDC
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
@@ -142,19 +153,27 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         # cargo 1.90+ publishes multiple workspace members in topological order
-        # (skuld-macros, then skuld, then cargo-skuld) and waits for each to appear on the
-        # sparse index before publishing the next. This replaces the manual
-        # publish-wait-publish dance.
-        run: cargo publish --workspace --locked
+        # (skuld-macros, then skuld, then cargo-skuld), waiting for each to
+        # appear on the sparse index before the next.
+        #
+        # `--no-verify` because the step above already ran the verification
+        # build on this exact commit, and stage 1 dry-ran it as well. This is
+        # what keeps the token window down to the uploads.
+        run: cargo publish --workspace --locked --no-verify
 
       - name: Publish GitHub release
         env:
           TAG: ${{ steps.version.outputs.tag }}
           REPO: ${{ github.repository }}
+          COMMIT_SHA: ${{ steps.release.outputs.commit_sha }}
         shell: bash
         run: |
           set -euo pipefail
-          gh release edit "$TAG" --draft=false
+          # Re-assert the target. The flip is what creates the tag, and it uses
+          # the release's target as it stands *now* — an edit to the draft
+          # between the earlier resolution and this point would otherwise tag a
+          # commit nobody verified. Pin it to the SHA this run actually built.
+          gh release edit "$TAG" --draft=false --target "$COMMIT_SHA"
 
           # Completion marker, to both the log and the summary: the operator is
           # told to read the log, and the summary is what a reader sees first.

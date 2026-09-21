@@ -94,17 +94,12 @@ if [ -z "$members" ]; then
 fi
 
 for c in $members; do
-  # Index paths encode the name's length and are lowercased.
-  lc=$(printf '%s' "$c" | tr '[:upper:]' '[:lower:]')
-  case ${#lc} in
-    1) prefix="1" ;;
-    2) prefix="2" ;;
-    3) prefix="3/${lc:0:1}" ;;
-    *) prefix="${lc:0:2}/${lc:2:2}" ;;
-  esac
+  # Same helper the release workflow uses, so the two cannot disagree about
+  # where a crate lives in the index.
+  path=$(.github/scripts/crate-index-path.sh "$c") || exit 1
 
   out=$(curl -s -w '\n%{http_code}' --retry 3 --retry-all-errors --max-time 30 \
-    -X GET "https://index.crates.io/$prefix/$lc")
+    -X GET "https://index.crates.io/$path")
   code=$(printf '%s\n' "$out" | tail -n 1)
   line=$(printf '%s\n' "$out" | grep "\"vers\":\"$V\"" || true)
 
