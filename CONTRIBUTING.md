@@ -10,7 +10,7 @@ Releases go through two GitHub Actions workflows. Both are triggered by hand —
 - You have the GitHub CLI (`gh`) authenticated for the `bindreams/skuld` repo.
 - **For recovery only:** a personal crates.io token with the `yank` scope on every publishable member, via `cargo login` or `cargo yank --token`. Publishing mints its own short-lived token inside the job, so there is none to borrow. Without this, the first command of either partial-publish recovery fails on authentication.
 - Every publishable member has a **trusted publisher** configured on crates.io — GitHub, owner `bindreams`, repository `skuld`, workflow `publish-release.yaml`, environment `Deploy`. Stage 2 mints a short-lived token by OIDC and carries no long-lived secret. All four fields are matched exactly, so both the workflow **filename** and the environment name are load-bearing: renaming the file or dropping `environment: Deploy` breaks publishing, and neither is visible until the irreversible step.
-- The `Deploy` environment has a **deployment branch policy limiting it to `main`**. A trusted-publisher config has no ref field — it matches only the four values above — so GitHub's branch policy is the one place a ref restriction can live. Without it, any branch carrying this workflow filename and environment name can mint a token valid for all three crates and publish from unreviewed code, going around `main`'s protection. Set it under Settings → Environments → Deploy → Deployment branches.
+- **Open action item, not yet configured:** the `Deploy` environment needs a **deployment branch policy limiting it to `main`**. A trusted-publisher config has no ref field — it matches only the four values above — so GitHub's branch policy is the one place a ref restriction can live. Until it is set, any branch carrying this workflow filename and this environment name can mint a token valid for all three crates and publish from unreviewed code, going around `main`'s protection. Set it under Settings → Environments → Deploy → Deployment branches. Unlike the bullets above, this one describes work still to do; the comment on the job in `publish-release.yaml` says the same.
 
 ### Adding a publishable member
 
@@ -74,12 +74,26 @@ This workflow:
 
 Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` — and `cargo publish` is not atomic, so a server-side error part-way through leaves the workspace partially published.
 
-**First, establish which state you are in.** The workflow log says where it stopped; the registry is authoritative. Use the sparse index, which needs no `User-Agent` — the crates.io JSON API answers `403` with an empty body to curl's default one, and `curl -s` without `--fail` exits `0`, so a bare query looks identical to "nothing published":
+**First, establish which state you are in.** The workflow log says where it stopped; the registry is authoritative. Use the sparse index, which needs no `User-Agent` — the crates.io JSON API answers `403` with an empty body to curl's default one.
 
-```sh
+The snippet reads the status code separately from the body, and that is why it does not use `--fail`. `curl -s` alone exits `0` whatever the server said, so judging by the body only cannot tell a 404 from a 503; `--fail` collapses them the other way, into one non-zero exit. Either way a transient error reads as "absent", which reports an untouched registry and routes you into re-running stage 2 at a version that is in fact already taken. `%{http_code}` is what separates them. Any `UNKNOWN` line means re-run the check rather than act on it. The block runs in a subshell so a refusal cannot close your terminal.
+
+```bash
+(
 V=X.Y.Z   # the version you were publishing — the only thing to edit
 
-for c in $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name'); do
+# Both guards exist because the failure they prevent is silent: every crate
+# reads `absent`, which is exactly what an untouched registry looks like.
+if [ "$V" = X.Y.Z ]; then
+  echo "Set V to the version you were publishing, then re-run."; exit 1
+fi
+
+members=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
+if [ -z "$members" ]; then
+  echo "Could not enumerate publishable members. Fix that before trusting anything below."; exit 1
+fi
+
+for c in $members; do
   # Index paths encode the name's length and are lowercased.
   lc=$(printf '%s' "$c" | tr '[:upper:]' '[:lower:]')
   case ${#lc} in
@@ -104,9 +118,8 @@ for c in $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | se
     printf '%-14s %s: PUBLISHED\n' "$c" "$V"
   fi
 done
+)
 ```
-
-The status code is read separately from the body because a transient error is not "absent": conflating them reports an untouched registry, which routes you to re-running stage 2 at a version that is in fact already taken. Any `UNKNOWN` line means re-run the check rather than proceeding.
 
 The member list is derived rather than written out, so it stays right as the workspace grows — recovery always runs from a checkout, so `cargo metadata` is available.
 
