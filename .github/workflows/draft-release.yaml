@@ -19,6 +19,7 @@ jobs:
   validate:
     name: Validate version
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     outputs:
@@ -79,11 +80,15 @@ jobs:
         run: git tag "v${VERSION}"
 
       - name: Validate workspace version and dep pin against tag
-        # Runs workspace_version() (version agreement + every intra-workspace pin) AND
-        # nearest-tag comparison with --exact. Fails on any inconsistency.
-        # Catches operator mistypes: if input version != Cargo.toml version,
-        # the newly-created local tag disagrees with Cargo.toml and --exact
-        # rejects it.
+        # Runs workspace_version() (version agreement + every intra-workspace
+        # pin) AND nearest-tag comparison with --exact.
+        #
+        # This does NOT catch an operator mistyping the version. `--exact` is
+        # satisfied by any version tag on the nearest tagged ancestor, so when
+        # that commit already carries a tag matching the manifest — main today —
+        # the tag created above is just one more alternative and any input
+        # passes. The manifest/input comparison in "Check crates.io state" below
+        # is what actually catches it.
         run: cargo xtask version --check --exact
 
   ci:
@@ -99,6 +104,7 @@ jobs:
     name: Verify publishable
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -226,6 +232,7 @@ jobs:
     name: Create draft release
     needs: [validate, ci, verify]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     env:
