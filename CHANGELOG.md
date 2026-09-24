@@ -36,12 +36,12 @@ All notable changes to this project are documented in this file.
 ### Changed
 
 - **Trials now run on a fresh, named thread instead of the dispatching
-  thread.** Each trial spawns via `thread::Builder::new().name(<trial
-  name>).spawn(...)`, joins, and re-raises any panic payload with
+  thread.** Each trial spawns on a `thread::Builder` named after the trial,
+  joins, and re-raises any panic payload with
   `resume_unwind` so libtest-mimic still reports it normally. This closes a
   cross-test leak: skuld's default (capture-enabled) mode forces
   libtest-mimic's `--test-threads=1`, under which every trial previously ran
-  sequentially on the *same* thread — the real main thread. A
+  sequentially on the _same_ thread — the real main thread. A
   `thread_local!` left set by one trial was therefore always observable by
   the next, a real hazard for any test suite with more than a handful of
   `thread_local!`-backed fixtures. The spawned thread uses std's default
@@ -56,7 +56,7 @@ All notable changes to this project are documented in this file.
   byte was never inspected.
 - **A failing fixture setup now fails a `should_panic` test.** Fixture
   resolution (`enter_test_scope` plus each `#[fixture]` parameter's
-  `fixture_get`) now runs *before* `catch_unwind`, not inside it. Previously,
+  `fixture_get`) now runs _before_ `catch_unwind`, not inside it. Previously,
   a fixture whose setup panicked would satisfy `should_panic`, masking a
   broken fixture as a passing test.
 - **`TestRegistration::drop` (the coordination DB's last connection per test)
@@ -65,7 +65,7 @@ All notable changes to this project are documented in this file.
   other connection (see below), so a DB that's become unusable since
   registration (e.g. replaced by a directory, or a filesystem-level publish
   failure) is now surfaced as a hard failure, not
-  silently swallowed — *except* when the test's own body already panicked
+  silently swallowed — _except_ when the test's own body already panicked
   (or is otherwise unwinding) and this drop is running as part of that
   unwind: a second, uncaught panic during an active unwind is Rust's "panic
   in a destructor during cleanup", which aborts the whole process
@@ -108,7 +108,7 @@ All notable changes to this project are documented in this file.
     glob), `fchmod`s it 0666, and publishes it with an atomic no-replace
     rename (`renameat2(..., RENAME_NOREPLACE)` via a raw `syscall()` on
     Linux and Android — going straight to the kernel sidesteps every
-    libc's own version floor for the `renameat2` *wrapper* symbol: glibc
+    libc's own version floor for the `renameat2` _wrapper_ symbol: glibc
     only exports it from 2.28, musl only from 1.2.6 (newer than what Rust's
     own bundled musl target links against), and uclibc never exports it at
     all — `renamex_np(..., RENAME_EXCL)` on macOS) — a lost race silently
