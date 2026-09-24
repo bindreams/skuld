@@ -143,3 +143,85 @@ doc = false
 name = "coordination_debug_fixture"
 path = "tests/support_bins/coordination_debug_fixture/main.rs"
 test = false
+doc = false
+
+# Subject fixture for thread_per_trial_cli.rs. Two dynamic trials that
+# record their thread's id and name, plus the main thread's id, to marker
+# files.
+[[bin]]
+name = "thread_per_trial"
+path = "tests/support_bins/thread_per_trial/main.rs"
+test = false
+doc = false
+
+# Subject fixture for fixture_setup_should_panic_cli.rs. A should_panic
+# test that depends on a fixture whose setup always fails.
+[[bin]]
+name = "broken_fixture_should_panic"
+path = "tests/support_bins/broken_fixture_should_panic/main.rs"
+test = false
+doc = false
+
+# Subject fixtures for libtest_names_cli.rs: opt-in libtest-style trial
+# names, and a hard error on duplicate final trial names.
+[[bin]]
+name = "libtest_names"
+path = "tests/support_bins/libtest_names/main.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "duplicate_names"
+path = "tests/support_bins/duplicate_names/main.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "duplicate_display_names"
+path = "tests/support_bins/duplicate_display_names/main.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "display_name_collides_with_libtest_path"
+path = "tests/support_bins/display_name_collides_with_libtest_path/main.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "dynamic_name_collides_with_inventory"
+path = "tests/support_bins/dynamic_name_collides_with_inventory/main.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "duplicate_names_ignored"
+path = "tests/support_bins/duplicate_names_ignored/main.rs"
+test = false
+doc = false
+
+# Subprocess probe for the coordination DB's atomic-publish behavior.
+# Connects to a caller-chosen DB path, optionally under a caller-chosen
+# umask, then holds the connection open across a handshake with the driver
+# before exiting. Also supports an opt-in stdout/stdin barrier so a driver
+# can hold several instances at the same starting line before they connect.
+# Spawned (never run in-process): umask is process-global, and the
+# concurrent-publishers test needs genuinely separate OS processes racing
+# to publish the same file.
+[[bin]]
+name = "publish_probe"
+path = "tests/support_bins/publish_probe/main.rs"
+test = false
+doc = false
+
+# Subprocess probe for the panic-during-unwind hazard in
+# `TestRegistration::drop`. Registers, corrupts the coordination DB out from
+# under itself, then panics while the guard is still alive so unwinding
+# drops it and its own `connect()` panics a second time. Spawned (never run
+# in-process) because an unfixed `Drop` can abort the whole process via
+# `SIGABRT`.
+[[bin]]
+name = "drop_panic_during_unwind_probe"
+path = "tests/support_bins/drop_panic_during_unwind_probe/main.rs"
+test = false
+doc = false

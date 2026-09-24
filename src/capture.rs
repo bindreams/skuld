@@ -588,11 +588,22 @@ impl FdCapture {
 impl Drop for FdCapture {
     fn drop(&mut self) {
         // Happy path: `end()` already took `saved`, so this path is a
-        // no-op. Drop runs only if `end` was skipped — normally
-        // impossible in `run_with_observability` because the runner
-        // always reaches `end` after `catch_unwind`. If it does run,
-        // we're in an exceptional state (bug in the runner or an
-        // unreachable panic path).
+        // no-op. Drop runs only if `end` was skipped. As
+        // `run_with_observability` is written today, that never happens:
+        // the trial name is checked before the capture window opens, a
+        // `Builder::spawn` failure is handled by the runner's `match`
+        // calling `capture_guard.take()` and `end()` before it panics, and
+        // `end()` otherwise always runs after the trial thread's `join()`
+        // returns, whether the trial panicked or not. This impl is a
+        // safety net for a path that doesn't currently exist rather than
+        // one that does: if a future change adds fallible code between
+        // `FdCapture::begin` and the point captured bytes are consumed via
+        // `end()`, and it panics without being caught, this still
+        // restores stdio instead of leaving it redirected into an
+        // abandoned pipe. On that path, whatever had already been written
+        // to the captured fds — and any `[skuld] {name}: ...` diagnostics
+        // not yet printed — is discarded, not dumped: only `end()` dumps
+        // captured bytes.
         let Some(saved) = self.saved.take() else {
             return;
         };

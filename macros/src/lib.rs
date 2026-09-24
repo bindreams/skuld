@@ -543,48 +543,65 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
     let is_async = func.sig.asyncness.is_some();
     let await_suffix = if is_async { quote!(.await) } else { quote!() };
 
-    // The core test body: enter scope, inject fixtures, call the test function.
-    // IntoTestResult handles both `()` and `Result<(), E>` return types.
-    let inner_body_core = if fixture_params.is_empty() {
-        quote! {
-            let __scope = ::skuld::enter_test_scope(#name_str, ::core::module_path!());
-            ::skuld::__private::IntoTestResult::into_test_result(#name()#await_suffix)
-        }
-    } else {
-        quote! {
-            let __scope = ::skuld::enter_test_scope(#name_str, ::core::module_path!());
-            #(#fixture_setup)*
-            ::skuld::__private::IntoTestResult::into_test_result(#name(#(#call_args),*)#await_suffix)
-        }
+    // Setup: enter scope and inject fixtures. Always runs *outside* should_panic's
+    // catch_unwind (see below) — a fixture setup failure is an infrastructure
+    // error, not a test panic that should satisfy should_panic. `#(#fixture_setup)*`
+    // expands to nothing when `fixture_params` is empty, so no separate branch
+    // is needed for the no-fixtures case.
+    let setup_core = quote! {
+        let __scope = ::skuld::enter_test_scope(#name_str, ::core::module_path!());
+        #(#fixture_setup)*
+    };
+
+    // The call itself: invoke the test function. IntoTestResult handles both
+    // `()` and `Result<(), E>` return types. `#name(#(#call_args),*)` expands
+    // to `#name()` when `call_args` is empty.
+    let call_core = quote! {
+        ::skuld::__private::IntoTestResult::into_test_result(#name(#(#call_args),*)#await_suffix)
     };
 
     // For async tests, build the runtime outside catch_unwind (a runtime build
     // failure is an infrastructure error, not a test panic that should satisfy
     // should_panic). The block_on call goes inside catch_unwind.
+    //
+    // `__rt.enter()` sets the runtime as this thread's current tokio context for as
+    // long as `__rt_guard` stays alive — which, since it's declared here before
+    // `#setup_core` and `#call_expr` and both are local to the same closure, covers
+    // fixture setup, the call itself, and fixture teardown (locals drop in reverse
+    // declaration order at the end of the closure). Without it, a sync fixture
+    // constructor or `Drop` impl that calls `Handle::current()` would see "there is
+    // no reactor running": `#setup_core` runs before `#call_expr`'s `block_on`, and
+    // teardown runs after `block_on` returns, so neither is otherwise covered by the
+    // runtime context `block_on` only holds for the async block itself.
     let runtime_preamble = if is_async {
-        quote! { let __rt = ::skuld::__private::build_async_runtime(); }
+        quote! {
+            let __rt = ::skuld::__private::build_async_runtime();
+            let __rt_guard = __rt.enter();
+        }
     } else {
         quote! {}
     };
 
-    let execute_core = if is_async {
-        quote! { __rt.block_on(async { #inner_body_core }) }
+    let call_expr = if is_async {
+        quote! { __rt.block_on(async { #call_core }) }
     } else {
-        quote! { #inner_body_core }
+        quote! { #call_core }
     };
 
     let body_expr = match &args.should_panic {
         ShouldPanicArg::No => quote! {
             || {
                 #runtime_preamble
-                #execute_core
+                #setup_core
+                #call_expr
             }
         },
         ShouldPanicArg::Yes => quote! {
             || {
                 #runtime_preamble
+                #setup_core
                 let __result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    #execute_core
+                    #call_expr
                 }));
                 if __result.is_ok() {
                     panic!("test did not panic as expected");
@@ -594,8 +611,9 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
         ShouldPanicArg::WithMessage(expected) => quote! {
             || {
                 #runtime_preamble
+                #setup_core
                 let __result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    #execute_core
+                    #call_expr
                 }));
                 match __result {
                     Ok(()) => panic!("test did not panic as expected"),

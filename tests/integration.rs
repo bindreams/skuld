@@ -10,6 +10,7 @@ fn main() {
 
     // Post-run assertions: verify test bodies and teardowns actually ran.
     support::async_tests::assert_all_ran();
+    support::async_tests::assert_runtime_context_probe_ran();
     support::capture_tests::assert_all_ran();
     support::harness_tests::assert_satisfied_test_ran();
     support::harness_tests::assert_result_tests_ran();

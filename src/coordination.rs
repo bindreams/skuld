@@ -6,6 +6,10 @@
 
 #[cfg(test)]
 mod coordination_tests;
+#[cfg(unix)]
+mod publish;
+#[cfg(all(test, unix))]
+mod publish_tests;
 
 use crate::label::{Label, LabelFilter};
 
@@ -48,18 +52,32 @@ fn instance_id() -> String {
 
 // Database initialization =====
 
-/// Current schema version. Bumped to 1 when LabelFilter canonicalization landed
-/// (azhukova/35). Older DBs may contain non-canonical `serial_filter` strings
+/// Current schema version. Bumped to 1 when LabelFilter canonicalization landed.
+/// Older DBs may contain non-canonical `serial_filter` strings
 /// from pre-canonicalization skuld; the migration in [`migrate_schema`] scrubs
 /// them on first open after upgrade.
 const SCHEMA_VERSION: i64 = 1;
+
+/// Open a connection to `path`, first ensuring the file exists published at
+/// mode 0666 on Unix, so whichever uid gets there first doesn't lock every
+/// other uid out with a narrow default mode. Every caller in this
+/// module goes through this one helper, including [`TestRegistration::drop`].
+///
+/// Windows is unchanged: no Windows lane mixes uids, so there's nothing for
+/// the publish step to protect against there.
+pub(crate) fn connect(path: &std::path::Path) -> rusqlite::Connection {
+    #[cfg(unix)]
+    publish::ensure_published(path);
+
+    rusqlite::Connection::open(path)
+        .unwrap_or_else(|e| panic!("skuld: failed to open coordination DB at {path:?}: {e}"))
+}
 
 /// Open a connection to the coordination database, creating it and the schema
 /// if necessary. Each call returns a fresh connection suitable for single-thread
 /// use.
 pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
-    let conn = rusqlite::Connection::open(path)
-        .unwrap_or_else(|e| panic!("skuld: failed to open coordination DB at {path:?}: {e}"));
+    let conn = connect(path);
     conn.busy_timeout(Duration::from_secs(5))
         .unwrap_or_else(|e| panic!("skuld: failed to set busy_timeout: {e}"));
     // Schema initialization requires a write lock. Under heavy concurrent access
@@ -236,6 +254,24 @@ fn pid_from_instance_id(instance_id: &str) -> Option<u32> {
 /// Check whether a process with the given PID is still alive.
 #[cfg(unix)]
 fn is_pid_alive(pid: u32) -> bool {
+    // `pid as i32` below is only meaningful for `0 < pid < 2^31`: `0` casts
+    // to `kill(0, 0)`, which checks the *caller's own process group* (always
+    // "exists") instead of a single process, and anything `>= 2^31` wraps
+    // negative — `-1` (only `u32::MAX`) makes `kill` check every process the
+    // caller may signal, and any other negative value makes it check the
+    // process *group* whose id is the absolute value — neither is "this one
+    // process still running". Every
+    // caller of this function (the schema scrub, `clean_stale_entries`)
+    // feeds it a `pid_from_instance_id`-parsed value, which only ever holds
+    // a real `std::process::id()` in ordinary use and can't produce either
+    // value — but the DB is world-writable, so any local uid can
+    // insert a row with a `"0:..."` or out-of-range instance_id, and a
+    // corrupted row could hold one too. No real process can have that PID,
+    // so it's always safe to report it as not alive rather than let the
+    // cast reinterpret it as a different check entirely.
+    if pid == 0 || pid >= (1u32 << 31) {
+        return false;
+    }
     // kill(pid, 0) checks existence without sending a signal.
     // Returns 0 on success, or EPERM if the process exists but we lack permission.
     let ret = unsafe { libc::kill(pid as i32, 0) };
@@ -386,15 +422,76 @@ pub(crate) struct TestRegistration {
 impl Drop for TestRegistration {
     fn drop(&mut self) {
         let cleanup = || -> Result<(), rusqlite::Error> {
-            let conn = rusqlite::Connection::open(&self.db_path)?;
+            let conn = connect(&self.db_path);
             conn.busy_timeout(Duration::from_secs(5))?;
             conn.execute_batch("PRAGMA foreign_keys = ON")?;
             conn.execute("DELETE FROM running WHERE id = ?1", [self.id])?;
             Ok(())
         };
-        if let Err(e) = cleanup() {
-            eprintln!("[skuld] warning: failed to unregister test from coordination DB: {e}");
+
+        // `connect()` can panic (a publish failure, or SQLite itself
+        // rejecting the file — e.g. it's been replaced by a directory —
+        // is loud by design). Ordinarily that panic should propagate: a
+        // genuinely broken DB is worth failing loudly over. But if this
+        // drop is running because the *thread* is already unwinding
+        // from a different, unrelated panic (e.g. the test itself failed), a
+        // second uncaught panic here is a panic during a panic — Rust turns
+        // that into `std::process::abort()` (`SIGABRT`), killing the whole
+        // process rather than just this one failing test. `catch_unwind`
+        // this call so we can tell those two cases apart and only let the
+        // panic through in the case where it's safe to.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup));
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("[skuld] warning: failed to unregister test from coordination DB: {e}");
+            }
+            Err(payload) => {
+                if std::thread::panicking() {
+                    // Already unwinding from another panic: downgrade to a
+                    // loud warning instead of letting this one escape and
+                    // aborting the process.
+                    eprintln!("{}", downgraded_warning_message(&payload));
+                } else {
+                    // Normal drop, no concurrent unwind: this is the only
+                    // panic in flight, so it's safe to let it through and
+                    // fail loudly as designed.
+                    std::panic::resume_unwind(payload);
+                }
+            }
         }
+    }
+}
+
+/// Build the downgraded-warning line for a panic payload caught from the
+/// cleanup closure above, for the case where the drop is already running
+/// during another panic's unwind. Pulled out of `Drop::drop` as its own
+/// function, taking `payload` by the same `&Box<dyn Any + Send>` shape
+/// `Drop::drop` holds it in, so unit tests exercise the exact call
+/// convention production code uses — not a stand-in for it. That matters
+/// because of a real footgun: `Box<dyn Any + Send>` is itself `Any` via the
+/// blanket impl, so `&payload` coerces to `&dyn Any` *over the Box*, not its
+/// contents, and `downcast_ref` inside `panic_payload_message` would then
+/// always miss. `payload.as_ref()` derefs through the Box first.
+fn downgraded_warning_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    let msg = panic_payload_message(payload.as_ref());
+    format!(
+        "[skuld] warning: coordination DB cleanup panicked while already unwinding from another \
+         panic (not re-raised, to avoid aborting the process): {msg}"
+    )
+}
+
+/// Best-effort extraction of a panic payload's message, for the downgraded
+/// warning path above. Panics are conventionally `&'static str` (from
+/// `panic!("literal")`) or `String` (from `panic!("{}", ...)` and friends);
+/// anything else prints as a fixed placeholder rather than guessing.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<non-string panic payload>"
     }
 }
 

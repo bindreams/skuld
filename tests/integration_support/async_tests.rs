@@ -53,6 +53,50 @@ async fn async_result_err_fails() -> Result<(), String> {
     Err("something went wrong".into())
 }
 
+// Fixture setup/teardown must run inside the async runtime's context ----------------------------
+//
+// Fixture setup now runs outside `should_panic`'s `catch_unwind`, but for an
+// async test that setup must still run inside the `tokio` runtime that
+// `__private::build_async_runtime` constructs (a sync fixture constructor or
+// `Drop` that calls `Handle::current()` must not see "there is no reactor
+// running"). This fixture's setup and its value's `Drop` both probe
+// `Handle::try_current()` to confirm that.
+
+static RUNTIME_CONTEXT_PROBE_SETUP_HAD_CONTEXT: AtomicBool = AtomicBool::new(false);
+static RUNTIME_CONTEXT_PROBE_DROP_HAD_CONTEXT: AtomicBool = AtomicBool::new(false);
+
+pub struct RuntimeContextProbe;
+
+impl Drop for RuntimeContextProbe {
+    fn drop(&mut self) {
+        RUNTIME_CONTEXT_PROBE_DROP_HAD_CONTEXT.store(tokio::runtime::Handle::try_current().is_ok(), Ordering::Relaxed);
+    }
+}
+
+#[skuld::fixture]
+fn runtime_context_probe() -> Result<RuntimeContextProbe, String> {
+    RUNTIME_CONTEXT_PROBE_SETUP_HAD_CONTEXT.store(tokio::runtime::Handle::try_current().is_ok(), Ordering::Relaxed);
+    Ok(RuntimeContextProbe)
+}
+
+#[skuld::test]
+async fn async_fixture_setup_and_teardown_run_inside_runtime_context(
+    #[fixture(runtime_context_probe)] _probe: &RuntimeContextProbe,
+) {
+    tokio::task::yield_now().await;
+}
+
+pub fn assert_runtime_context_probe_ran() {
+    assert!(
+        RUNTIME_CONTEXT_PROBE_SETUP_HAD_CONTEXT.load(Ordering::Relaxed),
+        "fixture setup must run inside the tokio runtime context for an async test"
+    );
+    assert!(
+        RUNTIME_CONTEXT_PROBE_DROP_HAD_CONTEXT.load(Ordering::Relaxed),
+        "fixture teardown (Drop) must run inside the tokio runtime context for an async test"
+    );
+}
+
 // Outer attribute tests --------------------------------------------------------------------------
 
 static ASYNC_OUTER_IGNORE_RAN: AtomicBool = AtomicBool::new(false);

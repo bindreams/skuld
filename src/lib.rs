@@ -174,4 +174,65 @@ pub mod __private {
             self.unwrap_or_else(|e| panic!("test returned an error: {e:?}"));
         }
     }
+
+    /// Probe hook for Skuld's own test suite: open a coordination DB
+    /// connection at `path`, running the Unix atomic-publish step and the
+    /// real schema-init path (`open_db`, not just `connect`),
+    /// and return it instead of dropping it. Going through `open_db` — not
+    /// `connect` alone — matters here: `PRAGMA journal_mode = WAL` is what
+    /// makes SQLite create the `-wal`/`-shm` companions in the first place,
+    /// and this hook exists to measure the mode those companions come out
+    /// at. `umask` is process-global, so testing "publish creates 0666
+    /// files despite a restrictive umask" safely needs a genuine subprocess
+    /// rather than mutating umask in-process, where it would corrupt
+    /// concurrently running unit tests. Support binaries under
+    /// `tests/support_bins/` link against Skuld's public API only, hence
+    /// this hook.
+    ///
+    /// Returning the live connection (rather than dropping it here) matters:
+    /// SQLite deletes `-wal`/`-shm` when the last connection to a database
+    /// closes, so a caller that dropped the connection before the driver
+    /// process got a chance to `stat` the companions would see them
+    /// vanish — not because publishing failed, but because nothing was
+    /// holding the database open anymore. `publish_probe`'s `main` keeps
+    /// this connection alive across a handshake with the driver for exactly
+    /// that reason.
+    #[cfg(unix)]
+    pub fn probe_coordination_connect(path: &std::path::Path) -> rusqlite::Connection {
+        crate::coordination::open_db(path)
+    }
+
+    /// Probe hook for Skuld's own test suite: register in the coordination
+    /// DB at `path`, corrupt it so a later `connect()` fails, then panic —
+    /// while the registration guard is still alive, so unwinding drops it.
+    /// `TestRegistration::drop` calls `connect()` too, so this reproduces a
+    /// panic occurring *during* an active unwind (inside a `Drop` the unwind
+    /// itself triggers). Without a `catch_unwind` guard in `Drop`, an
+    /// uncaught panic there is a panic during a panic, which Rust turns into
+    /// `abort()` (`SIGABRT`) — killing the whole process, not just this one
+    /// failing test. Needs a genuine subprocess: aborting the calling
+    /// process is the whole point of the probe.
+    ///
+    /// Corruption method: replace the DB file with a directory of the same
+    /// name, rather than `chmod`ing it narrow, so this hook is meaningful on
+    /// both platforms it runs on. On Unix, `ensure_published` sees the path
+    /// already exists (it's a directory) and skips publishing, so the
+    /// failure surfaces from SQLite's own file open, same as on Windows
+    /// (which skips the Unix-only publish step entirely): `rusqlite::Connection::open`
+    /// rejects a directory as a database (`SQLITE_CANTOPEN`) on both —
+    /// confirmed on macOS, and Skuld's CI Windows lane is what confirms the
+    /// Windows half. Either way, `chmod` has no Windows
+    /// analogue and would have left this hook, and the `Drop` fix it
+    /// exercises, untested on Windows CI even though the fix itself is
+    /// platform-agnostic.
+    pub fn probe_drop_panic_during_unwind(path: &std::path::Path) {
+        let _registration = crate::coordination::coordinate(path, "probe", &[], "");
+        std::fs::remove_file(path).unwrap_or_else(|e| panic!("probe: could not remove {path:?} to corrupt it: {e}"));
+        std::fs::create_dir(path).unwrap_or_else(|e| panic!("probe: could not create a directory at {path:?}: {e}"));
+
+        panic!(
+            "probe: artificial panic to trigger unwind; TestRegistration::drop's own connect() \
+             must not be allowed to abort the process"
+        );
+    }
 }
