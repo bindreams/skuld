@@ -6,7 +6,23 @@ mod support;
 fn main() {
     let original_cwd = std::env::current_dir().expect("failed to get initial cwd");
 
+    // `libtest_mimic::run` returns `Conclusion::empty()` — every count zero,
+    // no test body ever called — for a `--list` invocation (nextest's own
+    // test-discovery step calls every binary this way before running any of
+    // them for real). The post-run assertions below check side effects
+    // (`AtomicBool`s a body sets), not `Conclusion`'s counts, so they must be
+    // skipped for exactly this case; a real run that (impossibly, given the
+    // fixed test set below) filtered everything to zero would look
+    // identical to list-only through `Conclusion` alone, so the signal has
+    // to come from the same argv `run_tests` itself parses, not from the
+    // `Conclusion` it returns.
+    let list_only = <libtest_mimic::Arguments as clap::Parser>::parse_from(std::env::args()).list;
+
     let conclusion = skuld::TestRunner::new().run_tests();
+
+    if list_only {
+        conclusion.exit();
+    }
 
     // Post-run assertions: verify test bodies and teardowns actually ran.
     support::async_tests::assert_all_ran();
