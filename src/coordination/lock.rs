@@ -107,7 +107,12 @@ fn acquire_lock(path: &Path) -> File {
 /// publishing is always the thing that creates it. Windows has no
 /// uid-mixing hazard to guard against (see [`super::connect`]'s doc), so
 /// `create(true)` there creates-or-opens atomically in the one call, the
-/// same as it always has.
+/// same as it always has — `write(true)` alongside it is not optional
+/// there: `OpenOptions` rejects `create(true)` outright, before ever
+/// touching the filesystem, unless `write` or `append` is also set
+/// ("creating or truncating a file requires write or append access"), so
+/// this isn't `flock`/`LockFileEx` needing write access, only `std`'s own
+/// precondition for the flag combination that creates a file.
 fn open_lock_file(path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
@@ -118,6 +123,7 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
     {
         OpenOptions::new()
             .create(true)
+            .write(true)
             // Explicit, not the default: the lock file's contents are never
             // read or written by this module (only its identity as a
             // lockable object matters), so truncating it on open would just
