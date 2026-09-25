@@ -15,37 +15,57 @@
 //! waiting: `busy_timeout` and SQLite's own locking still apply to work
 //! done *while* this lock is held.
 //!
-//! **The lock target itself can never be deleted or replaced out from under
-//! a holder.** That is what lets [`with_init_lock`] be a single
-//! open-then-lock with no retry loop and no check that the locked handle
-//! still matches whatever is on disk: an open that succeeds is already the
-//! lock every other caller will contend, permanently, for as long as this
-//! handle stays open.
+//! **The lock target can't be deleted or replaced by anything short of
+//! recreating the directory (Unix) or the file (Windows) it lives at.** That
+//! is what lets [`with_init_lock`] be a single open-then-lock with no retry
+//! loop and no check that the locked handle still matches whatever is on
+//! disk: an open that succeeds is already the lock every other caller will
+//! contend, permanently, for as long as this handle stays open — *unless*
+//! something outside this crate replaces the lock target's directory entry
+//! wholesale while that handle is open (see the Unix bullet below); this
+//! crate itself never does that.
 //!
 //! - **Unix** locks `db_path`'s parent directory — the profile directory
 //!   holding `.skuld.db` — opened `O_RDONLY | O_DIRECTORY | O_CLOEXEC` (the
-//!   `CLOEXEC` bit is also `std`'s own default for every `File::open`; it's
-//!   named explicitly here only because the module doc for this design
-//!   calls it out, not because it adds anything `std` doesn't already do).
-//!   `flock` works directly on a read-only directory fd, so there is no
-//!   separate lock file, nothing here ever needs write access to anything,
-//!   and no uid needs more than the ordinary read+search access it already
-//!   needs to reach `.skuld.db` itself. The directory can't be `rmdir`'d
-//!   while `.skuld.db` (or its `-wal`/`-shm` companions) still live inside
-//!   it — `ENOTEMPTY` — and nothing in this crate ever removes the
-//!   directory itself, only files inside it, so the locked directory's
-//!   identity can't change out from under a holder.
+//!   `CLOEXEC` bit is redundant here — `std` already sets it on every
+//!   `File::open` regardless — and is listed only for parity with
+//!   `O_DIRECTORY`, since both are passed through the same `custom_flags`
+//!   call).
+//!   `flock` works directly on a directory fd opened read-only, so there is
+//!   no separate lock file and nothing here ever needs write access to
+//!   anything; opening the directory at all still needs ordinary *read*
+//!   permission on it, not just the search (execute) permission that's
+//!   enough to merely reach `.skuld.db` inside it by name. An ordinary
+//!   delete of `.skuld.db` (or its `-wal`/`-shm` companions) can't split the
+//!   lock: the directory itself is untouched by deleting a file inside it,
+//!   `ENOTEMPTY` still blocks a plain `rmdir` while any of them remain, and
+//!   nothing in this crate ever removes the directory itself, only files
+//!   inside it. **Wholesale replacement of the directory does still split
+//!   it**, the same accepted risk class as deleting `.skuld.db` itself
+//!   mid-run (see [`super::connect`]'s doc): renaming the directory aside
+//!   and `mkdir`ing a fresh one at the same path, or emptying it,
+//!   `rmdir`ing it, and `mkdir`ing it again, both leave the holder locking
+//!   its old (now-detached) directory while every new opener locks the
+//!   fresh one instead — this module verifies nothing about what's still at
+//!   the path beyond a successful open, so nothing here would notice the
+//!   swap to tell the two groups apart.
 //! - **Windows** locks a sibling [`lock_path`] file, opened with
 //!   `share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)` and, deliberately, no
 //!   `FILE_SHARE_DELETE`. Windows refuses to delete or rename a file out
 //!   from under any handle that didn't grant that share flag, so the lock
-//!   file can't be split out from under a holder either.
+//!   file can't be split out from under a holder at all, not even by
+//!   wholesale replacement.
 //!
 //! Any failure to open the lock target — a missing parent directory,
 //! file-descriptor-table exhaustion (`EMFILE`), a permissions problem,
 //! anything at all — panics immediately, naming the path. None of those
 //! conditions resolve themselves by trying the same open again, so there is
-//! nothing to retry.
+//! nothing to retry. On Unix specifically, a filesystem whose `flock` refuses
+//! to operate on a directory at all (some network filesystems' emulated
+//! `flock`, NFS's included) surfaces the same way: the `open` above still
+//! succeeds, but the subsequent `lock()` call in [`with_init_lock`] fails and
+//! panics, naming the path — there is no fallback to a different locking
+//! mechanism.
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;

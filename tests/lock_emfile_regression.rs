@@ -1,6 +1,8 @@
-//! Regression guard for M-a: at `RLIMIT_NOFILE` minus one, opening the
-//! coordination DB's lock target fails `EMFILE`; `open_lock_target` must
-//! turn that into an immediate panic, not an infinite spin. See
+//! Regression guard for M-a: with zero file descriptors left to spend (the
+//! probe's `RLIMIT_NOFILE` soft limit is lowered to exactly the 3 already
+//! open — stdin/stdout/stderr — leaving none free), opening the coordination
+//! DB's lock target fails `EMFILE`; `open_lock_target` must turn that into
+//! an immediate panic, not an infinite spin. See
 //! `tests/support_bins/lock_emfile_probe/main.rs`'s module doc for how the
 //! subprocess reaches `EMFILE` deterministically, without looping.
 //!

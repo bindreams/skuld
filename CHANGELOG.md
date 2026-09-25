@@ -153,17 +153,24 @@ All notable changes to this project are documented in this file.
     `.skuld.db` publish step entirely (there's no uid-mixing hazard to
     guard against there) but takes the same init lock as every other
     platform, since `open_db`'s WAL negotiation race is cross-platform.
-  - The lock target can never be deleted or replaced out from under a
-    holder, on either platform, so acquiring it is always a single
-    open-then-lock with no retry and no check that the locked handle still
-    matches what's on disk. On Unix, the lock is taken directly on
-    `.skuld.db`'s parent directory (opened read-only) rather than a
-    separate file: a non-empty directory can't be `rmdir`'d, and nothing in
-    this crate ever removes the directory itself, only files inside it. On
+  - Acquiring the lock is always a single open-then-lock with no retry and
+    no check that the locked handle still matches what's on disk. On Unix,
+    the lock is a directory `flock` taken directly on `.skuld.db`'s parent
+    directory, opened on a read-only fd (which still needs ordinary read
+    permission on the directory, not only search/execute), rather than a
+    separate lock file: an ordinary delete of `.skuld.db` itself can't split
+    the lock, since a non-empty directory can't be `rmdir`'d and nothing in
+    this crate ever removes the directory itself, only files inside it —
+    but wholesale replacement of the directory (rename-and-recreate, or
+    empty-rmdir-recreate) still can, the same accepted risk as deleting
+    `.skuld.db` itself mid-run. Some network filesystems refuse to `flock` a
+    directory at all — NFS's emulated `flock` among them — and skuld panics
+    loudly, naming the path, rather than falling back to a weaker lock. On
     Windows, the lock is a sibling `.skuld.db.lock` file opened with
     `FILE_SHARE_READ | FILE_SHARE_WRITE` and no `FILE_SHARE_DELETE`, so
     Windows itself refuses to delete or rename it while any handle holds
-    it. A failure to open the lock target — a missing parent directory,
+    it — that guarantee has no gap on Windows. A failure to open the lock
+    target on either platform — a missing parent directory,
     file-descriptor exhaustion, or anything else — panics immediately,
     naming the path, rather than retrying.
   - Only creation needs mode and no-replace-rename support: `ensure_published`

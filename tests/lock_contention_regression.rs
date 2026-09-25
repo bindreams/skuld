@@ -103,22 +103,30 @@ fn a_second_process_try_lock_reports_would_block_while_another_process_holds_the
     );
 }
 
-/// `src/coordination/lock.rs`'s whole design rests on the lock target being
-/// impossible to delete or replace out from under a holder — this proves
-/// that end to end across genuinely separate processes: while
-/// `lock_hold_probe` holds the real lock, an attempt to delete the lock
-/// target must fail (platform-specific mechanism, see below), and a fresh
-/// `try_lock` must still report `WouldBlock`, exactly as if nothing had
-/// been attempted. This is the scenario the previous identity-check-and-
-/// retry design only half handled: it detected a split after the fact
-/// instead of making the split impossible to begin with.
+/// `src/coordination/lock.rs`'s whole design rests on the lock target's own
+/// identity being stable while a holder has it open — this proves that end
+/// to end across genuinely separate processes, by a different mechanism per
+/// platform: on Windows, an attempt to delete the lock file itself must fail
+/// outright (`FILE_SHARE_DELETE` was never granted); on Unix, the lock
+/// target is `.skuld.db`'s parent directory, not `.skuld.db` itself, so
+/// deleting `.skuld.db` *succeeds* — the point is that doing so must not
+/// touch the directory's identity, so a fresh `try_lock` against the same
+/// directory must still report `WouldBlock` afterward, exactly as if nothing
+/// had been deleted. (Asserting that `rmdir` on the still-non-empty
+/// directory fails would prove nothing: that's true of any non-empty
+/// directory, lock or no lock — `ENOTEMPTY` doesn't depend on `flock` at
+/// all.) This is the scenario the previous identity-check-and-retry design
+/// only half handled: it detected a split after the fact instead of making
+/// the split impossible to begin with. Wholesale replacement of the profile
+/// directory itself (rename-and-recreate, or empty-rmdir-recreate) is a
+/// different, accepted risk this test doesn't claim to cover — see
+/// `src/coordination/lock.rs`'s module doc.
 #[test]
 fn a_holder_cannot_have_its_lock_target_deleted_out_from_under_it() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join(".skuld.db");
-    // The Unix half of this test needs `.skuld.db` to genuinely exist:
-    // `ENOTEMPTY` is what keeps the locked directory from being removed,
-    // not `flock` itself (see `src/coordination/lock.rs`'s module doc).
+    // The Unix half of this test needs `.skuld.db` to genuinely exist so
+    // there is something to delete below.
     std::fs::write(&db_path, b"").expect("create a stand-in .skuld.db");
 
     let mut holder = hold_probe(&db_path).spawn().expect("spawn lock_hold_probe");
@@ -133,18 +141,16 @@ fn a_holder_cannot_have_its_lock_target_deleted_out_from_under_it() {
 
     #[cfg(unix)]
     {
-        // The directory holding `.skuld.db` is the lock target on Unix. A
-        // non-empty directory can never be `rmdir`'d regardless of any
-        // lock, but that is exactly the point: as long as `.skuld.db`
-        // stays inside it, the directory's identity is structurally stable
-        // while a holder has it open.
-        let err = std::fs::remove_dir(dir.path())
-            .expect_err("a profile directory containing .skuld.db must not be removable while a holder has it locked");
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::DirectoryNotEmpty,
-            "unexpected error removing the locked profile directory: {err}"
-        );
+        // The lock target on Unix is `.skuld.db`'s parent directory, not
+        // `.skuld.db` itself — so deleting every `.skuld.db*` file must
+        // *succeed* here (there's nothing protecting them), and that's the
+        // real property under test: doing so must not touch the directory
+        // the lock is actually bound to. Only `.skuld.db` itself exists in
+        // this test (no `-wal`/`-shm`: nothing here ever opened a real
+        // SQLite connection to create them), so deleting it empties the
+        // directory completely.
+        std::fs::remove_file(&db_path)
+            .expect("deleting .skuld.db itself must succeed — it is not what's locked, its parent directory is");
     }
 
     #[cfg(windows)]
@@ -162,14 +168,16 @@ fn a_holder_cannot_have_its_lock_target_deleted_out_from_under_it() {
     let out = try_probe(&db_path);
     assert!(
         out.status.success(),
-        "lock_try_probe failed after the failed deletion attempt: {}",
+        "lock_try_probe failed after the deletion attempt above: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(
         out.stdout,
         b"B",
-        "a second process's try_lock must still report WouldBlock after a failed attempt to \
-         delete the lock target; stderr:\n{}",
+        "a second process's try_lock must still report WouldBlock after the deletion attempt \
+         above (which failed on Windows because the lock file itself is protected; which \
+         succeeded on Unix because deleting .skuld.db doesn't touch the directory that's \
+         actually locked); stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 
