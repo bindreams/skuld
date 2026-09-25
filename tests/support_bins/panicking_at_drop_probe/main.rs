@@ -2,7 +2,8 @@
 //! Not a real product binary.
 //!
 //! Pins two things about fixture teardown timing for a satisfied
-//! `should_panic` test:
+//! `should_panic` test, for both the bare (`Yes`) and message-checked
+//! (`WithMessage`) arms:
 //!
 //! 1. A Test-scoped fixture's `Drop` impl (`Tracked` below) must see
 //!    `std::thread::panicking() == true`: `__scope` (which reclaims
@@ -20,14 +21,29 @@
 //!    borrowed from it, was still alive — a dangling reference, not just a
 //!    timing difference.
 //!
-//! Reads `SKULD_PANICKING_AT_DROP_PROBE_OUT` (required: a file path).
-//! Each fixture's `Drop` appends one line there, tagged with its kind and
-//! what `std::thread::panicking()` read at the moment it ran — appended
-//! rather than overwritten so the driver can check both the values and the
-//! order they were written in. Never panics itself (a panic here, while the
+//! `panics_with_tracked_fixture` and `panics_with_tracked_fixture_msg`
+//! (`Yes` and `WithMessage`) pin these for a *satisfied* should_panic test.
+//! `body_completes_but_fixture_drop_panics` and its `_msg` twin pin the
+//! opposite case: the test body never panics, but a fixture's `Drop`
+//! (`PanicsOnDrop` below) does. Both arms must fail such a test — a
+//! teardown panic must never be mistaken for the expected one, the same
+//! way the plain (non-should_panic) arm would fail this shape.
+//!
+//! Reads `SKULD_PANICKING_AT_DROP_PROBE_OUT` (required for the two
+//! drop-order tests: a file path). Each of `Tracked`'s and `Dependent`'s
+//! `Drop` appends one line there, tagged with its kind and what
+//! `std::thread::panicking()` read at the moment it ran — appended rather
+//! than overwritten so the driver can check both the values and the order
+//! they were written in. Never panics itself (a panic here, while the
 //! test's own panic is already unwinding through this same `Drop`, would be
 //! a double panic — `SIGABRT` — which would only obscure the read this
-//! probe exists to take).
+//! probe exists to take). `PanicsOnDrop::drop` is the one exception: it
+//! panics unconditionally, since being the teardown panic under test is its
+//! entire purpose.
+//!
+//! The driver runs each test individually (`--exact <name>`), since the
+//! two `body_completes_but_fixture_drop_panics*` tests are expected to
+//! fail the process and must not affect the other tests' exit status.
 
 fn log_drop(line: &str) {
     if let Ok(path) = std::env::var("SKULD_PANICKING_AT_DROP_PROBE_OUT") {
@@ -74,6 +90,38 @@ fn dependent(#[fixture(tracked)] _t: &Tracked) -> Result<Dependent, String> {
 fn panics_with_tracked_fixture(#[fixture(dependent)] _v: &Dependent) {
     panic!("expected panic to pin fixture drop timing and order");
 }
+
+// Same scenario as above, but for the message-checked (`WithMessage`) arm:
+// the drop-order/panicking() guarantees must hold there too, not just for
+// the bare arm.
+#[skuld::test(should_panic = "expected panic to pin fixture drop timing and order")]
+fn panics_with_tracked_fixture_msg(#[fixture(dependent)] _v: &Dependent) {
+    panic!("expected panic to pin fixture drop timing and order");
+}
+
+struct PanicsOnDrop;
+
+impl Drop for PanicsOnDrop {
+    fn drop(&mut self) {
+        panic!("PanicsOnDrop::drop panicked");
+    }
+}
+
+#[skuld::fixture]
+fn panics_on_drop() -> Result<PanicsOnDrop, String> {
+    Ok(PanicsOnDrop)
+}
+
+// Body never panics; `panics_on_drop`'s teardown does. Must FAIL: a
+// teardown panic isn't the body panic should_panic contracts for.
+#[skuld::test(should_panic)]
+fn body_completes_but_fixture_drop_panics(#[fixture(panics_on_drop)] _p: &PanicsOnDrop) {}
+
+// Same, but for `WithMessage`, with the expected substring set to match
+// the teardown panic's own message — the exact shape that would let the
+// pre-fix code mistake it for a satisfied expectation.
+#[skuld::test(should_panic = "PanicsOnDrop::drop panicked")]
+fn body_completes_but_fixture_drop_panics_msg(#[fixture(panics_on_drop)] _p: &PanicsOnDrop) {}
 
 fn main() {
     skuld::run_all();

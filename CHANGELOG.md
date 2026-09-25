@@ -74,7 +74,13 @@ All notable changes to this project are documented in this file.
   plain (non-`should_panic`) case: a `Drop` impl sees
   `std::thread::panicking() == true`, and a Variable-scoped fixture that
   depends on a Test-scoped one still drops before the Test-scoped one is
-  reclaimed.
+  reclaimed. A panic from teardown itself (a fixture `Drop`, or `__scope`'s
+  reclaim) is no longer mistaken for the expected one either: if the test
+  body returns normally, any panic `catch_unwind` then catches is resumed
+  rather than counted as satisfying `should_panic`, so a test whose body
+  never panics still fails when a fixture's `Drop` does — for both
+  `should_panic` and `should_panic = "..."`, which now share one generated
+  code path instead of two hand-mirrored copies.
 - **`TestRegistration::drop` (the coordination DB's last connection per test)
   now panics loudly when its own `connect()` call fails**, instead of only
   `eprintln!`-warning. It goes through the same `connect()` helper as every

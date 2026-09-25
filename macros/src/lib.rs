@@ -634,6 +634,87 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
         quote! { #call_core }
     };
 
+    // should_panic arms only (Yes and WithMessage share this): once
+    // `#call_expr` has returned normally, `__body_completed` is set, and any
+    // panic caught afterwards came from teardown (a fixture `Drop`, or
+    // `__scope`'s reclaim) rather than from the body should_panic contracts
+    // for. Resuming it there — instead of falling into the message check —
+    // fails the test the same way the plain arm would for a panicking Drop;
+    // see `body_completes_but_fixture_drop_panics` (and its `_msg` twin) in
+    // `tests/support_bins/panicking_at_drop_probe/main.rs`.
+    let message_check = match &args.should_panic {
+        ShouldPanicArg::WithMessage(expected) => quote! {
+            let __msg = if let Some(s) = __payload.downcast_ref::<String>() {
+                s.as_str()
+            } else if let Some(s) = __payload.downcast_ref::<&str>() {
+                *s
+            } else {
+                panic!(
+                    "test panicked as expected, but the panic payload is not a string \
+                     (expected message containing {:?})",
+                    #expected,
+                );
+            };
+            if !__msg.contains(#expected) {
+                panic!(
+                    "test panicked as expected, but the message {:?} \
+                     does not contain {:?}",
+                    __msg, #expected,
+                );
+            }
+        },
+        _ => quote! {},
+    };
+
+    let should_panic_body = quote! {
+        || {
+            #runtime_preamble
+            #scope_and_fixture_gets
+            // `__scope` and every fixture handle move into this closure
+            // (rather than staying locals of the outer one), in the same
+            // declaration order `fixture_get` ran them in, so their `Drop`s —
+            // including `__scope`'s, which reclaims Test-scoped fixtures —
+            // run here, while a real panic from `#call_expr` is still
+            // unwinding through this closure's own scope, same as it would
+            // for a body with no should_panic at all. That also keeps drop
+            // order matching the plain arm: a Variable-scoped fixture that
+            // borrows from a Test-scoped one (via `#[fixture(other)]`) still
+            // drops before the Test-scoped one reclaims it, instead of after
+            // — dropping the handles here, in order, before `#call_expr`
+            // reproduces the same nesting the plain arm's single block gets
+            // for free. Left outside, they'd instead drop after
+            // `catch_unwind` has already caught and stopped the unwind, so a
+            // fixture `Drop` impl that checks `std::thread::panicking()`
+            // would see `false` for a panic this test expected and got, and
+            // `skuld::current_test()` would already be cleared — see
+            // `should_panic_satisfied_reports_panicking_during_scope_drop`
+            // in `tests/panicking_at_drop_cli.rs`. The `as_ref` bindings run
+            // after the moves, inside the closure too: they borrow the
+            // handles, so they have to outlive them.
+            let mut __body_completed = false;
+            let __result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                let __scope = __scope;
+                #(#fixture_handle_moves)*
+                #(#fixture_bindings)*
+                #call_expr;
+                __body_completed = true;
+            }));
+            match __result {
+                Ok(()) => panic!("test did not panic as expected"),
+                Err(__payload) => {
+                    if __body_completed {
+                        // The body already returned normally; this panic came
+                        // from teardown, not from the body. Resume it so the
+                        // test fails, instead of counting it as satisfying
+                        // should_panic.
+                        ::std::panic::resume_unwind(__payload);
+                    }
+                    #message_check
+                }
+            }
+        }
+    };
+
     let body_expr = match &args.should_panic {
         ShouldPanicArg::No => quote! {
             || {
@@ -642,78 +723,7 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
                 #call_expr
             }
         },
-        ShouldPanicArg::Yes => quote! {
-            || {
-                #runtime_preamble
-                #scope_and_fixture_gets
-                // `__scope` and every fixture handle move into this closure
-                // (rather than staying locals of the outer one), in the same
-                // declaration order `fixture_get` ran them in, so their `Drop`s —
-                // including `__scope`'s, which reclaims Test-scoped fixtures —
-                // run here, while a real panic from `#call_expr` is still
-                // unwinding through this closure's own scope, same as it would
-                // for a body with no should_panic at all. That also keeps drop
-                // order matching the plain arm: a Variable-scoped fixture that
-                // borrows from a Test-scoped one (via `#[fixture(other)]`) still
-                // drops before the Test-scoped one reclaims it, instead of after
-                // — dropping the handles here, in order, before `#call_expr`
-                // reproduces the same nesting the plain arm's single block gets
-                // for free. Left outside, they'd instead drop after
-                // `catch_unwind` has already caught and stopped the unwind, so a
-                // fixture `Drop` impl that checks `std::thread::panicking()`
-                // would see `false` for a panic this test expected and got, and
-                // `skuld::current_test()` would already be cleared — see
-                // `should_panic_satisfied_reports_panicking_during_scope_drop`
-                // in `tests/panicking_at_drop_cli.rs`. The `as_ref` bindings run
-                // after the moves, inside the closure too: they borrow the
-                // handles, so they have to outlive them.
-                let __result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    let __scope = __scope;
-                    #(#fixture_handle_moves)*
-                    #(#fixture_bindings)*
-                    #call_expr
-                }));
-                if __result.is_ok() {
-                    panic!("test did not panic as expected");
-                }
-            }
-        },
-        ShouldPanicArg::WithMessage(expected) => quote! {
-            || {
-                #runtime_preamble
-                #scope_and_fixture_gets
-                // See the identical comment on the plain `should_panic` arm above.
-                let __result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    let __scope = __scope;
-                    #(#fixture_handle_moves)*
-                    #(#fixture_bindings)*
-                    #call_expr
-                }));
-                match __result {
-                    Ok(()) => panic!("test did not panic as expected"),
-                    Err(__payload) => {
-                        let __msg = if let Some(s) = __payload.downcast_ref::<String>() {
-                            s.as_str()
-                        } else if let Some(s) = __payload.downcast_ref::<&str>() {
-                            *s
-                        } else {
-                            panic!(
-                                "test panicked as expected, but the panic payload is not a string \
-                                 (expected message containing {:?})",
-                                #expected,
-                            );
-                        };
-                        if !__msg.contains(#expected) {
-                            panic!(
-                                "test panicked as expected, but the message {:?} \
-                                 does not contain {:?}",
-                                __msg, #expected,
-                            );
-                        }
-                    }
-                }
-            }
-        },
+        ShouldPanicArg::Yes | ShouldPanicArg::WithMessage(_) => should_panic_body,
     };
 
     let should_panic_expr = match &args.should_panic {
