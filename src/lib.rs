@@ -202,6 +202,40 @@ pub mod __private {
         crate::coordination::open_db(path)
     }
 
+    /// Probe hook for Skuld's own test suite: open a coordination DB
+    /// connection at `path` via the real init path (`open_db`) and
+    /// immediately write through it, panicking loudly if the write fails.
+    /// Exists to catch a connection that opened without error but came back
+    /// permanently `SQLITE_READONLY` from a lost `PRAGMA journal_mode =
+    /// WAL` cold-start negotiation over the freshly-created `-shm` file —
+    /// `open` alone can't detect this, since a stuck-readonly connection
+    /// still opens fine; only a write on it fails.
+    ///
+    /// Meant to run from a genuine subprocess, not an in-process thread:
+    /// SQLite's own unix VFS serializes `-shm` creation across every thread
+    /// *of one process* through a process-local mutex (`unixShmNode`'s init
+    /// lock), so this race is invisible to a thread-only probe within a
+    /// single process — confirmed empirically (a 64-thread × 100-round
+    /// in-process probe against the pre-lock code never reproduced it). See
+    /// `tests/wal_cold_start_race_regression.rs`, which drives this hook
+    /// from real subprocesses; its own doc records that even that did not
+    /// reproduce a failure locally despite substantial stress, so treat
+    /// this as a hardening probe for a real, documented race rather than a
+    /// proven repro. Not `#[cfg(unix)]`: this race lives in SQLite's own
+    /// cross-platform WAL negotiation inside `open_db`, not in the
+    /// Unix-only publish step [`probe_coordination_connect`] above
+    /// exercises.
+    pub fn probe_coordination_write(path: &std::path::Path) {
+        let conn = crate::coordination::open_db(path);
+        conn.execute(
+            "INSERT INTO running (instance_id, name, serial_filter) VALUES (?1, ?2, ?3)",
+            rusqlite::params![std::process::id().to_string(), "wal_race_probe", ""],
+        )
+        .unwrap_or_else(|e| {
+            panic!("probe: write through open_db's connection at {path:?} failed (stuck readonly?): {e}")
+        });
+    }
+
     /// Probe hook for Skuld's own test suite: register in the coordination
     /// DB at `path`, corrupt it so a later `connect()` fails, then panic —
     /// while the registration guard is still alive, so unwinding drops it.

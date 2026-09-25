@@ -601,33 +601,36 @@ fn connect_panics_loudly_on_a_dangling_symlink_instead_of_recreating_the_db() {
     );
 }
 
-/// The gap between `ensure_published` returning and the retried open
-/// running is itself just another absence check, not a one-shot window:
-/// this drives `connect_with`'s publish hook to leave `.skuld.db` absent
-/// for the first two rounds and only really publish on the third, proving
-/// the loop keeps retrying through repeated genuine absence rather than
-/// panicking after the first round trip — there's no attempt cap.
+/// `connect_with` runs under `path`'s init lock (via `connect`/`open_db`),
+/// so it is the only creator or publisher in the whole system for the
+/// duration of the call — there is no concurrent publisher left to race,
+/// and therefore no legitimate reason to retry the publish step at all.
+/// One open, one publish attempt on `CANTOPEN`+absence, one more open: if
+/// the publish hook doesn't leave a file at `path` — a caller bug against
+/// `ensure_published`'s own documented contract, which is to panic rather
+/// than return without one — that must surface immediately as a loud
+/// panic, not as silent, indefinite retrying.
 #[cfg(unix)]
 #[test]
-fn connect_retries_through_repeated_genuine_absence_with_no_attempt_cap() {
+fn connect_with_panics_immediately_if_the_publish_hook_leaves_the_path_absent() {
     let (_dir, path) = temp_db();
     let mut publish_calls = 0u32;
 
-    let conn = crate::coordination::connect_with(&path, |p| {
-        publish_calls += 1;
-        if publish_calls < 3 {
-            // Leave `p` absent: the next open must fail CANTOPEN/NotFound
-            // again instead of giving up.
-            return;
-        }
-        crate::coordination::publish::ensure_published(p);
-    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::coordination::connect_with(&path, |_p| {
+            publish_calls += 1;
+            // Deliberately violate ensure_published's contract: leave `p`
+            // absent instead of creating it.
+        })
+    }));
 
-    conn.execute_batch("PRAGMA journal_mode = WAL;")
-        .expect("the connection returned after the retries must be a usable, open database");
+    assert!(
+        result.is_err(),
+        "connect_with must panic, not retry indefinitely, when the publish hook leaves path absent"
+    );
     assert_eq!(
-        publish_calls, 3,
-        "connect_with must call the publish hook again for every round of genuine absence"
+        publish_calls, 1,
+        "connect_with must call the publish hook exactly once per open attempt, never loop"
     );
 }
 
@@ -670,6 +673,18 @@ fn connect_survives_many_threads_racing_the_same_absent_path() {
         });
     }
 }
+
+// The `SQLITE_READONLY` WAL cold-start race documented on `open_db` (a
+// connection that loses `PRAGMA journal_mode = WAL`'s negotiation over the
+// freshly-created `-shm` file can come back permanently readonly for its
+// own lifetime) has no in-process regression test here: SQLite's own unix
+// VFS serializes `-shm` creation across every thread *of one process*
+// through a process-local mutex, so the race is invisible to threads
+// sharing a process, only observable (if at all — see that file's own doc)
+// between genuinely separate OS processes — confirmed empirically (a
+// 64-thread x 100-round in-process write-based probe never reproduced it
+// against the pre-lock code). See `tests/wal_cold_start_race_regression.rs`,
+// which spawns real subprocesses via the `wal_race_probe` binary instead.
 
 // Windows is_pid_alive: only "no such process" means dead =====
 

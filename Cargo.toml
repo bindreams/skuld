@@ -220,3 +220,10 @@ name = "panicking_at_drop_probe"
 path = "tests/support_bins/panicking_at_drop_probe/main.rs"
 test = false
 doc = false
+
+# See tests/support_bins/wal_race_probe/main.rs's module doc.
+[[bin]]
+name = "wal_race_probe"
+path = "tests/support_bins/wal_race_probe/main.rs"
+test = false
+doc = false
