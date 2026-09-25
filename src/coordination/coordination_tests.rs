@@ -564,32 +564,38 @@ fn drop_panics_loudly_on_a_corrupt_db_when_nothing_else_is_unwinding() {
 
 // Init lock file permissions =====
 
-/// Regression guard for H1: the lock file must never need write access to
-/// be locked (`flock`/`LockFileEx` only ever need read access on the
-/// handle — see `lock.rs`'s module doc), so `open_db` must succeed even
-/// against a pre-existing lock file that lacks the owner write bit
-/// entirely. Before the fix, `open_lock_file` opened with `.write(true)`,
-/// which would fail `EACCES` here exactly the way a root-published,
-/// 0644-narrowed-by-umask lock file would fail a later non-root run.
+/// Regression guard for H1, adapted to this module's directory-flock
+/// design: Unix locks `db_path`'s parent directory itself, not a sibling
+/// `.lock` file (see `lock.rs`'s module doc), so `open_db` must succeed
+/// (and never touch that file at all) even when a `.lock` file left behind
+/// by an older Skuld release — one that did lock a sibling file, published
+/// at whatever mode a root lane's umask gave it — has no owner write bit.
+/// Before this design, `open_lock_file` opened that file with
+/// `.write(true)`, which would fail `EACCES` here exactly the way a
+/// root-published, 0644-narrowed-by-umask lock file would fail a later
+/// non-root run; this proves the new design can't hit that failure mode at
+/// all, since it never opens the leftover file in the first place.
 #[cfg(unix)]
 #[test]
-fn open_db_succeeds_against_a_preexisting_lock_file_with_no_owner_write_bit() {
+fn open_db_succeeds_and_ignores_a_leftover_lock_file_with_no_owner_write_bit() {
     use std::os::unix::fs::PermissionsExt;
 
     let (_dir, path) = temp_db();
-    let lock_path = crate::coordination::lock::lock_path(&path);
-    std::fs::write(&lock_path, b"").unwrap();
-    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let mut leftover_lock_name = path.as_os_str().to_owned();
+    leftover_lock_name.push(".lock");
+    let leftover_lock_path = std::path::PathBuf::from(leftover_lock_name);
+    std::fs::write(&leftover_lock_path, b"").unwrap();
+    std::fs::set_permissions(&leftover_lock_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
     let conn = open_db(&path);
     conn.execute_batch("PRAGMA journal_mode = WAL;")
-        .expect("open_db must return a usable connection even with a read-only lock file");
+        .expect("open_db must return a usable connection regardless of a leftover lock file's permissions");
 
-    let meta = std::fs::metadata(&lock_path).unwrap();
+    let meta = std::fs::metadata(&leftover_lock_path).unwrap();
     assert_eq!(
         meta.permissions().mode() & 0o777,
         0o444,
-        "open_db must not have changed the lock file's mode"
+        "open_db must never touch a leftover lock file at all, let alone change its mode"
     );
 }
 

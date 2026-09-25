@@ -1,15 +1,19 @@
 //! Tests for the coordination DB init lock ([`super::lock`]).
 
+#[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering::SeqCst};
 use std::sync::Barrier;
 
-use super::lock::{lock_path, with_init_lock};
+#[cfg(windows)]
+use super::lock::lock_path;
+use super::lock::{open_lock_target, with_init_lock};
 
+#[cfg(windows)]
 #[test]
 fn lock_path_appends_dot_lock_to_the_full_db_path_verbatim() {
-    let db_path = PathBuf::from("/some/dir/.skuld.db");
-    assert_eq!(lock_path(&db_path), PathBuf::from("/some/dir/.skuld.db.lock"));
+    let db_path = PathBuf::from(r"C:\some\dir\.skuld.db");
+    assert_eq!(lock_path(&db_path), PathBuf::from(r"C:\some\dir\.skuld.db.lock"));
 }
 
 /// `with_init_lock` must be a *mutual exclusion* primitive, not just "don't
@@ -70,6 +74,13 @@ fn with_init_lock_serializes_concurrent_callers() {
 /// pre-creates it ahead of time. Proven the same way as above: real
 /// concurrent creation, checked for exclusivity, not just absence of a
 /// panic.
+///
+/// Windows-only: Unix has no lock file to race a `create(true)` open
+/// against — it locks `db_path`'s parent directory, which already exists
+/// before [`with_init_lock`] is ever called (see `lock.rs`'s module doc) —
+/// so this scenario doesn't arise there; the general concurrent-callers
+/// test above already covers Unix's actual concurrency shape.
+#[cfg(windows)]
 #[test]
 fn with_init_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet() {
     const THREADS: usize = 32;
@@ -120,10 +131,7 @@ fn a_fresh_try_lock_reports_would_block_while_with_init_lock_holds_the_lock() {
     let db_path = dir.path().join(".skuld.db");
 
     with_init_lock(&db_path, || {
-        let fresh = std::fs::OpenOptions::new()
-            .read(true)
-            .open(lock_path(&db_path))
-            .expect("lock file must already exist while with_init_lock holds it");
+        let fresh = open_lock_target(&db_path);
         match fresh.try_lock() {
             Err(std::fs::TryLockError::WouldBlock) => {}
             other => panic!(
@@ -132,4 +140,26 @@ fn a_fresh_try_lock_reports_would_block_while_with_init_lock_holds_the_lock() {
             ),
         }
     });
+}
+
+/// Regression guard for M-b: a missing parent directory must panic
+/// `with_init_lock` immediately, not spin forever treating "can't open" as
+/// "try again." Before this module's redesign, the identity-check retry
+/// loop treated a `NotFound` from the lock file's own open the same way
+/// `connect_with`'s absence loop treats a genuinely-absent `.skuld.db` —
+/// worth retrying — which is wrong for the lock target itself: a missing
+/// parent directory doesn't resolve on its own by trying the open again.
+/// `open_lock_target` now has no loop at all, so there's nothing left to
+/// spin; this proves the failure surfaces as an immediate panic instead.
+#[test]
+fn with_init_lock_panics_immediately_when_the_profile_directory_does_not_exist_instead_of_spinning() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("nonexistent-subdir").join(".skuld.db");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| with_init_lock(&db_path, || {})));
+
+    assert!(
+        result.is_err(),
+        "with_init_lock must panic when db_path's parent directory doesn't exist, not hang"
+    );
 }

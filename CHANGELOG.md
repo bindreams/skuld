@@ -35,9 +35,9 @@ All notable changes to this project are documented in this file.
 - **The filesystem holding `target/` must support a blocking advisory file
   lock (`flock` on Unix, `LockFileEx` on Windows)**, since `connect()` and
   `open_db()` now serialize the coordination DB's creation, publication, and
-  schema initialization through one on a sibling `.skuld.db.lock` file (see
-  below). Every mainstream local filesystem and every filesystem this crate
-  otherwise supports (see the two bullets above) already does.
+  schema initialization through one (see below). Every mainstream local
+  filesystem and every filesystem this crate otherwise supports (see the two
+  bullets above) already does.
 
 ### Changed
 
@@ -146,20 +146,26 @@ All notable changes to this project are documented in this file.
   helper (see below), which applies on every platform, Windows included.
   - `connect()` and `open_db()` now both run under a blocking, cross-process
     advisory lock (`flock` on Unix, `LockFileEx` on Windows, via
-    `std::fs::File`'s own native `lock`/`unlock`) on a sibling
-    `.skuld.db.lock` file, held for the whole create-or-open-and-initialize
-    sequence. Whoever holds it is the only actor in the system allowed to
-    create, publish, or schema-initialize `.skuld.db` at that instant. On
-    Windows, `connect()` still skips the `.skuld.db` publish step entirely
-    (there's no uid-mixing hazard to guard against there) but takes the
-    same init lock as every other platform, since `open_db`'s WAL
-    negotiation race is cross-platform.
-  - The lock file itself is published at 0666 the same way `.skuld.db` is,
-    and opened read-only (`flock`/`LockFileEx` only need read access on the
-    handle) — a lock file opened read-write, at whatever mode a plain
-    `open(O_CREAT)` gave it under the active umask, would reintroduce
-    exactly the lockout publishing `.skuld.db` itself exists to prevent, one
-    level down.
+    `std::fs::File`'s own native `lock`/`unlock`), held for the whole
+    create-or-open-and-initialize sequence. Whoever holds it is the only
+    actor in the system allowed to create, publish, or schema-initialize
+    `.skuld.db` at that instant. On Windows, `connect()` still skips the
+    `.skuld.db` publish step entirely (there's no uid-mixing hazard to
+    guard against there) but takes the same init lock as every other
+    platform, since `open_db`'s WAL negotiation race is cross-platform.
+  - The lock target can never be deleted or replaced out from under a
+    holder, on either platform, so acquiring it is always a single
+    open-then-lock with no retry and no check that the locked handle still
+    matches what's on disk. On Unix, the lock is taken directly on
+    `.skuld.db`'s parent directory (opened read-only) rather than a
+    separate file: a non-empty directory can't be `rmdir`'d, and nothing in
+    this crate ever removes the directory itself, only files inside it. On
+    Windows, the lock is a sibling `.skuld.db.lock` file opened with
+    `FILE_SHARE_READ | FILE_SHARE_WRITE` and no `FILE_SHARE_DELETE`, so
+    Windows itself refuses to delete or rename it while any handle holds
+    it. A failure to open the lock target — a missing parent directory,
+    file-descriptor exhaustion, or anything else — panics immediately,
+    naming the path, rather than retrying.
   - Only creation needs mode and no-replace-rename support: `ensure_published`
     checks for an existing `.skuld.db` first (`lstat`, so a dangling symlink
     counts as "already there" too, matching the rename's own `EEXIST`

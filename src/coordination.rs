@@ -270,7 +270,7 @@ pub(crate) fn probe_hold_init_lock(path: &std::path::Path, while_held: impl FnOn
 
 /// Probe hook for Skuld's own test suite (`tests/lock_contention_regression.rs`,
 /// via the `lock_try_probe` support binary): open a *fresh* handle on `path`'s
-/// init lock file — never the one [`probe_hold_init_lock`] or any real
+/// lock target — never the one [`probe_hold_init_lock`] or any real
 /// `connect`/`open_db` call holds — and attempt a non-blocking `try_lock` on
 /// it, returning the raw result. A fresh handle matters here the same way it
 /// does in `lock_tests.rs`'s in-process `try_lock` test: `flock`/`LockFileEx`
@@ -278,11 +278,7 @@ pub(crate) fn probe_hold_init_lock(path: &std::path::Path, while_held: impl FnOn
 /// only a genuinely separate handle (here, in a genuinely separate process)
 /// can observe contention against the held lock.
 pub(crate) fn probe_try_init_lock(path: &std::path::Path) -> Result<(), std::fs::TryLockError> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .open(lock::lock_path(path))
-        .unwrap_or_else(|e| panic!("skuld: probe could not open init lock file for {path:?}: {e}"));
-    file.try_lock()
+    lock::open_lock_target(path).try_lock()
 }
 
 // Transient error classification =====

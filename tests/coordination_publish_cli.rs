@@ -111,12 +111,11 @@ fn read_signal(child: &mut std::process::Child, expected: u8, what: &str) {
 /// connection holding them closes, and this probe's connection is the only
 /// one there is.
 ///
-/// Also covers the coordination DB's init lock file (`<db path>.lock`):
-/// `probe_coordination_connect` goes through `open_db`, which takes
-/// `db_path`'s init lock before doing anything else, so this same umask-077
-/// run exercises the lock file's own publish path too — a root lane's lock
-/// file created at `0644 & ~umask` (had it not been published the same way
-/// as `.skuld.db`) would lock out every later non-root run with `EACCES`.
+/// `probe_coordination_connect` also goes through `open_db`, which takes
+/// `db_path`'s init lock before doing anything else — but that lock is
+/// `db_path`'s own parent directory on Unix (see
+/// `src/coordination/lock.rs`'s module doc), not a file this test's umask
+/// scenario could affect, so there's no fourth companion to check here.
 #[test]
 fn publish_creates_three_0666_files_despite_umask() {
     let dir = tempfile::tempdir().unwrap();
@@ -130,7 +129,7 @@ fn publish_creates_three_0666_files_despite_umask() {
 
     read_signal(&mut child, b'C', "connected");
 
-    for suffix in ["", "-wal", "-shm", ".lock"] {
+    for suffix in ["", "-wal", "-shm"] {
         let path = companion(&db_path, suffix);
         let meta = std::fs::metadata(&path).unwrap_or_else(|e| panic!("{path:?} must exist: {e}"));
         assert!(meta.file_type().is_file(), "{path:?} must be a regular file");

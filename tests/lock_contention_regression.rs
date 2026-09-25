@@ -11,9 +11,8 @@
 //!
 //! Uses two support binaries, `lock_hold_probe` and `lock_try_probe`, driving
 //! `skuld::__private::probe_hold_init_lock`/`probe_try_init_lock` — the same
-//! real lock file, real `flock`/`LockFileEx` calls, and real `lock::lock_path`
-//! naming that `connect`/`open_db` use in production, not a simulation of
-//! them.
+//! real lock target and real `flock`/`LockFileEx` calls that `connect`/
+//! `open_db` use in production, not a simulation of them.
 //!
 //! No sleeps anywhere: a stdout/stdin byte handshake makes every ordering
 //! constraint explicit instead of timing-dependent. The holder only signals
@@ -73,6 +72,104 @@ fn a_second_process_try_lock_reports_would_block_while_another_process_holds_the
         b"B",
         "a second process's try_lock must report WouldBlock while lock_hold_probe holds the \
          lock; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    holder
+        .stdin
+        .as_mut()
+        .expect("stdin was piped")
+        .write_all(b"G")
+        .expect("release lock_hold_probe");
+    let holder_out = holder.wait_with_output().expect("wait lock_hold_probe");
+    assert!(
+        holder_out.status.success(),
+        "lock_hold_probe failed: {}",
+        String::from_utf8_lossy(&holder_out.stderr)
+    );
+
+    let out = try_probe(&db_path);
+    assert!(
+        out.status.success(),
+        "lock_try_probe failed after the holder released: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout,
+        b"K",
+        "a second process's try_lock must succeed once lock_hold_probe has released the lock; \
+         stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `src/coordination/lock.rs`'s whole design rests on the lock target being
+/// impossible to delete or replace out from under a holder — this proves
+/// that end to end across genuinely separate processes: while
+/// `lock_hold_probe` holds the real lock, an attempt to delete the lock
+/// target must fail (platform-specific mechanism, see below), and a fresh
+/// `try_lock` must still report `WouldBlock`, exactly as if nothing had
+/// been attempted. This is the scenario the previous identity-check-and-
+/// retry design only half handled: it detected a split after the fact
+/// instead of making the split impossible to begin with.
+#[test]
+fn a_holder_cannot_have_its_lock_target_deleted_out_from_under_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join(".skuld.db");
+    // The Unix half of this test needs `.skuld.db` to genuinely exist:
+    // `ENOTEMPTY` is what keeps the locked directory from being removed,
+    // not `flock` itself (see `src/coordination/lock.rs`'s module doc).
+    std::fs::write(&db_path, b"").expect("create a stand-in .skuld.db");
+
+    let mut holder = hold_probe(&db_path).spawn().expect("spawn lock_hold_probe");
+    let mut ready = [0u8; 1];
+    holder
+        .stdout
+        .as_mut()
+        .expect("stdout was piped")
+        .read_exact(&mut ready)
+        .unwrap_or_else(|e| panic!("failed to read lock_hold_probe's ready signal: {e}"));
+    assert_eq!(ready[0], b'R', "unexpected ready byte {:?}", ready[0] as char);
+
+    #[cfg(unix)]
+    {
+        // The directory holding `.skuld.db` is the lock target on Unix. A
+        // non-empty directory can never be `rmdir`'d regardless of any
+        // lock, but that is exactly the point: as long as `.skuld.db`
+        // stays inside it, the directory's identity is structurally stable
+        // while a holder has it open.
+        let err = std::fs::remove_dir(dir.path())
+            .expect_err("a profile directory containing .skuld.db must not be removable while a holder has it locked");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::DirectoryNotEmpty,
+            "unexpected error removing the locked profile directory: {err}"
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        // The sibling `.lock` file is the lock target on Windows, opened
+        // without FILE_SHARE_DELETE — deleting it while lock_hold_probe
+        // holds it open must fail outright.
+        let mut lock_path_os = db_path.as_os_str().to_owned();
+        lock_path_os.push(".lock");
+        let lock_path = std::path::PathBuf::from(lock_path_os);
+        std::fs::remove_file(&lock_path)
+            .expect_err("the init lock file must not be removable while a holder has it locked");
+    }
+
+    let out = try_probe(&db_path);
+    assert!(
+        out.status.success(),
+        "lock_try_probe failed after the failed deletion attempt: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout,
+        b"B",
+        "a second process's try_lock must still report WouldBlock after a failed attempt to \
+         delete the lock target; stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 

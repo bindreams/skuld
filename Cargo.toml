@@ -57,11 +57,9 @@ libc = "0.2"
 windows = { version = "0.62", features = [
     "Win32_System_Console",
     "Win32_System_Threading",
-    # GetFileInformationByHandle, for src/coordination/lock.rs's Windows file
-    # identity check: std::os::windows::fs::MetadataExt's
-    # volume_serial_number/file_index are still gated behind the unstable
-    # `windows_by_handle` feature (rust-lang/rust#63010), so this crate calls
-    # the Win32 API directly instead of waiting on stabilization.
+    # FILE_SHARE_READ/FILE_SHARE_WRITE, for src/coordination/lock.rs's
+    # Windows init lock file: opened without FILE_SHARE_DELETE so it can
+    # never be deleted or renamed out from under a holder.
     "Win32_Storage_FileSystem",
 ] }
 
@@ -241,5 +239,12 @@ doc = false
 [[bin]]
 name = "lock_try_probe"
 path = "tests/support_bins/lock_try_probe/main.rs"
+test = false
+doc = false
+
+# See tests/support_bins/lock_emfile_probe/main.rs's module doc.
+[[bin]]
+name = "lock_emfile_probe"
+path = "tests/support_bins/lock_emfile_probe/main.rs"
 test = false
 doc = false
