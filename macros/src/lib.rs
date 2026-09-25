@@ -600,7 +600,19 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
             || {
                 #runtime_preamble
                 #setup_core
+                // `__scope` moves into this closure (rather than staying a local of
+                // the outer one) so its `Drop` — which reclaims Test-scoped
+                // fixtures — runs here, while a real panic from `#call_expr` is
+                // still unwinding through this closure's own scope, same as it
+                // would for a body with no should_panic at all. Left outside,
+                // `__scope` would instead drop after `catch_unwind` has already
+                // caught and stopped that unwind, so a fixture `Drop` impl that
+                // checks `std::thread::panicking()` would see `false` for a panic
+                // this test expected and got — see
+                // `should_panic_satisfied_reports_panicking_during_scope_drop` in
+                // `tests/panicking_at_drop_cli.rs`.
                 let __result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    let __scope = __scope;
                     #call_expr
                 }));
                 if __result.is_ok() {
@@ -612,7 +624,9 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
             || {
                 #runtime_preamble
                 #setup_core
+                // See the identical comment on the plain `should_panic` arm above.
                 let __result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    let __scope = __scope;
                     #call_expr
                 }));
                 match __result {

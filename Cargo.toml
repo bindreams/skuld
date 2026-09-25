@@ -225,3 +225,13 @@ name = "drop_panic_during_unwind_probe"
 path = "tests/support_bins/drop_panic_during_unwind_probe/main.rs"
 test = false
 doc = false
+
+# Subprocess probe pinning `__scope`'s drop timing for a satisfied
+# should_panic test: a Test-scoped fixture's Drop impl must see
+# `std::thread::panicking() == true`. Spawned (never run in-process)
+# because it needs a fresh, isolated fixture-drop observation per run.
+[[bin]]
+name = "panicking_at_drop_probe"
+path = "tests/support_bins/panicking_at_drop_probe/main.rs"
+test = false
+doc = false

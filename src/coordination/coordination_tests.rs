@@ -328,15 +328,8 @@ fn is_retryable_matches_busy_and_locked_only() {
 
 // is_pid_alive PID range guard =====
 //
-// `pid as i32` only means "check this one process" for `0 < pid < 2^31`:
-// `kill(0, 0)` checks the caller's own process *group* (always "exists"),
-// and any pid whose cast wraps negative makes `kill` check either every
-// process the caller may signal (`-1`, i.e. `u32::MAX`) or a process
-// *group* (any other negative value) instead. `pid_from_instance_id` can't
-// produce these from a genuine
-// `std::process::id()` in ordinary use, but a corrupted DB row could — and
-// no real process can ever have PID 0 or `>= 2^31`, so treating both as
-// "not alive" is always safe, never a false negative on a real process.
+// See `is_pid_alive`'s own doc comment in `coordination.rs` for why a PID
+// of `0` or `>= 2^31` must be rejected before the `kill(pid as i32, 0)` cast.
 
 #[cfg(unix)]
 #[test]
@@ -469,21 +462,13 @@ fn migration_leaves_unparseable_live_rows_alone() {
 
 // Drop-panic-during-unwind downgrade path =====
 
-/// A regression guard for a real footgun: `payload: Box<dyn Any + Send>` is
-/// itself `Any` via the blanket impl (it's `Sized + 'static`), so `&payload`
-/// coerces to `&dyn Any` *over the Box*, not its contents, and
-/// `downcast_ref::<String>()` then always misses — silently, with no type
-/// error, since `Box<dyn Any + Send>: Any` typechecks fine as the "payload".
-/// `payload.as_ref()` derefs through the Box first and must be used instead.
-/// Caught by hand while building the `TestRegistration::drop` fix, not by a
-/// test.
-///
-/// This guards `downgraded_warning_message`'s call to `panic_payload_message`
-/// only — the `.as_ref()` is already applied before these cases reach it, so
-/// they exercise the extraction logic in isolation, not the `&payload` vs
-/// `payload.as_ref()` choice at `Drop::drop`'s call site. That choice is
-/// what `downgraded_warning_message_carries_the_real_panic_message_through_the_box`,
-/// below, and `drop_panic_during_unwind_cli.rs`'s subprocess test guard.
+/// Regression guard for the `&payload` vs `payload.as_ref()` footgun
+/// documented on `downgraded_warning_message` in `coordination.rs`. These
+/// cases exercise `panic_payload_message`'s extraction logic in isolation —
+/// the `.as_ref()` deref already happened before the payload reaches it.
+/// `downgraded_warning_message_carries_the_real_panic_message_through_the_box`
+/// below, and `drop_panic_during_unwind_cli.rs`'s subprocess test, guard the
+/// `&payload` vs `.as_ref()` choice itself.
 #[test]
 fn panic_payload_message_extracts_a_runtime_formatted_string_payload() {
     let payload = std::panic::catch_unwind(|| {
@@ -522,13 +507,11 @@ fn panic_payload_message_falls_back_on_a_non_string_payload() {
 }
 
 /// Exercises the exact call convention `Drop::drop` uses —
-/// `downgraded_warning_message(&payload)` with `payload: Box<dyn Any +
-/// Send>` — rather than the extraction helper alone with `.as_ref()` already
-/// applied. This is what actually regression-guards the `&payload` vs
-/// `payload.as_ref()` footgun documented above: passing the un-deref'd
-/// `&payload` here would make `downgraded_warning_message` fall back to
-/// `"<non-string panic payload>"` even though the payload is a real,
-/// runtime-formatted string.
+/// `downgraded_warning_message(&payload)` — which is what actually
+/// regression-guards the footgun documented on `downgraded_warning_message`
+/// in `coordination.rs`: passing the un-deref'd `&payload` here would wrongly
+/// fall back to `"<non-string panic payload>"` for a real, runtime-formatted
+/// string payload.
 #[test]
 fn downgraded_warning_message_carries_the_real_panic_message_through_the_box() {
     let payload = std::panic::catch_unwind(|| {
@@ -560,15 +543,8 @@ fn downgraded_warning_message_carries_the_real_panic_message_through_the_box() {
 /// downgrading unconditionally would silently swallow every one of them.
 ///
 /// Corrupts by replacing the DB file with a directory rather than
-/// `chmod`ing it narrow, so this runs on every platform: on Unix,
-/// `ensure_published` sees the path already exists (it's a directory) and
-/// skips publishing, so the failure surfaces from `rusqlite::Connection::open`
-/// itself (`SQLITE_CANTOPEN`) — confirmed on macOS —
-/// same as on Windows (which skips the Unix-only publish step entirely, but
-/// SQLite's own file open should still reject a directory as a database) —
-/// the `Drop` fix under test is not itself platform-gated, and Skuld's CI
-/// has a Windows lane that will confirm the Windows half of this claim when
-/// this test runs there.
+/// `chmod`ing it narrow, so this runs on every platform, for the reasons
+/// documented on `probe_drop_panic_during_unwind` in `src/lib.rs`.
 #[test]
 fn drop_panics_loudly_on_a_corrupt_db_when_nothing_else_is_unwinding() {
     let (_dir, path) = temp_db();
@@ -583,5 +559,67 @@ fn drop_panics_loudly_on_a_corrupt_db_when_nothing_else_is_unwinding() {
     assert!(
         result.is_err(),
         "drop must panic when the DB is unusable and no other unwind is already in flight"
+    );
+}
+
+// connect() TOCTOU between publish and open =====
+
+/// `connect()` publishes, then opens. If `.skuld.db` is gone by the time the
+/// open runs — here, a dangling symlink, which `ensure_published`'s rename
+/// cannot replace (`RENAME_NOREPLACE` reports `EEXIST` against a symlink
+/// regardless of what it points to, so publishing silently no-ops) — the
+/// open must not paper over that with `SQLITE_OPEN_CREATE`: doing so would
+/// silently create a fresh `0644 & ~umask` file through the symlink, which
+/// is exactly the lockout this module exists to prevent. `connect()` must
+/// instead panic loudly, naming the path, rather than resurrect the file.
+#[cfg(unix)]
+#[test]
+fn connect_panics_loudly_on_a_dangling_symlink_instead_of_recreating_the_db() {
+    let (_dir, path) = temp_db();
+    std::os::unix::fs::symlink(path.with_file_name("does-not-exist"), &path).unwrap();
+
+    let result = std::panic::catch_unwind(|| crate::coordination::connect(&path));
+    let payload = result.expect_err("connect() must panic on a dangling symlink, not create a fresh file");
+    let msg = crate::coordination::panic_payload_message(payload.as_ref());
+    assert!(
+        msg.contains(&path.to_string_lossy().into_owned()),
+        "panic message should name the path: {msg:?}"
+    );
+    assert!(
+        msg.contains("vanished") || msg.contains("isn't a regular file"),
+        "panic message should say the DB vanished or isn't a regular file: {msg:?}"
+    );
+
+    let meta = std::fs::symlink_metadata(&path).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "connect() must not have replaced the dangling symlink with a fresh file"
+    );
+}
+
+// Windows is_pid_alive: only "no such process" means dead =====
+
+/// `clean_stale_entries` must not delete a live process's row just because
+/// `OpenProcess` failed for a reason other than "no such process" —
+/// `ERROR_ACCESS_DENIED` (a process owned by another user, or a
+/// protected/elevated one) means the process exists but we can't query it,
+/// same shape as Unix's `EPERM`. Only `ERROR_INVALID_PARAMETER` — what
+/// `OpenProcess` returns for a nonexistent PID — means dead.
+#[cfg(windows)]
+#[test]
+fn win32_open_process_error_means_dead_only_for_invalid_parameter() {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER};
+
+    assert!(
+        crate::coordination::win32_open_process_error_means_dead(ERROR_INVALID_PARAMETER.to_hresult()),
+        "ERROR_INVALID_PARAMETER (no such process) must mean dead"
+    );
+    assert!(
+        !crate::coordination::win32_open_process_error_means_dead(ERROR_ACCESS_DENIED.to_hresult()),
+        "ERROR_ACCESS_DENIED must mean alive-but-inaccessible, mirroring Unix's EPERM"
+    );
+    assert!(
+        !crate::coordination::win32_open_process_error_means_dead(ERROR_FILE_NOT_FOUND.to_hresult()),
+        "an unrelated error code must not be treated as 'no such process' either"
     );
 }

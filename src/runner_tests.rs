@@ -151,3 +151,39 @@ fn write_nextest_metadata_handles_empty_list() {
     let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(parsed["tests"].as_array().unwrap().len(), 0);
 }
+
+// Capture teardown: warn instead of swallowing =====
+//
+// Shared by both places `FdCapture::end`'s result is consumed: the normal
+// post-join path, and the spawn-failure path (`Builder::spawn` erroring
+// before there's a trial thread to join). Both must report a teardown
+// failure instead of discarding it — `captured_bytes_or_warn` is the one
+// piece of logic that decides that, injected with a closure instead of
+// calling `eprintln!` directly so a failure can be pinned without forcing a
+// real OS-level capture-teardown error (draining thread panics, or
+// exhausting the process's thread/fd budget).
+
+#[test]
+fn captured_bytes_or_warn_returns_bytes_on_ok_and_does_not_warn() {
+    let mut warnings: Vec<String> = Vec::new();
+    let bytes = crate::runner::captured_bytes_or_warn("t", Ok(vec![1, 2, 3]), |msg| warnings.push(msg));
+    assert_eq!(bytes, vec![1, 2, 3]);
+    assert!(
+        warnings.is_empty(),
+        "unexpected warning(s) on the Ok path: {warnings:?}"
+    );
+}
+
+#[test]
+fn captured_bytes_or_warn_warns_and_returns_empty_on_err() {
+    let mut warnings: Vec<String> = Vec::new();
+    let err = std::io::Error::other("drain thread panicked");
+    let bytes = crate::runner::captured_bytes_or_warn("my_trial", Err(err), |msg| warnings.push(msg));
+    assert_eq!(bytes, Vec::<u8>::new());
+    assert_eq!(warnings.len(), 1, "expected exactly one warning, got: {warnings:?}");
+    assert!(
+        warnings[0].contains("my_trial") && warnings[0].contains("drain thread panicked"),
+        "warning should name the trial and the underlying error: {:?}",
+        warnings[0]
+    );
+}

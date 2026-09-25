@@ -1,11 +1,9 @@
 //! Subject of subprocess invocations in `tests/coordination_publish_cli.rs`.
 //! Not a real product binary.
 //!
-//! `umask` is process-global, so testing "publish creates 0666 files
-//! despite a restrictive umask" safely needs a genuine subprocess rather
-//! than mutating umask in the driver's own process,
-//! which would corrupt every other test running concurrently in the same
-//! `cargo test` binary.
+//! Spawned as a genuine subprocess rather than run in-process — see
+//! `tests/coordination_publish_cli.rs`'s module doc for why (`umask` is
+//! process-global).
 //!
 //! Reads `SKULD_PUBLISH_PROBE_DB` (required: the coordination DB path to
 //! connect to), `SKULD_PUBLISH_PROBE_UMASK` (optional: an octal umask to
@@ -58,10 +56,11 @@ fn main() {
         // overlap it. Releasing all children together does not *guarantee*
         // the EEXIST path is hit on any given run — the driver still
         // releases them one write() at a time, and a child that only starts
-        // after the winner's rename skips publishing entirely via
-        // `ensure_published`'s existence check — so this test's assertions
-        // don't depend on that path being taken; the deterministic EEXIST
-        // case is `a_lost_publish_race_uses_the_winners_file` in
+        // after the winner's rename still attempts its own publish, but the
+        // rename itself fails `EEXIST` against the now-published file and
+        // no-ops — so this test's assertions don't depend on which timing
+        // is hit; the deterministic EEXIST case is
+        // `a_lost_publish_race_uses_the_winners_file` in
         // `src/coordination/publish_tests.rs`.
         let mut out = std::io::stdout();
         out.write_all(b"R")

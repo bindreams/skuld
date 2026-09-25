@@ -10,13 +10,8 @@
 //! with it.
 //!
 //! Portable: `probe_drop_panic_during_unwind` corrupts the DB by replacing
-//! it with a directory. On Unix, `ensure_published` sees the path already
-//! exists (it's a directory) and skips publishing, so `connect()` fails via
-//! SQLite's own file open rejecting a directory (`rusqlite::Connection::open`)
-//! — confirmed on macOS — and the same reasoning is
-//! expected to fail it on Windows too (which skips the Unix-only publish
-//! step, but hits the same `Connection::open` rejection) — Skuld's CI
-//! Windows lane is the actual confirmation for that half. The hazard this
+//! it with a directory, which fails `connect()` on both platforms for the
+//! reasons documented on that function in `src/lib.rs`. The hazard this
 //! probe reproduces lives in `Drop`'s `catch_unwind`/`thread::panicking()`
 //! logic, which is not platform-gated, so this probe runs on every CI lane
 //! rather than only Unix.

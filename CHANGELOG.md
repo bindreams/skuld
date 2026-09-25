@@ -54,6 +54,16 @@ All notable changes to this project are documented in this file.
   trial, because `std::thread::Builder::spawn` rejects such names;
   previously it ran on the dispatching thread like any other and the NUL
   byte was never inspected.
+  - A lazily-initialized Process-scoped fixture is now built on the trial
+    thread that first requests it, rather than on the dispatching thread.
+    A resource whose setup ties itself to _the creating thread_, not just
+    to the value it returns — a child started with `PR_SET_PDEATHSIG`,
+    which dies with its parent thread — would die when that trial's
+    thread joins, breaking every later trial that reuses the cached
+    value. This is libtest's own behavior too (it also runs each test on
+    its own thread), not new to skuld. Use `warm_up` from `main()` for
+    such thread-bound resources, so setup runs on the long-lived main
+    thread instead; see `fixture::warm_up`'s docs.
 - **A failing fixture setup now fails a `should_panic` test.** Fixture
   resolution (`enter_test_scope` plus each `#[fixture]` parameter's
   `fixture_get`) now runs _before_ `catch_unwind`, not inside it. Previously,
@@ -72,14 +82,17 @@ All notable changes to this project are documented in this file.
   (`SIGABRT`) rather than just failing the one test. In that one case the DB
   failure is downgraded to a loud `eprintln!` warning instead of a panic, so
   one broken test can never take the rest of the run down with it.
-- **An async test's fixture setup and teardown now run inside the test's
-  tokio runtime context (`Runtime::enter()`), not just the `block_on`'d test
-  call.** Previously, only the async body itself ran under the runtime;
-  fixture setup ran before `block_on` and teardown after it returned, so a
-  synchronous `#[fixture]` constructor or `Drop` impl that called
-  `Handle::current()` would panic with "there is no reactor running". Now
-  the runtime guard is held for the whole closure — setup, call and
-  teardown, in that order — so both see a live runtime.
+- **An async test's fixture setup and teardown now run outside `block_on`,
+  under an explicit `Runtime::enter()` guard instead.** Previously, setup and
+  teardown were part of the same async block `block_on` drove, so they got a
+  live runtime for free but ran too late relative to `should_panic`'s
+  `catch_unwind` (see above) to let a failing setup fail the test correctly.
+  Moving them out of `block_on` fixed that, but would otherwise have broken
+  a synchronous `#[fixture]` constructor or `Drop` impl that calls
+  `Handle::current()` — "there is no reactor running" — since neither runs
+  under `block_on`'s runtime context anymore. `Runtime::enter()`'s guard is
+  now held for the whole closure — setup, the `block_on`'d call, and
+  teardown, in that order — so all three still see a live runtime.
 
 ### Added
 
@@ -108,10 +121,8 @@ All notable changes to this project are documented in this file.
     glob), `fchmod`s it 0666, and publishes it with an atomic no-replace
     rename (`renameat2(..., RENAME_NOREPLACE)` via a raw `syscall()` on
     Linux and Android — going straight to the kernel sidesteps every
-    libc's own version floor for the `renameat2` _wrapper_ symbol: glibc
-    only exports it from 2.28, musl only from 1.2.6 (newer than what Rust's
-    own bundled musl target links against), and uclibc never exports it at
-    all — `renamex_np(..., RENAME_EXCL)` on macOS) — a lost race silently
+    libc's own version floor for the `renameat2` _wrapper_ symbol —
+    `renamex_np(..., RENAME_EXCL)` on macOS) — a lost race silently
     discards the loser's temp and uses the winner's file as-is, with no
     further checks.
   - The `-wal`/`-shm` companions are not pre-created or `fchmod`ed by

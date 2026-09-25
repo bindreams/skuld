@@ -176,16 +176,13 @@ fn run_with_observability(
     }) {
         Ok(h) => h,
         Err(e) => {
-            // This panic itself happens inside the capture window (when
-            // `capture` is true): restore stdio first so the message reaches
-            // the real terminal instead of being silently discarded by
-            // `FdCapture`'s `Drop` (not `end`) — see the comment on
-            // `FdCapture`'s `Drop` impl in `capture.rs`, and the identical
-            // concern for `ensure_valid_thread_name` above (which sidesteps
-            // it by running before the window opens; a spawn failure can't
-            // be checked that early).
+            // Restore stdio first (see the NOTE above) so this panic message
+            // reaches the real terminal — see `FdCapture::drop`'s comment in
+            // `capture.rs`. `ensure_valid_thread_name` above sidesteps the
+            // same concern by running before the capture window opens; a
+            // spawn failure can't be checked that early.
             if let Some(c) = capture_guard.take() {
-                let _ = c.end();
+                captured_bytes_or_warn(name, c.end(), |msg| eprintln!("{msg}"));
             }
             panic!("skuld: failed to spawn trial thread for {name:?}: {e}");
         }
@@ -200,13 +197,7 @@ fn run_with_observability(
     // Restore stdio before any further diagnostic output so we print to
     // the real terminal, not the capture buffer.
     let captured_bytes: Vec<u8> = match capture_guard.take() {
-        Some(c) => match c.end() {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                eprintln!("[skuld] {name}: warning: capture teardown failed: {e}");
-                Vec::new()
-            }
-        },
+        Some(c) => captured_bytes_or_warn(name, c.end(), |msg| eprintln!("{msg}")),
         None => Vec::new(),
     };
 
@@ -226,6 +217,29 @@ fn run_with_observability(
 
     if let Err(payload) = result {
         resume_unwind(payload);
+    }
+}
+
+/// Turn `FdCapture::end`'s result into the bytes to report on, calling
+/// `warn` instead of silently discarding a teardown failure. Shared by both
+/// callers of `end()`: the normal post-join path, and the spawn-failure
+/// path, which must warn exactly like the normal path does rather than
+/// swallow the error with `let _ = c.end();`.
+///
+/// `warn` is injected (rather than this calling `eprintln!` directly) so
+/// the warn-on-`Err` behavior can be pinned in a unit test without needing
+/// a real OS-level capture-teardown failure.
+pub(crate) fn captured_bytes_or_warn(
+    name: &str,
+    result: std::io::Result<Vec<u8>>,
+    mut warn: impl FnMut(String),
+) -> Vec<u8> {
+    match result {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn(format!("[skuld] {name}: warning: capture teardown failed: {e}"));
+            Vec::new()
+        }
     }
 }
 

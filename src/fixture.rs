@@ -10,6 +10,23 @@
 //!
 //! Scope dependency rule: a fixture may only depend on fixtures of the **same or
 //! wider** scope (Variable < Test < Process).
+//!
+//! **Process-scoped fixtures and thread lifetime.** A Process fixture's
+//! *value* outlives any one trial — it's cached until
+//! [`cleanup_process_fixtures`] runs — but if it's built lazily, on first
+//! use inside a trial, its `setup` closure runs on that trial's own
+//! spawned, short-lived thread (skuld runs each trial on a fresh
+//! `thread::Builder`-spawned thread; see the runner). Anything the setup
+//! ties to *the creating thread itself*, rather than to the value it
+//! returns, inherits that thread's lifetime, not the fixture's: a child
+//! process started with `PR_SET_PDEATHSIG` dies with its parent *thread*
+//! (not the parent process), so a lazily-initialized fixture spawning one
+//! would see it killed the moment the trial that happened to trigger the
+//! lazy init finishes — every later trial that reuses the cached fixture
+//! value gets a dead child. This is libtest's own behavior too (it also
+//! runs each test on its own thread), not something specific to skuld.
+//! Thread-bound resources need [`warm_up`], called from `main()` before the
+//! runner starts, so setup runs on the long-lived main thread instead.
 
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
@@ -280,6 +297,16 @@ pub fn enter_test_scope(name: &'static str, module_path: &'static str) -> TestSc
 /// Call this from `main()` before running tests to pre-build expensive resources
 /// (e.g. Docker images). Does nothing if the fixture is already initialized or
 /// if the fixture is not process-scoped.
+///
+/// Also the right call for a resource whose setup is tied to *the thread
+/// that creates it*, not just to the value it returns — for example a child
+/// process started with `PR_SET_PDEATHSIG`, which dies with its parent
+/// thread. Left to lazy initialization, such a fixture's setup would run on
+/// whichever trial's short-lived spawned thread happens to trigger it
+/// first, and the resource would die when that thread joins, breaking every
+/// later trial that reuses the cached value. Calling `warm_up` from `main`
+/// runs setup on the long-lived main thread instead, before any trial
+/// thread exists.
 ///
 /// # Panics
 ///

@@ -14,16 +14,13 @@
 //! platform-gated (Windows shares the hazard via `connect()`'s other panic
 //! paths, even though it skips the Unix-only publish step), and Skuld's CI
 //! has a Windows lane. The probe's corruption method (a directory in place
-//! of the DB file) fails `connect()` via the same underlying
-//! `rusqlite::Connection::open` rejection on both platforms (Unix:
-//! `ensure_published` sees the path already exists and skips publishing, so
-//! the failure surfaces from SQLite's own file open; Windows: skips the
-//! Unix-only publish step entirely and hits the same open rejection) — only
-//! the OS-level error text SQLite wraps differs, so this test does not
-//! assert the exact panic wording — only that the process exits via a
-//! single ordinary panic (not an abort), and that the downgraded warning
-//! carries a real extracted message rather than the `panic_payload_message`
-//! fallback placeholder.
+//! of the DB file) fails `connect()` on both platforms for the reasons
+//! documented on `probe_drop_panic_during_unwind` in `src/lib.rs` — only the
+//! OS-level error text SQLite wraps differs, so this test does not assert
+//! the exact panic wording — only that the process exits via a single
+//! ordinary panic (not an abort), and that the downgraded warning carries a
+//! real extracted message rather than the `panic_payload_message` fallback
+//! placeholder.
 
 use std::process::Command;
 

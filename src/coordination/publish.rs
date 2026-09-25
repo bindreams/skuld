@@ -38,15 +38,17 @@ use std::path::{Path, PathBuf};
 
 use super::skuld_debug_eprintln;
 
-/// Ensure `db_path` exists, published at `0666`. Called by [`super::connect`]
-/// before any SQLite call. If the file is already there — published by us or
-/// by another process — this is a no-op; nothing about the existing file is
-/// checked. Panics loudly on: a filesystem that ignores modes, one with no
-/// atomic no-replace rename, or any other unexpected publish failure.
+/// Ensure `db_path` is published at `0666`. Called by [`super::connect`]
+/// before any SQLite call. No existence pre-check: `publish_one` always
+/// attempts the create-and-rename, and its own `EEXIST` handling (a
+/// no-replace rename against anything already at `db_path` — a real file,
+/// or even a dangling symlink — fails `EEXIST` and is treated as "someone
+/// else already published") is what makes a second call a no-op, without a
+/// separate check that could itself race the very thing it's checking for.
+/// Nothing about an existing file is checked. Panics loudly on: a
+/// filesystem that ignores modes, one with no atomic no-replace rename, or
+/// any other unexpected publish failure.
 pub(super) fn ensure_published(db_path: &Path) {
-    if db_path.exists() {
-        return;
-    }
     let dir = db_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

@@ -215,16 +215,17 @@ pub mod __private {
     ///
     /// Corruption method: replace the DB file with a directory of the same
     /// name, rather than `chmod`ing it narrow, so this hook is meaningful on
-    /// both platforms it runs on. On Unix, `ensure_published` sees the path
-    /// already exists (it's a directory) and skips publishing, so the
-    /// failure surfaces from SQLite's own file open, same as on Windows
-    /// (which skips the Unix-only publish step entirely): `rusqlite::Connection::open`
-    /// rejects a directory as a database (`SQLITE_CANTOPEN`) on both —
-    /// confirmed on macOS, and Skuld's CI Windows lane is what confirms the
-    /// Windows half. Either way, `chmod` has no Windows
-    /// analogue and would have left this hook, and the `Drop` fix it
-    /// exercises, untested on Windows CI even though the fix itself is
-    /// platform-agnostic.
+    /// both platforms it runs on. On Unix, `ensure_published`'s no-replace
+    /// rename still attempts to publish over the directory, but it fails
+    /// `EEXIST` (a no-replace rename treats anything already at the target
+    /// regardless of type as taken) and silently no-ops, so the failure
+    /// surfaces from SQLite's own file open, same as on Windows (which
+    /// skips the Unix-only publish step entirely): SQLite rejects a
+    /// directory as a database (`SQLITE_CANTOPEN`) on both — confirmed on
+    /// macOS, and Skuld's CI Windows lane is what confirms the Windows
+    /// half. Either way, `chmod` has no Windows analogue and would have
+    /// left this hook, and the `Drop` fix it exercises, untested on Windows
+    /// CI even though the fix itself is platform-agnostic.
     pub fn probe_drop_panic_during_unwind(path: &std::path::Path) {
         let _registration = crate::coordination::coordinate(path, "probe", &[], "");
         std::fs::remove_file(path).unwrap_or_else(|e| panic!("probe: could not remove {path:?} to corrupt it: {e}"));

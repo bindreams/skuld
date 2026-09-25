@@ -63,12 +63,32 @@ const SCHEMA_VERSION: i64 = 1;
 /// other uid out with a narrow default mode. Every caller in this
 /// module goes through this one helper, including [`TestRegistration::drop`].
 ///
+/// On Unix the open itself uses no `SQLITE_OPEN_CREATE`: publishing is the
+/// only thing allowed to create `.skuld.db`, so if it's gone by the time
+/// this runs — deleted mid-run, or a dangling symlink `ensure_published`'s
+/// no-replace rename couldn't get past (`EEXIST` fires against a symlink
+/// regardless of what it points to) — SQLite has nothing to silently
+/// recreate at a narrow default mode. That would be exactly the lockout
+/// this module exists to prevent, so this panics loudly instead, naming the
+/// path. No retry: a DB that vanishes mid-run is external interference, not
+/// a transient condition to wait out.
+///
 /// Windows is unchanged: no Windows lane mixes uids, so there's nothing for
-/// the publish step to protect against there.
+/// the publish step to protect against there, and the open keeps its
+/// default `SQLITE_OPEN_CREATE`.
 pub(crate) fn connect(path: &std::path::Path) -> rusqlite::Connection {
     #[cfg(unix)]
-    publish::ensure_published(path);
+    {
+        publish::ensure_published(path);
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        rusqlite::Connection::open_with_flags(path, flags).unwrap_or_else(|e| {
+            panic!("skuld: coordination DB at {path:?} vanished or isn't a regular file after being published: {e}")
+        })
+    }
 
+    #[cfg(not(unix))]
     rusqlite::Connection::open(path)
         .unwrap_or_else(|e| panic!("skuld: failed to open coordination DB at {path:?}: {e}"))
 }
@@ -282,6 +302,21 @@ fn is_pid_alive(pid: u32) -> bool {
     err.raw_os_error() == Some(libc::EPERM)
 }
 
+/// Classify a failed `OpenProcess`'s error as meaning the process is gone,
+/// or something else. Mirrors Unix's `EPERM` handling above: only "no such
+/// process" means dead. `OpenProcess` reports a nonexistent PID as
+/// `ERROR_INVALID_PARAMETER`; anything else — `ERROR_ACCESS_DENIED`
+/// included, e.g. a process owned by another user, or a
+/// protected/elevated one — means the process exists but we can't query
+/// it, same shape as Unix's EPERM. A small pure function, taking just the
+/// `HRESULT` rather than the live `windows::core::Error`, so this
+/// classification can be unit-tested without needing a real failing
+/// `OpenProcess` call.
+#[cfg(windows)]
+fn win32_open_process_error_means_dead(code: windows::core::HRESULT) -> bool {
+    code == windows::Win32::Foundation::ERROR_INVALID_PARAMETER.to_hresult()
+}
+
 #[cfg(windows)]
 fn is_pid_alive(pid: u32) -> bool {
     use windows::Win32::Foundation::CloseHandle;
@@ -292,7 +327,7 @@ fn is_pid_alive(pid: u32) -> bool {
             let _ = unsafe { CloseHandle(handle) };
             true
         }
-        Err(_) => false,
+        Err(e) => !win32_open_process_error_means_dead(e.code()),
     }
 }
 
