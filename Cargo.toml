@@ -200,36 +200,21 @@ path = "tests/support_bins/duplicate_names_ignored/main.rs"
 test = false
 doc = false
 
-# Subprocess probe for the coordination DB's atomic-publish behavior.
-# Connects to a caller-chosen DB path, optionally under a caller-chosen
-# umask, then holds the connection open across a handshake with the driver
-# before exiting. Also supports an opt-in stdout/stdin barrier so a driver
-# can hold several instances at the same starting line before they connect.
-# Spawned (never run in-process): umask is process-global, and the
-# concurrent-publishers test needs genuinely separate OS processes racing
-# to publish the same file.
+# See tests/support_bins/publish_probe/main.rs's module doc.
 [[bin]]
 name = "publish_probe"
 path = "tests/support_bins/publish_probe/main.rs"
 test = false
 doc = false
 
-# Subprocess probe for the panic-during-unwind hazard in
-# `TestRegistration::drop`. Registers, corrupts the coordination DB out from
-# under itself, then panics while the guard is still alive so unwinding
-# drops it and its own `connect()` panics a second time. Spawned (never run
-# in-process) because an unfixed `Drop` can abort the whole process via
-# `SIGABRT`.
+# See tests/support_bins/drop_panic_during_unwind_probe/main.rs's module doc.
 [[bin]]
 name = "drop_panic_during_unwind_probe"
 path = "tests/support_bins/drop_panic_during_unwind_probe/main.rs"
 test = false
 doc = false
 
-# Subprocess probe pinning `__scope`'s drop timing for a satisfied
-# should_panic test: a Test-scoped fixture's Drop impl must see
-# `std::thread::panicking() == true`. Spawned (never run in-process)
-# because it needs a fresh, isolated fixture-drop observation per run.
+# See tests/support_bins/panicking_at_drop_probe/main.rs's module doc.
 [[bin]]
 name = "panicking_at_drop_probe"
 path = "tests/support_bins/panicking_at_drop_probe/main.rs"

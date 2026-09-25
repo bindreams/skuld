@@ -150,9 +150,7 @@ All notable changes to this project are documented in this file.
     an absent `.skuld.db` creates a private
     `.skuld-publish-<pid>-<nanos>-<seq>.tmp` (outside the `.skuld.db*`
     glob), `fchmod`s it 0666, and publishes it with an atomic no-replace
-    rename (`renameat2(..., RENAME_NOREPLACE)` via a raw `syscall()` on
-    Linux and Android — going straight to the kernel sidesteps every
-    libc's own version floor for the `renameat2` _wrapper_ symbol —
+    rename (`renameat2(..., RENAME_NOREPLACE)` on Linux and Android,
     `renamex_np(..., RENAME_EXCL)` on macOS) — a lost race silently
     discards the loser's temp and uses the winner's file as-is, with no
     further checks. Every later connection, on every process, skips the
