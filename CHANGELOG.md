@@ -138,11 +138,34 @@ All notable changes to this project are documented in this file.
   the new mode. The publish step itself is Unix-only — no Windows lane
   mixes uids — but every connection now goes through one `connect()`
   helper (see below), which applies on every platform, Windows included.
-  - On Unix, `connect()` calls `ensure_published` before running any SQL, so
-    every connection — `open_db` and `TestRegistration::drop` alike — sees a
-    `.skuld.db` already at 0666. On Windows, `connect()` skips that call
-    (there's no uid-mixing hazard to guard against) and only provides
-    `Connection::open`'s panic-on-failure wrapper, same as every platform.
+  - On Unix, `connect()` tries the open first and only calls `ensure_published`
+    if that fails with `SQLITE_CANTOPEN` and nothing is at the path
+    (`symlink_metadata` reports `NotFound`), retrying the open afterward —
+    looping for as long as the failure keeps being genuine absence, with no
+    attempt cap, so a concurrent delete anywhere in that sequence just costs
+    another round trip instead of a panic. Every connection — `open_db` and
+    `TestRegistration::drop` alike — goes through this. Any other open
+    failure (a dangling symlink, a directory at the path) still panics
+    loudly, naming the path. On Windows, `connect()` skips the publish step
+    entirely (there's no uid-mixing hazard to guard against) and only
+    provides `Connection::open`'s panic-on-failure wrapper, same as every
+    platform.
+  - A single `symlink_metadata` recheck after `SQLITE_CANTOPEN` can't tell a
+    genuinely broken path (dangling symlink, directory) from a plain race —
+    a concurrent publisher's rename landing in the gap between the failed
+    open and the recheck presents identically. `connect()` now gives a
+    not-plain-absence result one retried open before panicking: a race
+    resolves on that retry, a genuinely broken entry doesn't. Many threads
+    opening the same never-yet-published path concurrently no longer panic
+    or hang on this.
+  - `open_db`'s schema-initialization retry now also treats
+    `SQLITE_READONLY` as transient, and reopens a fresh connection before
+    each retry rather than retrying on the one that lost the race: many
+    connections racing `PRAGMA journal_mode = WAL`'s cold-start negotiation
+    over a freshly-published, still-empty database can have a loser see
+    `SQLITE_READONLY`, and that connection stays readonly for its own
+    lifetime regardless of how many times the same statement is retried on
+    it — only a fresh `connect()` observes the winner's progress.
   - Only creation needs mode and no-replace-rename support: `ensure_published`
     checks for an existing `.skuld.db` first (`lstat`, so a dangling symlink
     counts as "already there" too, matching the rename's own `EEXIST`

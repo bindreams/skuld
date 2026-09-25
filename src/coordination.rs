@@ -58,34 +58,52 @@ fn instance_id() -> String {
 /// them on first open after upgrade.
 const SCHEMA_VERSION: i64 = 1;
 
-/// Open a connection to `path`, first ensuring the file exists published at
-/// mode 0666 on Unix, so whichever uid gets there first doesn't lock every
-/// other uid out with a narrow default mode. Every caller in this
-/// module goes through this one helper, including [`TestRegistration::drop`].
+/// Open a connection to `path`. On Unix this asks forgiveness rather than
+/// permission: the open (no `SQLITE_OPEN_CREATE`) is tried first, and
+/// [`publish::ensure_published`] only runs — followed by a retried open —
+/// when that open fails with `SQLITE_CANTOPEN` *and* nothing is at `path`
+/// (`symlink_metadata` reports `NotFound`). The loop keeps going for as
+/// long as the failure keeps being genuine absence, with no attempt cap, so
+/// a concurrent delete anywhere in the open-publish-open sequence — even
+/// one landing in the retry's own gap — just costs another round trip
+/// instead of a panic: each iteration re-derives "is it really absent?"
+/// from the open syscall itself, not from a stat taken earlier. Every
+/// caller in this module goes through this one helper, including
+/// [`TestRegistration::drop`].
 ///
-/// A `.skuld.db` deleted mid-run is *not* what makes this panic: `connect()`
-/// calls `ensure_published` first, on every call, so a plain absence is
-/// recreated fresh at 0666 right here, same as the very first connection of
-/// the run. Recreation gets a new inode; any process that still holds a
-/// connection open to the deleted file's old inode (POSIX doesn't invalidate
-/// an open fd on unlink) keeps operating on that old inode, coordinating
-/// separately from processes that connect afterward and see the new one.
-/// That split is accepted under this module's minimal-publish design (see
-/// the module doc): there's no verification of what's actually at `path`
-/// beyond "something is," so nothing here would notice the swap to tell the
-/// two groups apart, let alone reconcile them.
+/// A `.skuld.db` deleted mid-run is *not* what makes this panic: any
+/// absence the open discovers gets recreated fresh at 0666, same as the
+/// very first connection of the run. Recreation gets a new inode; any
+/// process that still holds a connection open to the deleted file's old
+/// inode (POSIX doesn't invalidate an open fd on unlink) keeps operating on
+/// that old inode, coordinating separately from processes that connect
+/// afterward and see the new one. That split is accepted under this
+/// module's minimal-publish design (see the module doc): there's no
+/// verification of what's actually at `path` beyond "something is," so
+/// nothing here would notice the swap to tell the two groups apart, let
+/// alone reconcile them.
 ///
-/// What *does* panic: the open itself uses no `SQLITE_OPEN_CREATE`, so a
-/// dangling symlink at `path` is the one shape `ensure_published` can't turn
-/// into a usable file. Its no-replace rename reports `EEXIST` against the
-/// symlink regardless of what it points to (or that it points to nothing),
-/// so publishing no-ops, and the open then fails against a target that
-/// doesn't resolve. SQLite has nothing to silently recreate at a narrow
-/// default mode (`SQLITE_OPEN_CREATE` would just create a fresh file
-/// *through* the dangling link, at whatever mode `umask` leaves it — exactly
-/// the lockout this module exists to prevent), so this panics loudly
-/// instead, naming the path. No retry: a dangling symlink is external
-/// interference, not a transient condition to wait out.
+/// What *does* panic: an open failure that isn't plain absence. A dangling
+/// symlink at `path` is the one shape `ensure_published` can't turn into a
+/// usable file: its no-replace rename reports `EEXIST` against the symlink
+/// regardless of what it points to (or that it points to nothing), so
+/// publishing no-ops, and `symlink_metadata` (which doesn't follow the
+/// link) reports the link itself rather than `NotFound` — so this isn't
+/// treated as absence. A directory at `path` is the same shape. Neither is
+/// a transient condition to wait out; both are external interference, and
+/// the open's repeated failure eventually panics loudly, naming the path.
+///
+/// "Eventually" is one extra attempt, not zero: a bare `symlink_metadata`
+/// call right after a failed open cannot tell a genuinely broken entry
+/// apart from a plain race, where a *concurrent* connection's publish
+/// lands in the gap between this thread's failed open and its own
+/// recheck — both present identically as "CANTOPEN, then something's
+/// there." The two are told apart behaviorally: the loop always gives a
+/// not-plain-absence result one retried open before it panics, since a
+/// race resolves on that retry (the file is genuinely there now) while a
+/// broken entry doesn't. That grace attempt is spent once per *round* of
+/// not-absence, not once per call — a fresh round of genuine absence
+/// (`ensure_published` ran again) always gets its own.
 ///
 /// Windows is unchanged: no Windows lane mixes uids, so there's nothing for
 /// the publish step to protect against there, and the open keeps its
@@ -93,12 +111,7 @@ const SCHEMA_VERSION: i64 = 1;
 pub(crate) fn connect(path: &std::path::Path) -> rusqlite::Connection {
     #[cfg(unix)]
     {
-        publish::ensure_published(path);
-        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        rusqlite::Connection::open_with_flags(path, flags)
-            .unwrap_or_else(|e| panic!("skuld: could not open coordination DB {path:?}: {e}"))
+        connect_with(path, publish::ensure_published)
     }
 
     #[cfg(not(unix))]
@@ -106,16 +119,99 @@ pub(crate) fn connect(path: &std::path::Path) -> rusqlite::Connection {
         .unwrap_or_else(|e| panic!("skuld: failed to open coordination DB at {path:?}: {e}"))
 }
 
+/// [`connect`]'s Unix implementation, parameterized over the publish step so
+/// `coordination_tests` can prove the retry loop genuinely repeats — not
+/// just tolerates a single race — by controlling exactly when `.skuld.db`
+/// comes back into existence.
+///
+/// A single `symlink_metadata` call after a failed open cannot tell two
+/// shapes apart, because both present identically — `CANTOPEN`, then
+/// `symlink_metadata` says something is there: a genuinely broken entry
+/// (dangling symlink, directory), and a plain race, where the path was
+/// absent at the moment the open failed and a concurrent publisher's
+/// rename landed in the window between that failure and this recheck. The
+/// only way to tell them apart is behavioral: retry the open once more. A
+/// race resolves (the file is there for real; the retry succeeds); a
+/// genuinely broken entry doesn't (the retry fails the same way). Only a
+/// CANTOPEN that stays unresolved through that single extra attempt panics
+/// — `retried_after_existing` tracks whether this round already got that
+/// grace attempt, and only the *not-absent* branch consumes it: the
+/// genuine-absence branch below always resets it, so every fresh round of
+/// real absence gets its own grace attempt too, with no cap on how many
+/// rounds of genuine absence the loop as a whole will retry through.
+#[cfg(unix)]
+fn connect_with(path: &std::path::Path, mut ensure_published: impl FnMut(&std::path::Path)) -> rusqlite::Connection {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let mut retried_after_existing = false;
+    loop {
+        match rusqlite::Connection::open_with_flags(path, flags) {
+            Ok(conn) => return conn,
+            Err(e) => {
+                if !is_cantopen(&e) {
+                    panic!("skuld: could not open coordination DB {path:?}: {e}");
+                }
+                if path_is_absent(path) {
+                    retried_after_existing = false;
+                    ensure_published(path);
+                    continue;
+                }
+                if retried_after_existing {
+                    panic!("skuld: could not open coordination DB {path:?}: {e}");
+                }
+                retried_after_existing = true;
+                continue;
+            }
+        }
+    }
+}
+
+/// True when `err` is SQLite's own `SQLITE_CANTOPEN`.
+#[cfg(unix)]
+fn is_cantopen(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(inner, _) if inner.code == rusqlite::ErrorCode::CannotOpen
+    )
+}
+
+/// True when nothing exists at `path` (`symlink_metadata`, not `exists()` —
+/// a dangling symlink is still "something is there," same distinction
+/// `ensure_published`'s own fast path draws).
+#[cfg(unix)]
+fn path_is_absent(path: &std::path::Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Open a connection to the coordination database, creating it and the schema
 /// if necessary. Each call returns a fresh connection suitable for single-thread
 /// use.
+///
+/// Schema initialization requires a write lock. Under heavy concurrent access
+/// (many connections opening the same freshly-published, still-empty DB at
+/// once), busy_timeout alone isn't enough: `PRAGMA journal_mode = WAL`'s own
+/// cold-start negotiation over the (also just-being-created) `-shm` file can
+/// report `SQLITE_READONLY` to whichever connection loses that particular
+/// race, same as `SQLITE_BUSY`/`SQLITE_LOCKED` for an ordinary write lock —
+/// all three mean "someone else has it right now," not "this connection
+/// can't write here." `is_transient_init_error` checks the error *code*, not
+/// its message text, so this isn't classifying by wording that could shift
+/// between SQLite versions.
+///
+/// A loser of that negotiation reopens a fresh connection before retrying,
+/// rather than retrying `execute_batch` on the one it already has: measured
+/// (`connect_survives_many_threads_racing_the_same_absent_path`, run
+/// repeatedly), a connection that lands `SQLITE_READONLY` here stays
+/// readonly for its own lifetime no matter how many times the same
+/// statement is retried on it — the cold-start negotiation resolves the
+/// *file*, not this connection's already-formed opinion of it, so nothing
+/// short of a new `sqlite3_open` call ever sees the resolution. `connect`,
+/// not a bare retry, is what actually observes the winner's progress.
 pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
-    let conn = connect(path);
-    conn.busy_timeout(Duration::from_secs(5))
-        .unwrap_or_else(|e| panic!("skuld: failed to set busy_timeout: {e}"));
-    // Schema initialization requires a write lock. Under heavy concurrent access
-    // (multiple test threads opening the DB simultaneously), the PRAGMA journal_mode
-    // change may not honor busy_timeout on all platforms. Retry on "database is locked".
     let init_sql = "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS running (
@@ -128,14 +224,18 @@ pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
              running_id INTEGER NOT NULL REFERENCES running(id) ON DELETE CASCADE,
              label      TEXT    NOT NULL
          );";
+    let mut conn = connect(path);
     for attempt in 0..50 {
+        conn.busy_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("skuld: failed to set busy_timeout: {e}"));
         match conn.execute_batch(init_sql) {
             Ok(()) => {
                 migrate_schema(&conn);
                 return conn;
             }
-            Err(e) if e.to_string().contains("database is locked") && attempt < 49 => {
+            Err(e) if is_transient_init_error(&e) && attempt < 49 => {
                 std::thread::sleep(Duration::from_millis(100));
+                conn = connect(path);
             }
             Err(e) => panic!("skuld: failed to initialize coordination DB at {path:?}: {e}"),
         }
@@ -157,6 +257,21 @@ pub(crate) fn is_retryable(err: &rusqlite::Error) -> bool {
         err.sqlite_error_code(),
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
     )
+}
+
+/// Returns true for transient errors `open_db`'s schema-initialization retry
+/// loop should retry past, rather than panic on. A superset of
+/// [`is_retryable`]'s lock-contention codes: `SQLITE_READONLY` joins them
+/// here because switching a freshly-created, still-empty database into WAL
+/// mode makes every racing connection negotiate creation of the same
+/// `-shm` file, and a connection that loses that particular negotiation
+/// sees `SQLITE_READONLY`, not `SQLITE_BUSY` — transient for the same
+/// reason, just a different code. This is deliberately not folded into
+/// `is_retryable` itself: that function's own contract and test
+/// (`is_retryable_matches_busy_and_locked_only`) are about ordinary query
+/// lock contention, a narrower claim than "retry during schema init."
+fn is_transient_init_error(err: &rusqlite::Error) -> bool {
+    is_retryable(err) || matches!(err.sqlite_error_code(), Some(rusqlite::ErrorCode::ReadOnly))
 }
 
 // Schema migration =====

@@ -562,16 +562,19 @@ fn drop_panics_loudly_on_a_corrupt_db_when_nothing_else_is_unwinding() {
     );
 }
 
-// connect() TOCTOU between publish and open =====
+// connect() ask-forgiveness retry =====
 
-/// `connect()` publishes, then opens. If `.skuld.db` is gone by the time the
-/// open runs — here, a dangling symlink, which `ensure_published`'s rename
-/// cannot replace (`RENAME_NOREPLACE` reports `EEXIST` against a symlink
-/// regardless of what it points to, so publishing silently no-ops) — the
-/// open must not paper over that with `SQLITE_OPEN_CREATE`: doing so would
-/// silently create a fresh `0644 & ~umask` file through the symlink, which
-/// is exactly the lockout this module exists to prevent. `connect()` must
-/// instead panic loudly, naming the path, rather than resurrect the file.
+/// `connect()` opens first and only publishes on a `CANTOPEN` that
+/// `symlink_metadata` confirms is genuine absence. A dangling symlink is
+/// the other shape: `ensure_published`'s rename cannot replace it
+/// (`RENAME_NOREPLACE` reports `EEXIST` against a symlink regardless of
+/// what it points to, so publishing silently no-ops), and `symlink_metadata`
+/// reports the link itself, not `NotFound` — so this is never treated as
+/// absence. The open must not paper over that with `SQLITE_OPEN_CREATE`
+/// either: doing so would silently create a fresh `0644 & ~umask` file
+/// through the symlink, which is exactly the lockout this module exists to
+/// prevent. `connect()` must instead panic loudly, naming the path, rather
+/// than resurrect the file or retry forever.
 #[cfg(unix)]
 #[test]
 fn connect_panics_loudly_on_a_dangling_symlink_instead_of_recreating_the_db() {
@@ -596,6 +599,76 @@ fn connect_panics_loudly_on_a_dangling_symlink_instead_of_recreating_the_db() {
         meta.file_type().is_symlink(),
         "connect() must not have replaced the dangling symlink with a fresh file"
     );
+}
+
+/// The gap between `ensure_published` returning and the retried open
+/// running is itself just another absence check, not a one-shot window:
+/// this drives `connect_with`'s publish hook to leave `.skuld.db` absent
+/// for the first two rounds and only really publish on the third, proving
+/// the loop keeps retrying through repeated genuine absence rather than
+/// panicking after the first round trip — there's no attempt cap.
+#[cfg(unix)]
+#[test]
+fn connect_retries_through_repeated_genuine_absence_with_no_attempt_cap() {
+    let (_dir, path) = temp_db();
+    let mut publish_calls = 0u32;
+
+    let conn = crate::coordination::connect_with(&path, |p| {
+        publish_calls += 1;
+        if publish_calls < 3 {
+            // Leave `p` absent: the next open must fail CANTOPEN/NotFound
+            // again instead of giving up.
+            return;
+        }
+        crate::coordination::publish::ensure_published(p);
+    });
+
+    conn.execute_batch("PRAGMA journal_mode = WAL;")
+        .expect("the connection returned after the retries must be a usable, open database");
+    assert_eq!(
+        publish_calls, 3,
+        "connect_with must call the publish hook again for every round of genuine absence"
+    );
+}
+
+/// Many threads racing `connect()` against the same, initially-absent path:
+/// one thread's failed open (genuinely absent at that instant) can have its
+/// `symlink_metadata` recheck land *after* a concurrent thread's publish has
+/// already landed the file — the open failed because of absence, but by the
+/// time this thread looks, absence is no longer what `symlink_metadata`
+/// reports. That must not be mistaken for a dangling-symlink/directory kind
+/// of brokenness and panic; the file is simply there now, and the very next
+/// open succeeds. Every thread must return a connection, never panic.
+///
+/// Repeated across many fresh paths in one test (rather than relying on a
+/// single race) because the window this exercises is a handful of syscalls
+/// wide — one iteration is not a reliable enough probe on its own.
+#[cfg(unix)]
+#[test]
+fn connect_survives_many_threads_racing_the_same_absent_path() {
+    const THREADS: usize = 16;
+    const ROUNDS: usize = 20;
+
+    for _ in 0..ROUNDS {
+        let (_dir, path) = temp_db();
+        let barrier = Barrier::new(THREADS);
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(|| {
+                    barrier.wait();
+                    // `open_db`, not a bare `connect()`, matches how every
+                    // real caller reaches `connect()`: it sets
+                    // `busy_timeout` before touching the DB, which a raw
+                    // `connect()` deliberately doesn't (that's `open_db`'s
+                    // job, not `connect`'s) — asserting through a bare
+                    // `PRAGMA` here would conflate `SQLITE_BUSY` from that
+                    // missing timeout with the absence/TOCTOU race this
+                    // test targets.
+                    let _conn = open_db(&path);
+                });
+            }
+        });
+    }
 }
 
 // Windows is_pid_alive: only "no such process" means dead =====
