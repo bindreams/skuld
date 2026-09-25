@@ -12,8 +12,8 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use super::publish::{
-    classify_rename_errno, create_publish_temp, create_publish_temp_with, ensure_published, handle_rename_result,
-    rename_publish_temp, RenameError,
+    classify_rename_errno, create_publish_temp, create_publish_temp_with, ensure_published, ensure_published_with,
+    handle_rename_result, rename_publish_temp, RenameError,
 };
 
 /// Downcast a `catch_unwind` payload to its panic message.
@@ -246,4 +246,65 @@ fn ensure_published_leaves_an_existing_file_untouched() {
     // narrow mode from before this uid's involvement — is used as-is.
     assert_eq!(std::fs::read(&target).unwrap(), b"already here");
     assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o600);
+}
+
+/// The fast path this test pins: `connect()` runs on every connection, not
+/// just the first, so an unconditional publish attempt (temp create, fchmod,
+/// rename — three syscalls plus a retry loop) on every single one is wasted
+/// work the moment `.skuld.db` already exists. An `EEXIST`-only no-op (what
+/// `ensure_published` falls back to without this pre-check) still does the
+/// temp create and fchmod before discovering that on the rename. A plain
+/// existence check (lstat, not a full open+read) must skip the publish
+/// attempt entirely instead.
+#[test]
+fn ensure_published_skips_publishing_when_the_target_already_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join(".skuld.db");
+    std::fs::write(&target, b"already here").unwrap();
+
+    let mut called = false;
+    ensure_published_with(&target, |_dir, _target| called = true);
+
+    assert!(
+        !called,
+        "the publish closure must not run at all when the target already exists"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"already here");
+}
+
+/// A dangling symlink at the target path counts as "already exists" for the
+/// fast path too: `lstat`/`symlink_metadata` succeeds against the link
+/// itself even though what it points to is gone. Skipping the publish here
+/// is what the module doc's "even a dangling symlink" already assumes on the
+/// `rename`'s `EEXIST` side; the fast path must agree, not attempt a publish
+/// that the rename would just reject anyway.
+#[test]
+fn ensure_published_skips_publishing_for_a_dangling_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join(".skuld.db");
+    std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &target).unwrap();
+
+    let mut called = false;
+    ensure_published_with(&target, |_dir, _target| called = true);
+
+    assert!(
+        !called,
+        "the publish closure must not run at all when the target is a dangling symlink"
+    );
+    let meta = std::fs::symlink_metadata(&target).unwrap();
+    assert!(meta.file_type().is_symlink(), "the symlink must be left untouched");
+}
+
+/// Mirrors `ensure_published_creates_an_absent_file_at_0666`, but through the
+/// injectable seam: confirms the fast path's absence check doesn't itself
+/// false-positive and skip a genuinely absent target.
+#[test]
+fn ensure_published_publishes_when_the_target_is_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join(".skuld.db");
+
+    let mut called = false;
+    ensure_published_with(&target, |_dir, _target| called = true);
+
+    assert!(called, "the publish closure must run when the target is absent");
 }

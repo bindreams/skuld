@@ -1,9 +1,13 @@
-//! End-to-end test pinning `__scope`'s drop timing for a satisfied
-//! `should_panic` test: a Test-scoped fixture's `Drop` impl that checks
-//! `std::thread::panicking()` must see `true`. Out-of-harness because the
-//! read has to survive past the subprocess that took it — a subprocess is
-//! also required so a would-be regression (a real double panic, if the
-//! probe's own `Drop` ever panicked) can't take this driver down with it.
+//! End-to-end test pinning fixture teardown timing and order for a satisfied
+//! `should_panic` test: both a Test-scoped fixture's `Drop` and a
+//! Variable-scoped fixture that depends on it must see
+//! `std::thread::panicking() == true`, and the Variable-scoped one (the
+//! dependent) must drop *before* the Test-scoped one (the dependency) it
+//! borrowed from — the same order the plain (non-should_panic) arm produces
+//! for free. Out-of-harness because the read has to survive past the
+//! subprocess that took it — a subprocess is also required so a would-be
+//! regression (a real double panic, if the probe's own `Drop` ever
+//! panicked) can't take this driver down with it.
 
 use std::process::Command;
 
@@ -25,9 +29,12 @@ fn should_panic_satisfied_reports_panicking_during_scope_drop() {
 
     let recorded =
         std::fs::read_to_string(out_path).unwrap_or_else(|e| panic!("probe did not write its output file: {e}"));
+    let lines: Vec<&str> = recorded.lines().collect();
     assert_eq!(
-        recorded, "true",
-        "the tracked fixture's Drop must run while the test's own panic is still unwinding \
-         through __scope, so std::thread::panicking() must read true, not {recorded:?}"
+        lines,
+        vec!["variable-scoped panicking=true", "test-scoped panicking=true"],
+        "the Variable-scoped fixture (dependent) must drop before the Test-scoped one \
+         (tracked) it borrowed from, and both must see std::thread::panicking() == true \
+         while the test's own panic is still unwinding through __scope; got: {recorded:?}"
     );
 }

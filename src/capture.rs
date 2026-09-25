@@ -602,8 +602,10 @@ impl Drop for FdCapture {
         // restores stdio instead of leaving it redirected into an
         // abandoned pipe. On that path, whatever had already been written
         // to the captured fds — and any `[skuld] {name}: ...` diagnostics
-        // not yet printed — is discarded, not dumped: only `end()` dumps
-        // captured bytes.
+        // not yet printed — is discarded here: `end()` only returns the
+        // captured bytes, it doesn't dump them; the caller (`runner.rs`'s
+        // `dump_captured_bytes`) does, and only on the paths where `end()`
+        // actually ran.
         let Some(saved) = self.saved.take() else {
             return;
         };

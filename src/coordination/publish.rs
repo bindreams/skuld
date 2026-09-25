@@ -39,21 +39,38 @@ use std::path::{Path, PathBuf};
 use super::skuld_debug_eprintln;
 
 /// Ensure `db_path` is published at `0666`. Called by [`super::connect`]
-/// before any SQLite call. No existence pre-check: `publish_one` always
-/// attempts the create-and-rename, and its own `EEXIST` handling (a
-/// no-replace rename against anything already at `db_path` — a real file,
-/// or even a dangling symlink — fails `EEXIST` and is treated as "someone
-/// else already published") is what makes a second call a no-op, without a
-/// separate check that could itself race the very thing it's checking for.
-/// Nothing about an existing file is checked. Panics loudly on: a
-/// filesystem that ignores modes, one with no atomic no-replace rename, or
-/// any other unexpected publish failure.
+/// before any SQLite call — on every connection, not just the first, so a
+/// fast path matters: an `lstat` (`symlink_metadata`, not `exists()` — a
+/// dangling symlink must count as "already there" too, same as
+/// `publish_one`'s own `EEXIST` handling treats it) skips the publish
+/// attempt entirely once something is already at `db_path`. Only creation —
+/// the first connection to ever see `db_path` absent — needs the temp
+/// create, `fchmod` and no-replace rename `publish_one` does; every later
+/// connection would otherwise repeat all three syscalls just to discover an
+/// `EEXIST` no-op on the rename. This check can still race a concurrent
+/// first publish (TOCTOU between the `lstat` and `publish_one`'s own
+/// create), which is why `publish_one` keeps its `EEXIST` handling rather
+/// than relying on this check alone: this is a fast path over that
+/// mechanism, not a replacement for it. Panics loudly on: a filesystem that
+/// ignores modes, one with no atomic no-replace rename, or any other
+/// unexpected publish failure.
 pub(super) fn ensure_published(db_path: &Path) {
+    ensure_published_with(db_path, publish_one);
+}
+
+/// [`ensure_published`]'s implementation, parameterized over the publish
+/// step so `publish_tests` can assert the fast path skips it entirely
+/// instead of only observing side effects that an `EEXIST` no-op would
+/// produce too.
+pub(super) fn ensure_published_with(db_path: &Path, publish: impl FnOnce(&Path, &Path)) {
+    if std::fs::symlink_metadata(db_path).is_ok() {
+        return;
+    }
     let dir = db_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    publish_one(dir, db_path);
+    publish(dir, db_path);
 }
 
 // Publish atomically =====

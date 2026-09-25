@@ -586,8 +586,9 @@ fn connect_panics_loudly_on_a_dangling_symlink_instead_of_recreating_the_db() {
         "panic message should name the path: {msg:?}"
     );
     assert!(
-        msg.contains("vanished") || msg.contains("isn't a regular file"),
-        "panic message should say the DB vanished or isn't a regular file: {msg:?}"
+        msg.contains("could not open coordination DB"),
+        "panic message should be the neutral open-failure wording, not claim the DB vanished \
+         (it doesn't: ensure_published recreates a plain absence): {msg:?}"
     );
 
     let meta = std::fs::symlink_metadata(&path).unwrap();

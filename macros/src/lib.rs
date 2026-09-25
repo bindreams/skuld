@@ -503,19 +503,29 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
     // Fixture names for TestDef.fixture_names.
     let fixture_name_strs: Vec<&str> = fixture_params.iter().map(|p| p.fixture_name.as_str()).collect();
 
-    // Build fixture injection code using fixture_get().
+    // Build fixture injection code using fixture_get(). Split into three
+    // per-fixture pieces (rather than one combined block) so the
+    // should_panic arms below can run `fixture_get` outside catch_unwind —
+    // it's the part that can fail, an infrastructure error rather than a
+    // test panic — while still moving each handle into catch_unwind's
+    // closure, in the same declaration order as `fixture_get` ran, before
+    // deriving its reference. That ordering is what keeps drop order
+    // matching the plain (non-should_panic) arm: see `fixture_handle_moves`
+    // and `fixture_bindings` below, and the should_panic arms' comments.
+    //
     // Each block references the fixture function as an identifier, which:
     // 1. Forces the crate containing the fixture to be linked (for inventory discovery)
     // 2. Gives a compile-time error if the fixture function is not in scope
-    let fixture_setup: Vec<_> = fixture_params
+    let handle_names: Vec<_> = (0..fixture_params.len())
+        .map(|i| format_ident!("__fixture_handle_{}", i))
+        .collect();
+
+    let fixture_gets: Vec<_> = fixture_params
         .iter()
-        .enumerate()
-        .map(|(i, fp)| {
-            let handle_name = format_ident!("__fixture_handle_{}", i);
+        .zip(&handle_names)
+        .map(|(fp, handle_name)| {
             let fixture_ident = format_ident!("{}", fp.fixture_name);
-            let binding = &fp.binding;
             let target_ty = &fp.target_ty;
-            let param_ty = &fp.param_ty;
             let fixture_name = &fp.fixture_name;
             quote! {
                 let _ = &#fixture_ident;
@@ -523,9 +533,35 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
                     #fixture_name,
                     ::std::any::TypeId::of::<#target_ty>(),
                 );
+            }
+        })
+        .collect();
+
+    let fixture_handle_moves: Vec<_> = handle_names
+        .iter()
+        .map(|handle_name| quote! { let #handle_name = #handle_name; })
+        .collect();
+
+    let fixture_bindings: Vec<_> = fixture_params
+        .iter()
+        .zip(&handle_names)
+        .map(|(fp, handle_name)| {
+            let binding = &fp.binding;
+            let target_ty = &fp.target_ty;
+            let param_ty = &fp.param_ty;
+            quote! {
                 let #binding: #param_ty = unsafe { #handle_name.as_ref::<#target_ty>() };
             }
         })
+        .collect();
+
+    // Combined form for the plain arm, where there's no catch_unwind split
+    // to keep separate: fixture_get and its binding happen back to back,
+    // same as before this was split into three pieces.
+    let fixture_setup: Vec<_> = fixture_gets
+        .iter()
+        .zip(&fixture_bindings)
+        .map(|(get, binding)| quote! { #get #binding })
         .collect();
 
     let vis = &func.vis;
@@ -543,14 +579,24 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
     let is_async = func.sig.asyncness.is_some();
     let await_suffix = if is_async { quote!(.await) } else { quote!() };
 
-    // Setup: enter scope and inject fixtures. Always runs *outside* should_panic's
-    // catch_unwind (see below) — a fixture setup failure is an infrastructure
-    // error, not a test panic that should satisfy should_panic. `#(#fixture_setup)*`
-    // expands to nothing when `fixture_params` is empty, so no separate branch
-    // is needed for the no-fixtures case.
+    // Setup: enter scope and inject fixtures. For the plain (non-should_panic)
+    // arm this is the whole thing, run directly in the test closure — no
+    // catch_unwind to split it around. `#(#fixture_setup)*` expands to nothing
+    // when `fixture_params` is empty, so no separate branch is needed for the
+    // no-fixtures case.
     let setup_core = quote! {
         let __scope = ::skuld::enter_test_scope(#name_str, ::core::module_path!());
         #(#fixture_setup)*
+    };
+
+    // should_panic arms only: `enter_test_scope` plus every `fixture_get`
+    // (the parts that can fail — an infrastructure error, not a test panic
+    // that should satisfy should_panic) run outside catch_unwind, same as the
+    // plain arm. `__scope` and the handles move in afterwards; see the
+    // should_panic arms below for why.
+    let scope_and_fixture_gets = quote! {
+        let __scope = ::skuld::enter_test_scope(#name_str, ::core::module_path!());
+        #(#fixture_gets)*
     };
 
     // The call itself: invoke the test function. IntoTestResult handles both
@@ -599,20 +645,32 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
         ShouldPanicArg::Yes => quote! {
             || {
                 #runtime_preamble
-                #setup_core
-                // `__scope` moves into this closure (rather than staying a local of
-                // the outer one) so its `Drop` — which reclaims Test-scoped
-                // fixtures — runs here, while a real panic from `#call_expr` is
-                // still unwinding through this closure's own scope, same as it
-                // would for a body with no should_panic at all. Left outside,
-                // `__scope` would instead drop after `catch_unwind` has already
-                // caught and stopped that unwind, so a fixture `Drop` impl that
-                // checks `std::thread::panicking()` would see `false` for a panic
-                // this test expected and got — see
-                // `should_panic_satisfied_reports_panicking_during_scope_drop` in
-                // `tests/panicking_at_drop_cli.rs`.
+                #scope_and_fixture_gets
+                // `__scope` and every fixture handle move into this closure
+                // (rather than staying locals of the outer one), in the same
+                // declaration order `fixture_get` ran them in, so their `Drop`s —
+                // including `__scope`'s, which reclaims Test-scoped fixtures —
+                // run here, while a real panic from `#call_expr` is still
+                // unwinding through this closure's own scope, same as it would
+                // for a body with no should_panic at all. That also keeps drop
+                // order matching the plain arm: a Variable-scoped fixture that
+                // borrows from a Test-scoped one (via `#[fixture(other)]`) still
+                // drops before the Test-scoped one reclaims it, instead of after
+                // — dropping the handles here, in order, before `#call_expr`
+                // reproduces the same nesting the plain arm's single block gets
+                // for free. Left outside, they'd instead drop after
+                // `catch_unwind` has already caught and stopped the unwind, so a
+                // fixture `Drop` impl that checks `std::thread::panicking()`
+                // would see `false` for a panic this test expected and got, and
+                // `skuld::current_test()` would already be cleared — see
+                // `should_panic_satisfied_reports_panicking_during_scope_drop`
+                // in `tests/panicking_at_drop_cli.rs`. The `as_ref` bindings run
+                // after the moves, inside the closure too: they borrow the
+                // handles, so they have to outlive them.
                 let __result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                     let __scope = __scope;
+                    #(#fixture_handle_moves)*
+                    #(#fixture_bindings)*
                     #call_expr
                 }));
                 if __result.is_ok() {
@@ -623,10 +681,12 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
         ShouldPanicArg::WithMessage(expected) => quote! {
             || {
                 #runtime_preamble
-                #setup_core
+                #scope_and_fixture_gets
                 // See the identical comment on the plain `should_panic` arm above.
                 let __result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                     let __scope = __scope;
+                    #(#fixture_handle_moves)*
+                    #(#fixture_bindings)*
                     #call_expr
                 }));
                 match __result {

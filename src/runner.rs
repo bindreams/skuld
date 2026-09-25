@@ -182,7 +182,8 @@ fn run_with_observability(
             // same concern by running before the capture window opens; a
             // spawn failure can't be checked that early.
             if let Some(c) = capture_guard.take() {
-                captured_bytes_or_warn(name, c.end(), |msg| eprintln!("{msg}"));
+                let captured_bytes = captured_bytes_or_warn(name, c.end(), |msg| eprintln!("{msg}"));
+                dump_captured_bytes(name, &captured_bytes);
             }
             panic!("skuld: failed to spawn trial thread for {name:?}: {e}");
         }
@@ -206,18 +207,39 @@ fn run_with_observability(
     let outcome = if result.is_ok() { "pass" } else { "fail" };
     eprintln!("[skuld] {name}: {outcome} ({} ms)", duration.as_millis());
 
-    if result.is_err() && !captured_bytes.is_empty() {
-        eprintln!("[skuld] {name}: ---- captured ----");
-        let _ = std::io::stderr().write_all(&captured_bytes);
-        if !captured_bytes.ends_with(b"\n") {
-            let _ = std::io::stderr().write_all(b"\n");
-        }
-        eprintln!("[skuld] {name}: ---- end capture ----");
+    if result.is_err() {
+        dump_captured_bytes(name, &captured_bytes);
     }
 
     if let Err(payload) = result {
         resume_unwind(payload);
     }
+}
+
+/// Print the `---- captured ----` block for `captured_bytes` to stderr, or
+/// do nothing if there's nothing captured. Shared by the normal post-join
+/// path and the spawn-failure path (`Builder::spawn` erroring before
+/// there's a trial thread to join) — both must show what was captured
+/// before reporting the failure, not just a trial body that itself failed.
+pub(crate) fn dump_captured_bytes(name: &str, captured_bytes: &[u8]) {
+    dump_captured_bytes_to(name, captured_bytes, |bytes| {
+        let _ = std::io::stderr().write_all(bytes);
+    });
+}
+
+/// [`dump_captured_bytes`]'s implementation, parameterized over the writer
+/// so the exact block it produces can be pinned in a unit test without
+/// capturing real stderr.
+pub(crate) fn dump_captured_bytes_to(name: &str, captured_bytes: &[u8], mut write: impl FnMut(&[u8])) {
+    if captured_bytes.is_empty() {
+        return;
+    }
+    write(format!("[skuld] {name}: ---- captured ----\n").as_bytes());
+    write(captured_bytes);
+    if !captured_bytes.ends_with(b"\n") {
+        write(b"\n");
+    }
+    write(format!("[skuld] {name}: ---- end capture ----\n").as_bytes());
 }
 
 /// Turn `FdCapture::end`'s result into the bytes to report on, calling

@@ -187,3 +187,62 @@ fn captured_bytes_or_warn_warns_and_returns_empty_on_err() {
         warnings[0]
     );
 }
+
+// Captured-bytes dump block: shared by the normal post-join path and the
+// spawn-failure path =====
+//
+// `Builder::spawn` can fail (e.g. the process's thread budget is exhausted)
+// after the capture window has already opened. Whatever landed in the pipe
+// before that failure — and any `[skuld] {name}: ...` diagnostics printed
+// through it — must reach the real terminal before the panic that reports
+// the spawn failure, the same as it would for a trial body that itself
+// failed. `dump_captured_bytes_to` is the pure piece of that: parameterized
+// over the writer so the exact block it produces can be pinned without a
+// real (practically untriggerable) `Builder::spawn` failure.
+
+#[test]
+fn dump_captured_bytes_to_writes_the_block_when_non_empty() {
+    let mut written = Vec::new();
+    crate::runner::dump_captured_bytes_to("my_trial", b"hello\n", |bytes| written.extend_from_slice(bytes));
+    let s = String::from_utf8(written).unwrap();
+    assert!(s.contains("[skuld] my_trial: ---- captured ----"));
+    assert!(s.contains("hello"));
+    assert!(s.contains("[skuld] my_trial: ---- end capture ----"));
+    assert!(
+        s.find("---- captured ----").unwrap() < s.find("hello").unwrap()
+            && s.find("hello").unwrap() < s.find("---- end capture ----").unwrap(),
+        "block order must be header, then bytes, then footer: {s:?}"
+    );
+}
+
+#[test]
+fn dump_captured_bytes_to_adds_a_trailing_newline_if_missing() {
+    let mut written = Vec::new();
+    crate::runner::dump_captured_bytes_to("t", b"no newline", |bytes| written.extend_from_slice(bytes));
+    let s = String::from_utf8(written).unwrap();
+    assert!(
+        s.contains("no newline\n[skuld] t: ---- end capture ----"),
+        "a missing trailing newline must be added before the footer: {s:?}"
+    );
+}
+
+#[test]
+fn dump_captured_bytes_to_does_not_duplicate_an_existing_trailing_newline() {
+    let mut written = Vec::new();
+    crate::runner::dump_captured_bytes_to("t", b"has newline\n", |bytes| written.extend_from_slice(bytes));
+    let s = String::from_utf8(written).unwrap();
+    assert!(
+        !s.contains("has newline\n\n"),
+        "must not add a second newline when one is already there: {s:?}"
+    );
+}
+
+#[test]
+fn dump_captured_bytes_to_is_a_no_op_when_empty() {
+    let mut written = Vec::new();
+    crate::runner::dump_captured_bytes_to("t", b"", |bytes| written.extend_from_slice(bytes));
+    assert!(
+        written.is_empty(),
+        "must not write anything when nothing was captured: {written:?}"
+    );
+}

@@ -265,8 +265,17 @@ impl Drop for TestScope {
             let mut entries = cell.borrow_mut();
             while let Some(entry) = entries.pop() {
                 // SAFETY: we leaked this Box in get_or_create_test, and no
-                // references to it outlive this scope (handles are dropped before
-                // the scope guard).
+                // references to it outlive this scope. This depends on every
+                // fixture handle for the current test dropping before this
+                // TestScope guard does — including a Variable-scoped handle that
+                // borrows from this one via #[fixture(other)]. Macro-generated
+                // test bodies uphold that by moving every handle, and this guard,
+                // into the same panic-catching closure, in declaration order (see
+                // the should_panic arms in macros/src/lib.rs); a handle left
+                // outside that closure would drop after this guard instead of
+                // before it, reclaiming this storage while a live reference to it
+                // still existed. tests/panicking_at_drop_cli.rs regression-tests
+                // this ordering.
                 unsafe {
                     let _ = Box::from_raw(entry.ptr);
                 }

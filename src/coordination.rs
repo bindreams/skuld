@@ -63,15 +63,29 @@ const SCHEMA_VERSION: i64 = 1;
 /// other uid out with a narrow default mode. Every caller in this
 /// module goes through this one helper, including [`TestRegistration::drop`].
 ///
-/// On Unix the open itself uses no `SQLITE_OPEN_CREATE`: publishing is the
-/// only thing allowed to create `.skuld.db`, so if it's gone by the time
-/// this runs — deleted mid-run, or a dangling symlink `ensure_published`'s
-/// no-replace rename couldn't get past (`EEXIST` fires against a symlink
-/// regardless of what it points to) — SQLite has nothing to silently
-/// recreate at a narrow default mode. That would be exactly the lockout
-/// this module exists to prevent, so this panics loudly instead, naming the
-/// path. No retry: a DB that vanishes mid-run is external interference, not
-/// a transient condition to wait out.
+/// A `.skuld.db` deleted mid-run is *not* what makes this panic: `connect()`
+/// calls `ensure_published` first, on every call, so a plain absence is
+/// recreated fresh at 0666 right here, same as the very first connection of
+/// the run. Recreation gets a new inode; any process that still holds a
+/// connection open to the deleted file's old inode (POSIX doesn't invalidate
+/// an open fd on unlink) keeps operating on that old inode, coordinating
+/// separately from processes that connect afterward and see the new one.
+/// That split is accepted under this module's minimal-publish design (see
+/// the module doc): there's no verification of what's actually at `path`
+/// beyond "something is," so nothing here would notice the swap to tell the
+/// two groups apart, let alone reconcile them.
+///
+/// What *does* panic: the open itself uses no `SQLITE_OPEN_CREATE`, so a
+/// dangling symlink at `path` is the one shape `ensure_published` can't turn
+/// into a usable file. Its no-replace rename reports `EEXIST` against the
+/// symlink regardless of what it points to (or that it points to nothing),
+/// so publishing no-ops, and the open then fails against a target that
+/// doesn't resolve. SQLite has nothing to silently recreate at a narrow
+/// default mode (`SQLITE_OPEN_CREATE` would just create a fresh file
+/// *through* the dangling link, at whatever mode `umask` leaves it — exactly
+/// the lockout this module exists to prevent), so this panics loudly
+/// instead, naming the path. No retry: a dangling symlink is external
+/// interference, not a transient condition to wait out.
 ///
 /// Windows is unchanged: no Windows lane mixes uids, so there's nothing for
 /// the publish step to protect against there, and the open keeps its
@@ -83,9 +97,8 @@ pub(crate) fn connect(path: &std::path::Path) -> rusqlite::Connection {
         let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
             | rusqlite::OpenFlags::SQLITE_OPEN_URI
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        rusqlite::Connection::open_with_flags(path, flags).unwrap_or_else(|e| {
-            panic!("skuld: coordination DB at {path:?} vanished or isn't a regular file after being published: {e}")
-        })
+        rusqlite::Connection::open_with_flags(path, flags)
+            .unwrap_or_else(|e| panic!("skuld: could not open coordination DB {path:?}: {e}"))
     }
 
     #[cfg(not(unix))]
@@ -312,6 +325,20 @@ fn is_pid_alive(pid: u32) -> bool {
 /// `HRESULT` rather than the live `windows::core::Error`, so this
 /// classification can be unit-tested without needing a real failing
 /// `OpenProcess` call.
+///
+/// **Known hang hazard, same class as Unix `EPERM` above, not fixed here:**
+/// `clean_stale_entries` treats an "exists but we can't query it" PID as
+/// alive and leaves its `running` row in place. If that PID was actually
+/// this instance's *own* long-dead owner, and the OS has since reused the
+/// number for an unrelated process this uid can't `OpenProcess` (protected,
+/// elevated, or another user's) — `ERROR_ACCESS_DENIED` — the row is never
+/// cleaned up. A later test whose serial filter conflicts with that row then
+/// blocks in `coordinate`'s loop for as long as the unrelated process lives,
+/// which can be indefinitely. Fixing this needs a way to tell "this PID,
+/// this instance" apart from "this PID, coincidentally reused," which
+/// `instance_id`'s `"{pid}:{timestamp}"` format doesn't do across a reuse —
+/// the same gap the existing cross-namespace `is_pid_alive` issue tracks.
+/// That's an owner design question, not addressed by this change.
 #[cfg(windows)]
 fn win32_open_process_error_means_dead(code: windows::core::HRESULT) -> bool {
     code == windows::Win32::Foundation::ERROR_INVALID_PARAMETER.to_hresult()

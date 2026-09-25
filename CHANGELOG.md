@@ -68,7 +68,13 @@ All notable changes to this project are documented in this file.
   resolution (`enter_test_scope` plus each `#[fixture]` parameter's
   `fixture_get`) now runs _before_ `catch_unwind`, not inside it. Previously,
   a fixture whose setup panicked would satisfy `should_panic`, masking a
-  broken fixture as a passing test.
+  broken fixture as a passing test. Every fixture handle and the test scope
+  guard still move into `catch_unwind` together, in declaration order, so
+  teardown timing and order for a satisfied `should_panic` test match the
+  plain (non-`should_panic`) case: a `Drop` impl sees
+  `std::thread::panicking() == true`, and a Variable-scoped fixture that
+  depends on a Test-scoped one still drops before the Test-scoped one is
+  reclaimed.
 - **`TestRegistration::drop` (the coordination DB's last connection per test)
   now panics loudly when its own `connect()` call fails**, instead of only
   `eprintln!`-warning. It goes through the same `connect()` helper as every
@@ -93,6 +99,21 @@ All notable changes to this project are documented in this file.
   under `block_on`'s runtime context anymore. `Runtime::enter()`'s guard is
   now held for the whole closure — setup, the `block_on`'d call, and
   teardown, in that order — so all three still see a live runtime.
+- **On Windows, stale-entry cleanup now treats `OpenProcess` failing with
+  anything other than `ERROR_INVALID_PARAMETER` (a nonexistent PID) as "the
+  process exists but we can't query it," not as dead** — `ERROR_ACCESS_DENIED`
+  included, e.g. a process owned by another user or a protected/elevated
+  one. Matches Unix's existing `EPERM` handling, which already treats
+  "exists but not signalable" as alive rather than assuming a permission
+  failure means gone. **Known hang, not fixed here:** if a `running` row's
+  PID has since been reused by a process this uid can't `OpenProcess`,
+  cleanup can never delete that row, and a later test whose serial filter
+  conflicts with it blocks in `coordinate`'s wait loop for as long as the
+  unrelated process lives — potentially indefinitely. Same class of problem
+  as Unix's `EPERM` case. Fixing it needs a way to distinguish "this PID,
+  this instance" from "this PID, reused by someone else," which will be
+  addressed together with the existing cross-namespace `is_pid_alive`
+  tracking issue.
 
 ### Added
 
@@ -116,7 +137,11 @@ All notable changes to this project are documented in this file.
     `.skuld.db` already at 0666. On Windows, `connect()` skips that call
     (there's no uid-mixing hazard to guard against) and only provides
     `Connection::open`'s panic-on-failure wrapper, same as every platform.
-  - The first process to see an absent `.skuld.db` creates a private
+  - Only creation needs mode and no-replace-rename support: `ensure_published`
+    checks for an existing `.skuld.db` first (`lstat`, so a dangling symlink
+    counts as "already there" too, matching the rename's own `EEXIST`
+    handling below) and returns immediately if so. The first process to see
+    an absent `.skuld.db` creates a private
     `.skuld-publish-<pid>-<nanos>-<seq>.tmp` (outside the `.skuld.db*`
     glob), `fchmod`s it 0666, and publishes it with an atomic no-replace
     rename (`renameat2(..., RENAME_NOREPLACE)` via a raw `syscall()` on
@@ -124,7 +149,9 @@ All notable changes to this project are documented in this file.
     libc's own version floor for the `renameat2` _wrapper_ symbol —
     `renamex_np(..., RENAME_EXCL)` on macOS) — a lost race silently
     discards the loser's temp and uses the winner's file as-is, with no
-    further checks.
+    further checks. Every later connection, on every process, skips the
+    create/fchmod/rename dance entirely via the existence check instead of
+    repeating it just to hit an `EEXIST` no-op on the rename.
   - The `-wal`/`-shm` companions are not pre-created or `fchmod`ed by
     Skuld at all: SQLite's own Unix VFS derives their mode from the main
     DB file's already-0666 mode, so once `.skuld.db` is published they come
