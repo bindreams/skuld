@@ -32,6 +32,12 @@ All notable changes to this project are documented in this file.
   atomic-publish step at all — `.skuld.db` was created with a plain
   `open(O_CREAT)` and whatever mode/rename semantics the filesystem gave it,
   no matter how limited.
+- **The filesystem holding `target/` must support a blocking advisory file
+  lock (`flock` on Unix, `LockFileEx` on Windows)**, since `connect()` and
+  `open_db()` now serialize the coordination DB's creation, publication, and
+  schema initialization through one on a sibling `.skuld.db.lock` file (see
+  below). Every mainstream local filesystem and every filesystem this crate
+  otherwise supports (see the two bullets above) already does.
 
 ### Changed
 
@@ -143,23 +149,17 @@ All notable changes to this project are documented in this file.
     `std::fs::File`'s own native `lock`/`unlock`) on a sibling
     `.skuld.db.lock` file, held for the whole create-or-open-and-initialize
     sequence. Whoever holds it is the only actor in the system allowed to
-    create, publish, or schema-initialize `.skuld.db` at that instant, so
-    every race this module used to paper over with a retry is removed at
-    the source instead: on Unix, `connect()`'s single ask-forgiveness open
-    → `ensure_published` → reopen sequence needs no retry loop around it,
-    because while the lock is held there is no concurrent publisher left to
-    race; and `open_db`'s `PRAGMA journal_mode = WAL` cold-start negotiation
-    over the freshly-created `-shm` file has nothing left to contend with
-    either, since it's the only connection performing that negotiation for
-    the whole system at that moment. An earlier version of this release
-    instead retried both races (a single grace reopen in `connect`, and a
-    sleep-then-retry loop with a 50-attempt cap in `open_db`) — both were
-    replaced by the lock before release, since a retry can still lose twice
-    in a row, and a sleep-based retry loop is time-based synchronization
-    with an arbitrary cap either way. On Windows, `connect()` still skips
-    the publish step entirely (there's no uid-mixing hazard to guard
-    against there) but takes the same init lock as every other platform,
-    since `open_db`'s WAL negotiation race is cross-platform.
+    create, publish, or schema-initialize `.skuld.db` at that instant. On
+    Windows, `connect()` still skips the `.skuld.db` publish step entirely
+    (there's no uid-mixing hazard to guard against there) but takes the
+    same init lock as every other platform, since `open_db`'s WAL
+    negotiation race is cross-platform.
+  - The lock file itself is published at 0666 the same way `.skuld.db` is,
+    and opened read-only (`flock`/`LockFileEx` only need read access on the
+    handle) — a lock file opened read-write, at whatever mode a plain
+    `open(O_CREAT)` gave it under the active umask, would reintroduce
+    exactly the lockout publishing `.skuld.db` itself exists to prevent, one
+    level down.
   - Only creation needs mode and no-replace-rename support: `ensure_published`
     checks for an existing `.skuld.db` first (`lstat`, so a dangling symlink
     counts as "already there" too, matching the rename's own `EEXIST`

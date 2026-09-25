@@ -104,3 +104,32 @@ fn with_init_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet()
         "with_init_lock let more than one thread into the critical section at once"
     );
 }
+
+/// Deterministic counterpart to the two statistical tests above: rather than
+/// racing many threads and checking they never overlap, this holds
+/// `with_init_lock` open and, from *inside* it, `try_lock`s a completely
+/// fresh handle on the same lock file. `flock`/`LockFileEx` locks are scoped
+/// to the open file description/handle, not the process or thread, so a
+/// second, independently-opened handle contending the same lock — even from
+/// the same thread — must report `WouldBlock`, not silently succeed. This
+/// can't flake: there is no timing window to miss, since the fresh `try_lock`
+/// only ever runs while `with_init_lock`'s own lock is provably still held.
+#[test]
+fn a_fresh_try_lock_reports_would_block_while_with_init_lock_holds_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join(".skuld.db");
+
+    with_init_lock(&db_path, || {
+        let fresh = std::fs::OpenOptions::new()
+            .read(true)
+            .open(lock_path(&db_path))
+            .expect("lock file must already exist while with_init_lock holds it");
+        match fresh.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            other => panic!(
+                "a fresh handle's try_lock() must report WouldBlock while with_init_lock \
+                 already holds the exclusive lock, got {other:?}"
+            ),
+        }
+    });
+}

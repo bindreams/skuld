@@ -562,6 +562,37 @@ fn drop_panics_loudly_on_a_corrupt_db_when_nothing_else_is_unwinding() {
     );
 }
 
+// Init lock file permissions =====
+
+/// Regression guard for H1: the lock file must never need write access to
+/// be locked (`flock`/`LockFileEx` only ever need read access on the
+/// handle — see `lock.rs`'s module doc), so `open_db` must succeed even
+/// against a pre-existing lock file that lacks the owner write bit
+/// entirely. Before the fix, `open_lock_file` opened with `.write(true)`,
+/// which would fail `EACCES` here exactly the way a root-published,
+/// 0644-narrowed-by-umask lock file would fail a later non-root run.
+#[cfg(unix)]
+#[test]
+fn open_db_succeeds_against_a_preexisting_lock_file_with_no_owner_write_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, path) = temp_db();
+    let lock_path = crate::coordination::lock::lock_path(&path);
+    std::fs::write(&lock_path, b"").unwrap();
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let conn = open_db(&path);
+    conn.execute_batch("PRAGMA journal_mode = WAL;")
+        .expect("open_db must return a usable connection even with a read-only lock file");
+
+    let meta = std::fs::metadata(&lock_path).unwrap();
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o444,
+        "open_db must not have changed the lock file's mode"
+    );
+}
+
 // connect() ask-forgiveness retry =====
 
 /// `connect()` opens first and only publishes on a `CANTOPEN` that
@@ -602,35 +633,34 @@ fn connect_panics_loudly_on_a_dangling_symlink_instead_of_recreating_the_db() {
 }
 
 /// `connect_with` runs under `path`'s init lock (via `connect`/`open_db`),
-/// so it is the only creator or publisher in the whole system for the
-/// duration of the call — there is no concurrent publisher left to race,
-/// and therefore no legitimate reason to retry the publish step at all.
-/// One open, one publish attempt on `CANTOPEN`+absence, one more open: if
-/// the publish hook doesn't leave a file at `path` — a caller bug against
-/// `ensure_published`'s own documented contract, which is to panic rather
-/// than return without one — that must surface immediately as a loud
-/// panic, not as silent, indefinite retrying.
+/// which excludes every other *Skuld* process, not external interference —
+/// something outside Skuld (a human, another tool) can still delete
+/// `.skuld.db` between `ensure_published` returning and the retried open
+/// running, repeatedly, and `connect`'s own doc promises that any such
+/// absence gets recreated fresh rather than panicking. This drives the
+/// publish hook to leave `path` absent for the first two rounds and only
+/// really publish on the third, proving the loop keeps retrying through
+/// repeated genuine absence rather than giving up after one round trip —
+/// there is no attempt cap.
 #[cfg(unix)]
 #[test]
-fn connect_with_panics_immediately_if_the_publish_hook_leaves_the_path_absent() {
+fn connect_with_retries_through_repeated_genuine_absence_with_no_attempt_cap() {
     let (_dir, path) = temp_db();
     let mut publish_calls = 0u32;
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::coordination::connect_with(&path, |_p| {
-            publish_calls += 1;
-            // Deliberately violate ensure_published's contract: leave `p`
-            // absent instead of creating it.
-        })
-    }));
+    let conn = crate::coordination::connect_with(&path, |p| {
+        publish_calls += 1;
+        if publish_calls < 3 {
+            return;
+        }
+        crate::coordination::publish::ensure_published(p);
+    });
 
-    assert!(
-        result.is_err(),
-        "connect_with must panic, not retry indefinitely, when the publish hook leaves path absent"
-    );
+    conn.execute_batch("PRAGMA journal_mode = WAL;")
+        .expect("the connection returned after the retries must be a usable, open database");
     assert_eq!(
-        publish_calls, 1,
-        "connect_with must call the publish hook exactly once per open attempt, never loop"
+        publish_calls, 3,
+        "connect_with must call the publish hook again for every round of genuine absence"
     );
 }
 
@@ -677,14 +707,18 @@ fn connect_survives_many_threads_racing_the_same_absent_path() {
 // The `SQLITE_READONLY` WAL cold-start race documented on `open_db` (a
 // connection that loses `PRAGMA journal_mode = WAL`'s negotiation over the
 // freshly-created `-shm` file can come back permanently readonly for its
-// own lifetime) has no in-process regression test here: SQLite's own unix
-// VFS serializes `-shm` creation across every thread *of one process*
-// through a process-local mutex, so the race is invisible to threads
-// sharing a process, only observable (if at all — see that file's own doc)
-// between genuinely separate OS processes — confirmed empirically (a
-// 64-thread x 100-round in-process write-based probe never reproduced it
-// against the pre-lock code). See `tests/wal_cold_start_race_regression.rs`,
-// which spawns real subprocesses via the `wal_race_probe` binary instead.
+// own lifetime) has no direct regression test anywhere in this crate:
+// SQLite's own unix VFS serializes `-shm` creation across every thread *of
+// one process* through a process-local mutex, so the race is invisible to
+// threads sharing a process, only observable (if at all) between genuinely
+// separate OS processes — and even a genuine-subprocess version of this
+// same write-based probe (16 processes x 20 rounds, barrier-synchronized)
+// never reproduced it against pre-lock code either, so it was dropped
+// rather than kept as a test that had never demonstrably failed on the code
+// it was meant to guard. `tests/lock_contention_regression.rs` instead
+// deterministically guards the mechanism that removes this race outright —
+// `lock::with_init_lock`'s mutual exclusion — which is provable without
+// needing to reproduce the race it was built to remove.
 
 // Windows is_pid_alive: only "no such process" means dead =====
 

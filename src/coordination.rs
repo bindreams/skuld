@@ -65,35 +65,47 @@ const SCHEMA_VERSION: i64 = 1;
 /// `connect`/`open_db` call for the same path by [`lock::with_init_lock`].
 /// On Unix this asks forgiveness rather than permission: the open (no
 /// `SQLITE_OPEN_CREATE`) is tried first, and [`publish::ensure_published`]
-/// only runs — followed by one more open — when that open fails with
+/// only runs — followed by another open — when that open fails with
 /// `SQLITE_CANTOPEN` *and* nothing is at `path` (`symlink_metadata` reports
-/// `NotFound`). Every caller in this module goes through this one helper,
-/// including [`TestRegistration::drop`].
+/// `NotFound`). [`connect_locked`] — this function's body, and the same
+/// ask-forgiveness retry described below — is what every real caller
+/// actually uses: [`open_db`] calls it directly under its own longer-lived
+/// lock acquisition, and so does [`TestRegistration::drop`]'s cleanup, for
+/// the same reason: composing a second, nested [`lock::with_init_lock`] call
+/// (which this function itself does) inside a closure that already holds
+/// the lock would self-deadlock, since `flock`/`LockFileEx` locks are scoped
+/// to the open file description, not the process — a second open on the
+/// same path blocks even from the very thread already holding the first.
+/// This standalone wrapper exists only for tests that want [`connect_locked`]'s
+/// exact contract — including the lock acquisition — without also paying for
+/// [`open_db`]'s schema initialization.
 ///
-/// Holding the init lock for the whole sequence is what makes a single
-/// extra attempt enough, rather than a bet: while it's held, this call is
-/// the only create-or-publish attempt for `path` anywhere in the system, so
-/// there is no concurrent publisher left to race. `ensure_published` itself
-/// panics rather than returning without a file at `path` (see its own
-/// doc), so the second open either succeeds or the entry was never a plain
-/// race to begin with — a dangling symlink or a directory, which
-/// `ensure_published`'s no-replace rename can't turn into a usable file
-/// (`EEXIST` against a symlink regardless of what it points to, or against
-/// a directory) and `symlink_metadata` reports as present rather than
-/// `NotFound`. That failure is external interference, not something to
-/// wait out, and panics loudly, naming the path.
+/// Holding the init lock for the whole sequence removes any *Skuld* process
+/// as a source of that `CANTOPEN`+absence: while it's held, this call is the
+/// only create-or-publish attempt for `path` anywhere in the system, so a
+/// `symlink_metadata` recheck that still finds nothing there cannot be a
+/// concurrent Skuld publisher's rename landing in the gap — it is either
+/// genuine absence (something outside Skuld deleted `path`; `ensure_published`
+/// republishes and the open is retried, uncapped, for as long as that keeps
+/// happening) or a genuinely broken entry (a dangling symlink or a
+/// directory, which `ensure_published`'s no-replace rename can't turn into a
+/// usable file and `symlink_metadata` reports as present rather than
+/// `NotFound`) — external interference either way, not a Skuld-internal race
+/// to retry through. A broken entry panics loudly, naming the path, rather
+/// than being waited out.
 ///
-/// A `.skuld.db` deleted mid-run is *not* what makes this panic: any
-/// absence the open discovers gets recreated fresh at 0666, same as the
-/// very first connection of the run. Recreation gets a new inode; any
-/// process that still holds a connection open to the deleted file's old
-/// inode (POSIX doesn't invalidate an open fd on unlink) keeps operating on
-/// that old inode, coordinating separately from processes that connect
-/// afterward and see the new one. That split is accepted under this
-/// module's minimal-publish design (see the module doc): there's no
-/// verification of what's actually at `path` beyond "something is," so
-/// nothing here would notice the swap to tell the two groups apart, let
-/// alone reconcile them.
+/// A `.skuld.db` deleted mid-run is *not* what makes this panic, no matter
+/// how many times it happens: every absence the open discovers, including a
+/// repeat one after `ensure_published` already ran once, gets recreated
+/// fresh at 0666, same as the very first connection of the run. Recreation
+/// gets a new inode; any process that still holds a connection open to the
+/// deleted file's old inode (POSIX doesn't invalidate an open fd on unlink)
+/// keeps operating on that old inode, coordinating separately from
+/// processes that connect afterward and see the new one. That split is
+/// accepted under this module's minimal-publish design (see the module
+/// doc): there's no verification of what's actually at `path` beyond
+/// "something is," so nothing here would notice the swap to tell the two
+/// groups apart, let alone reconcile them.
 ///
 /// Windows is unchanged: no Windows lane mixes uids, so there's nothing for
 /// the publish step to protect against there, and the open keeps its
@@ -101,6 +113,13 @@ const SCHEMA_VERSION: i64 = 1;
 /// [`open_db`] needs that regardless of platform (see its doc) and a
 /// single lock covering every `connect` call, not just the ones that could
 /// race, keeps this function's contract uniform.
+///
+/// `#[cfg(all(test, unix))]`, not just `#[cfg(test)]`: its only caller,
+/// `connect_panics_loudly_on_a_dangling_symlink_instead_of_recreating_the_db`,
+/// is itself Unix-only (dangling symlinks and `ensure_published`'s
+/// no-replace rename are both Unix-only concepts), so on a Windows test
+/// build this would be dead code even under `cfg(test)`.
+#[cfg(all(test, unix))]
 pub(crate) fn connect(path: &std::path::Path) -> rusqlite::Connection {
     lock::with_init_lock(path, || connect_locked(path))
 }
@@ -126,32 +145,42 @@ fn connect_locked(path: &std::path::Path) -> rusqlite::Connection {
 /// race.
 ///
 /// A single `symlink_metadata` call after a failed open can't, on its own,
-/// tell a genuinely broken entry (dangling symlink, directory) apart from a
-/// plain race — a concurrent publisher's rename landing between this open
-/// and the recheck presents identically. Without the init lock, that
-/// ambiguity would need to be resolved by retrying; the caller holding the
-/// lock resolves it instead: no other connection can be publishing `path`
-/// right now, so a `symlink_metadata` recheck that still finds nothing
-/// there is genuine absence to recreate, and a recheck that finds something
-/// there despite `ensure_published`'s guarantee is genuinely broken, not a
-/// race to wait out. Either way, one attempt at each step suffices.
+/// tell a genuinely broken entry (dangling symlink, directory) apart from
+/// genuine absence — a concurrent publisher's rename landing between this
+/// open and the recheck would present identically. The caller holding
+/// `path`'s init lock resolves that ambiguity: no other *Skuld* connection
+/// can be publishing `path` right now, so a `symlink_metadata` recheck that
+/// still finds nothing there is genuine absence — caused only by something
+/// outside Skuld, since the lock excludes every other Skuld process — and a
+/// recheck that finds something there despite `ensure_published`'s
+/// guarantee is genuinely broken, not a race to wait out.
+///
+/// Absence loops, uncapped, republishing and reopening each time: nothing
+/// bounds how many times something outside Skuld can delete `path` between
+/// this loop's publish and open, and giving up after one round would panic
+/// on exactly the case [`connect`]'s own doc promises recreates fresh. A
+/// broken entry never loops — it can't become un-broken by retrying — and
+/// panics immediately.
 #[cfg(unix)]
 fn connect_with(path: &std::path::Path, mut ensure_published: impl FnMut(&std::path::Path)) -> rusqlite::Connection {
     let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
         | rusqlite::OpenFlags::SQLITE_OPEN_URI
         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    match rusqlite::Connection::open_with_flags(path, flags) {
-        Ok(conn) => conn,
-        Err(e) => {
-            if !is_cantopen(&e) {
-                panic!("skuld: could not open coordination DB {path:?}: {e}");
+    loop {
+        match rusqlite::Connection::open_with_flags(path, flags) {
+            Ok(conn) => return conn,
+            Err(e) => {
+                if !is_cantopen(&e) {
+                    panic!("skuld: could not open coordination DB {path:?}: {e}");
+                }
+                if !path_is_absent(path) {
+                    panic!("skuld: could not open coordination DB {path:?}: {e}");
+                }
+                ensure_published(path);
+                // Loop back and reopen; if something outside Skuld keeps
+                // deleting `path` between publish and open, keep
+                // republishing — see this function's doc.
             }
-            if !path_is_absent(path) {
-                panic!("skuld: could not open coordination DB {path:?}: {e}");
-            }
-            ensure_published(path);
-            rusqlite::Connection::open_with_flags(path, flags)
-                .unwrap_or_else(|e| panic!("skuld: could not open coordination DB {path:?} after publishing: {e}"))
         }
     }
 }
@@ -188,10 +217,14 @@ fn path_is_absent(path: &std::path::Path) -> bool {
 /// the same `PRAGMA` reliably resolves either: the negotiation resolves the
 /// *file*'s `-shm`, not any one connection's already-formed opinion of it,
 /// so a connection that lands `SQLITE_READONLY` here can stay readonly for
-/// its own lifetime regardless of retries on that connection. See
-/// `tests/wal_cold_start_race_regression.rs` for this crate's own attempt to
-/// exercise the race directly (its module doc records what that attempt did
-/// and didn't manage to reproduce).
+/// its own lifetime regardless of retries on that connection. This race
+/// itself has no direct reproduction in this crate's own test suite — see
+/// the comment in `coordination_tests.rs` just above the Windows
+/// `is_pid_alive` tests for what was tried and why it didn't reproduce
+/// against pre-lock code. `tests/lock_contention_regression.rs` instead
+/// guards the mechanism that removes the race deterministically:
+/// [`lock::with_init_lock`]'s mutual exclusion itself, not the race's own
+/// historical symptom.
 ///
 /// [`lock::with_init_lock`] removes the race outright instead of retrying
 /// past it: this whole function — [`connect_locked`] plus the WAL pragma,
@@ -221,6 +254,35 @@ pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
         migrate_schema(&conn);
         conn
     })
+}
+
+// Test probe hooks =====
+
+/// Probe hook for Skuld's own test suite (`tests/lock_contention_regression.rs`,
+/// via the `lock_hold_probe` support binary): hold `path`'s real init lock —
+/// the same [`lock::with_init_lock`] `connect`/`open_db` use — for exactly the
+/// duration of `while_held`, so a driver process can deterministically prove
+/// a second process's `try_lock` on the same lock file reports `WouldBlock`
+/// while this one is running, then succeeds once it returns.
+pub(crate) fn probe_hold_init_lock(path: &std::path::Path, while_held: impl FnOnce()) {
+    lock::with_init_lock(path, while_held)
+}
+
+/// Probe hook for Skuld's own test suite (`tests/lock_contention_regression.rs`,
+/// via the `lock_try_probe` support binary): open a *fresh* handle on `path`'s
+/// init lock file — never the one [`probe_hold_init_lock`] or any real
+/// `connect`/`open_db` call holds — and attempt a non-blocking `try_lock` on
+/// it, returning the raw result. A fresh handle matters here the same way it
+/// does in `lock_tests.rs`'s in-process `try_lock` test: `flock`/`LockFileEx`
+/// locks are scoped to the open file description/handle, not the process, so
+/// only a genuinely separate handle (here, in a genuinely separate process)
+/// can observe contention against the held lock.
+pub(crate) fn probe_try_init_lock(path: &std::path::Path) -> Result<(), std::fs::TryLockError> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(lock::lock_path(path))
+        .unwrap_or_else(|e| panic!("skuld: probe could not open init lock file for {path:?}: {e}"));
+    file.try_lock()
 }
 
 // Transient error classification =====
@@ -563,15 +625,23 @@ pub(crate) struct TestRegistration {
 
 impl Drop for TestRegistration {
     fn drop(&mut self) {
+        // Runs the connect *and* the first statement on it under `db_path`'s
+        // init lock (like `open_db` does), not just a raw `connect()`: a
+        // fresh connection's first write against a WAL database still
+        // touches the `-shm` mapping, so this cleanup is itself a
+        // participant in the cold-start negotiation `open_db`'s doc
+        // describes, not a bystander exempt from it.
         let cleanup = || -> Result<(), rusqlite::Error> {
-            let conn = connect(&self.db_path);
-            conn.busy_timeout(Duration::from_secs(5))?;
-            conn.execute_batch("PRAGMA foreign_keys = ON")?;
-            conn.execute("DELETE FROM running WHERE id = ?1", [self.id])?;
-            Ok(())
+            lock::with_init_lock(&self.db_path, || {
+                let conn = connect_locked(&self.db_path);
+                conn.busy_timeout(Duration::from_secs(5))?;
+                conn.execute_batch("PRAGMA foreign_keys = ON")?;
+                conn.execute("DELETE FROM running WHERE id = ?1", [self.id])?;
+                Ok(())
+            })
         };
 
-        // `connect()` can panic (a publish failure, or SQLite itself
+        // `connect_locked` can panic (a publish failure, or SQLite itself
         // rejecting the file — e.g. it's been replaced by a directory —
         // is loud by design). Ordinarily that panic should propagate: a
         // genuinely broken DB is worth failing loudly over. But if this

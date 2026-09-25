@@ -54,7 +54,16 @@ libc = "0.2"
 #     io::stdout()/io::stderr(), which bypass the CRT fd table entirely.
 # We must swap both during capture or one stream silently escapes.
 libc = "0.2"
-windows = { version = "0.62", features = ["Win32_System_Console", "Win32_System_Threading"] }
+windows = { version = "0.62", features = [
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    # GetFileInformationByHandle, for src/coordination/lock.rs's Windows file
+    # identity check: std::os::windows::fs::MetadataExt's
+    # volume_serial_number/file_index are still gated behind the unstable
+    # `windows_by_handle` feature (rust-lang/rust#63010), so this crate calls
+    # the Win32 API directly instead of waiting on stabilization.
+    "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 skuld = { path = ".", features = ["tokio"] }
@@ -221,9 +230,16 @@ path = "tests/support_bins/panicking_at_drop_probe/main.rs"
 test = false
 doc = false
 
-# See tests/support_bins/wal_race_probe/main.rs's module doc.
+# See tests/support_bins/lock_hold_probe/main.rs's module doc.
 [[bin]]
-name = "wal_race_probe"
-path = "tests/support_bins/wal_race_probe/main.rs"
+name = "lock_hold_probe"
+path = "tests/support_bins/lock_hold_probe/main.rs"
+test = false
+doc = false
+
+# See tests/support_bins/lock_try_probe/main.rs's module doc.
+[[bin]]
+name = "lock_try_probe"
+path = "tests/support_bins/lock_try_probe/main.rs"
 test = false
 doc = false

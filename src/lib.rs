@@ -202,45 +202,34 @@ pub mod __private {
         crate::coordination::open_db(path)
     }
 
-    /// Probe hook for Skuld's own test suite: open a coordination DB
-    /// connection at `path` via the real init path (`open_db`) and
-    /// immediately write through it, panicking loudly if the write fails.
-    /// Exists to catch a connection that opened without error but came back
-    /// permanently `SQLITE_READONLY` from a lost `PRAGMA journal_mode =
-    /// WAL` cold-start negotiation over the freshly-created `-shm` file —
-    /// `open` alone can't detect this, since a stuck-readonly connection
-    /// still opens fine; only a write on it fails.
-    ///
-    /// Meant to run from a genuine subprocess, not an in-process thread:
-    /// SQLite's own unix VFS serializes `-shm` creation across every thread
-    /// *of one process* through a process-local mutex (`unixShmNode`'s init
-    /// lock), so this race is invisible to a thread-only probe within a
-    /// single process — confirmed empirically (a 64-thread × 100-round
-    /// in-process probe against the pre-lock code never reproduced it). See
-    /// `tests/wal_cold_start_race_regression.rs`, which drives this hook
-    /// from real subprocesses; its own doc records that even that did not
-    /// reproduce a failure locally despite substantial stress, so treat
-    /// this as a hardening probe for a real, documented race rather than a
-    /// proven repro. Not `#[cfg(unix)]`: this race lives in SQLite's own
-    /// cross-platform WAL negotiation inside `open_db`, not in the
-    /// Unix-only publish step [`probe_coordination_connect`] above
-    /// exercises.
-    pub fn probe_coordination_write(path: &std::path::Path) {
-        let conn = crate::coordination::open_db(path);
-        conn.execute(
-            "INSERT INTO running (instance_id, name, serial_filter) VALUES (?1, ?2, ?3)",
-            rusqlite::params![std::process::id().to_string(), "wal_race_probe", ""],
-        )
-        .unwrap_or_else(|e| {
-            panic!("probe: write through open_db's connection at {path:?} failed (stuck readonly?): {e}")
-        });
+    /// Probe hook for Skuld's own test suite (`tests/lock_contention_regression.rs`,
+    /// via the `lock_hold_probe` support binary): hold `path`'s coordination
+    /// DB init lock — the real one `connect`/`open_db` use — for the
+    /// duration of `while_held`, so a driver process can deterministically
+    /// prove a second process's `try_lock` on the same lock file blocks
+    /// while this one runs, and succeeds once it returns. Thin wrapper
+    /// around `coordination`'s own `probe_hold_init_lock`, needed because
+    /// the `lock` module is private to `coordination` and can't be reached
+    /// from `lib.rs` directly.
+    pub fn probe_hold_init_lock(path: &std::path::Path, while_held: impl FnOnce()) {
+        crate::coordination::probe_hold_init_lock(path, while_held)
+    }
+
+    /// Probe hook for Skuld's own test suite (`tests/lock_contention_regression.rs`,
+    /// via the `lock_try_probe` support binary): attempt a non-blocking
+    /// `try_lock` on `path`'s coordination DB init lock file through a fresh
+    /// handle, returning the raw result for the caller to report. See
+    /// [`probe_hold_init_lock`].
+    pub fn probe_try_init_lock(path: &std::path::Path) -> Result<(), std::fs::TryLockError> {
+        crate::coordination::probe_try_init_lock(path)
     }
 
     /// Probe hook for Skuld's own test suite: register in the coordination
-    /// DB at `path`, corrupt it so a later `connect()` fails, then panic —
-    /// while the registration guard is still alive, so unwinding drops it.
-    /// `TestRegistration::drop` calls `connect()` too, so this reproduces a
-    /// panic occurring *during* an active unwind (inside a `Drop` the unwind
+    /// DB at `path`, corrupt it so a later connection attempt fails, then
+    /// panic — while the registration guard is still alive, so unwinding
+    /// drops it. `TestRegistration::drop`'s own cleanup opens a connection
+    /// too, so this reproduces a panic occurring *during* an active unwind
+    /// (inside a `Drop` the unwind
     /// itself triggers). Without a `catch_unwind` guard in `Drop`, an
     /// uncaught panic there is a panic during a panic, which Rust turns into
     /// `abort()` (`SIGABRT`) — killing the whole process, not just this one
@@ -266,7 +255,7 @@ pub mod __private {
         std::fs::create_dir(path).unwrap_or_else(|e| panic!("probe: could not create a directory at {path:?}: {e}"));
 
         panic!(
-            "probe: artificial panic to trigger unwind; TestRegistration::drop's own connect() \
+            "probe: artificial panic to trigger unwind; TestRegistration::drop's own cleanup \
              must not be allowed to abort the process"
         );
     }

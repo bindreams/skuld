@@ -72,6 +72,12 @@ fn should_panic_not_satisfied_by_teardown_panic() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("PanicsOnDrop::drop panicked"),
+        "the failure must be the teardown panic itself, not some other, unrelated failure; \
+         stderr:\n{stderr}"
+    );
 }
 
 #[test]
@@ -85,5 +91,11 @@ fn should_panic_with_message_not_satisfied_by_teardown_panic() {
          happens to match the expected substring; stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("PanicsOnDrop::drop panicked"),
+        "the failure must be the teardown panic itself, not some other, unrelated failure; \
+         stderr:\n{stderr}"
     );
 }
