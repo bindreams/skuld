@@ -21,7 +21,7 @@ members=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | sel
 if [ -z "$members" ]; then
 	msg="no publishable workspace members found. Expected at least one."
 	if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-		echo "::error::${msg}"
+		echo "::error::${msg}" >&2
 	else
 		echo "${0##*/}: ${msg}" >&2
 	fi

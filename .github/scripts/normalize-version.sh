@@ -31,7 +31,7 @@ v="$1"
 if ! [[ "$v" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
 	msg="invalid version '${v}'. Expected three dot-separated numbers with no leading zeros, no leading 'v', and no pre-release or build suffix (e.g. 1.2.3)."
 	if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-		echo "::error::${msg}"
+		echo "::error::${msg}" >&2
 	else
 		echo "${0##*/}: ${msg}" >&2
 	fi
