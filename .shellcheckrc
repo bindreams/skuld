@@ -1,16 +1,6 @@
-# Two checks that shellcheck leaves optional. SC2312 fired on this repo's own
-# draft-release workflow; SC2249 recurred across review rounds on the publish
-# workflow. Neither is on by default:
-#
-#   SC2249  a `case` with no default arm — an unmatched value falls through
-#           silently, which in a publish guard means a member classified as
-#           neither published nor absent.
-#   SC2312  a return value masked by a command substitution or process
-#           substitution — `set -e` does not see through either, so a script
-#           that refuses is read by its caller as one that succeeded.
-#
-# actionlint runs shellcheck with `--norc`, so this file does not apply to
-# workflow `run:` blocks. The actionlint hook in prek.toml carries the same
-# options as its own `env` instead; keep the two lists in step. This file
-# governs standalone shell scripts, in CI and locally alike.
+# Enables shellcheck's optional SC2249 (no-default-case) and SC2312 (masked
+# return) checks — see prek.toml for why these two.
+# actionlint runs shellcheck with --norc, so this file only covers standalone
+# scripts; the actionlint hook's env in prek.toml carries the same options for
+# workflow run: blocks — keep them in step.
 enable=add-default-case,check-extra-masked-returns
