@@ -198,10 +198,12 @@ jobs:
       # Recovery in CONTRIBUTING.md).
       #
       # Uses `crate-state.sh` (crates.io JSON API, not the sparse index — see
-      # its header) so a re-dispatch seconds after a cancelled run still
-      # reads correctly. Every branch fails closed: a wrong "absent" would
-      # re-upload a live member, a wrong "published" would skip one that
-      # never went out.
+      # its header), which sidesteps the index's 600s CDN cache. That is not
+      # a read-after-write guarantee from the API itself, which crates.io
+      # does not document — see Recovery in CONTRIBUTING.md for what to do
+      # if a read looks stale right after an upload. Every branch here still
+      # fails closed: a wrong "absent" would re-upload a live member, a wrong
+      # "published" would skip one that never went out.
       - name: Classify crates.io state for every publishable member
         id: crate_state
         timeout-minutes: 10
@@ -224,6 +226,16 @@ jobs:
             state=$(.github/scripts/crate-state.sh "$c" "$VERSION")
             kind=${state%% *}
             case "$kind" in
+              never-published)
+                # Stage 1's verify job already refuses to create a draft for
+                # any member in this state, so reaching stage 2 with one
+                # should be unreachable — surface it as its own case rather
+                # than falling into "Unrecognized state" below, since the fix
+                # (there is a trusted-publisher config missing, not a build
+                # or registry problem) is different from either of those.
+                echo "::error::$c has never been published on crates.io. Stage 2 authenticates by trusted publishing, and a crate that does not exist cannot have a publisher configured. Follow \"Adding a publishable member\" in CONTRIBUTING.md, then re-run stage 1 before stage 2."
+                exit 1
+                ;;
               published)
                 # A "published" verdict only proves *some* build occupies this
                 # version slot, not that it is the one this run just packaged.
