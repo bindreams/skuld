@@ -101,7 +101,7 @@ jobs:
             fi
           done
 
-      - uses: j178/prek-action@v2
+      - uses: j178/prek-action@v3.0.0
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
