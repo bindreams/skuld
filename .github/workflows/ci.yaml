@@ -30,23 +30,76 @@ jobs:
 
       # Single source of truth for lint is prek.toml — the same checks run
       # locally as pre-commit hooks, shellcheck's optional checks included:
-      # the actionlint hook carries them as its own `env`, so there is no
-      # CI-only lint setting to keep in step. prek-action runs
+      # the actionlint hook carries them as its own `env`. prek-action runs
       # `prek run --all-files` with `--show-diff-on-failure --color=always`,
       # so fmt / mixed-line-ending failures surface as a diff in CI logs.
-      #
-      # actionlint shells out to shellcheck for `run:` blocks and *silently*
-      # disables that rule when the binary is missing — it says so only under
-      # -verbose, which means the capability can vanish while this job stays
-      # green. Install it explicitly rather than inheriting whatever the runner
-      # image ships, then assert it is really there.
+      # prek.toml's own `shellcheck-on-path` hook (not a step here) asserts
+      # shellcheck is reachable, so that check runs identically in CI and
+      # locally instead of living only in this file.
+      - name: Derive pinned shellcheck version from prek.toml
+        # actionlint's shellcheck (see prek.toml) is not the shellcheck-py
+        # hook's own binary — it shells out to whatever `shellcheck` is on
+        # PATH, so CI needs its own install. Parse the version straight out
+        # of prek.toml's shellcheck-py `rev` instead of pinning a second copy
+        # by hand, so there's one number to bump, not two to keep in step.
+        id: shellcheck-pin
+        run: |
+          set -euo pipefail
+          version=$(python3 - <<'PY'
+          import tomllib
+
+          with open("prek.toml", "rb") as f:
+              data = tomllib.load(f)
+          rev = next(
+              r["rev"]
+              for r in data["repos"]
+              if r.get("repo") == "https://github.com/shellcheck-py/shellcheck-py"
+          )
+          # shellcheck-py tags as v<shellcheck-version>.<pypi-patch>, e.g.
+          # v0.11.0.1 wraps shellcheck 0.11.0 -- drop the trailing segment.
+          print(".".join(rev.lstrip("v").split(".")[:-1]))
+          PY
+          )
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # actionlint's shellcheck integration silently degrades if the binary is
+      # missing (see prek.toml) — install it explicitly and verify.
       - name: Install shellcheck
         uses: taiki-e/install-action@v2
         with:
-          tool: shellcheck@0.11.0
+          tool: shellcheck@${{ steps.shellcheck-pin.outputs.version }}
 
-      - name: Assert shellcheck is available to actionlint
-        run: shellcheck --version
+      # .shellcheckrc's `enable=` line (and its copy as SHELLCHECK_OPTS in
+      # prek.toml's actionlint hook) is the only thing turning on SC2249 and
+      # SC2312. shellcheck silently no-ops on an unrecognized enable= name, so
+      # a typo, or an upstream rename/removal of either check, would drop
+      # coverage with this job staying green. Prove both still fire against a
+      # fixture built to trip each of them.
+      - name: Assert shellcheck's optional checks still fire
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture=$(mktemp)
+          trap 'rm -f "$fixture"' EXIT
+          cat <<'SH' > "$fixture"
+          #!/bin/sh
+          case "$1" in
+            x) echo x ;;
+          esac
+          if [ "$(false)" ]; then echo hi; fi
+          SH
+          out=$(shellcheck --enable=add-default-case,check-extra-masked-returns "$fixture" 2>&1) && rc=0 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::shellcheck did not flag a fixture built to trip SC2249 and SC2312 -- the optional checks may have stopped being recognized"
+            exit 1
+          fi
+          for code in SC2249 SC2312; do
+            if ! grep -q "$code" <<<"$out"; then
+              echo "::error::Expected $code in shellcheck's output but it was missing:"
+              echo "$out"
+              exit 1
+            fi
+          done
 
       - uses: j178/prek-action@v2
 
