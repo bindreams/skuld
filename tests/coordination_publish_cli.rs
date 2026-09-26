@@ -162,23 +162,29 @@ fn concurrent_publishers_all_converge_on_one_0666_file() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join(".skuld.db");
 
-    // Every publisher starts against the same empty directory: whichever one
-    // wins the race to publish `.skuld.db` itself, every one of them must
-    // still end up connected without panicking, and the file each one sees
-    // (the winner's own, or the winner's once its own attempt lost) must be
+    // Every publisher starts against the same empty directory, each
+    // contending `path`'s init lock (`probe_coordination_connect` goes
+    // through `open_db`, which holds it for the whole open-or-publish
+    // sequence): whichever child takes the lock first finds the DB absent
+    // and publishes it; every other child, once it takes the lock in its
+    // turn, finds the file already published and just opens it. Every
+    // child must still end up connected without panicking, and the file
+    // each one sees — the one lock-serialized publisher's own — must be
     // `0666`.
     //
     // Spawning 8 children in quick succession does not by itself guarantee
-    // they contend: the real race window (open+fchmod+rename, all inside
-    // `probe_coordination_connect`) is narrow next to exec/dynamic-linking
-    // jitter, so without synchronization genuine contention is a matter of
-    // scheduling luck, not something this test reliably exercises. Each
-    // child instead blocks on `SKULD_PUBLISH_PROBE_BARRIER` (see
-    // `publish_probe`'s doc) until it has signaled readiness on stdout; only
-    // once every child has done so does the driver release them via stdin,
-    // holding every publisher at the same starting line first. Even so,
-    // this test's own assertions never depend on the EEXIST path actually
-    // being taken on a given run — the deterministic case for that is
+    // they contend for the lock: the window between the first child taking
+    // the lock and later ones reaching their own `open_db` call is narrow
+    // next to exec/dynamic-linking jitter, so without synchronization
+    // genuine contention is a matter of scheduling luck, not something this
+    // test reliably exercises. Each child instead blocks on
+    // `SKULD_PUBLISH_PROBE_BARRIER` (see `publish_probe`'s doc) until it has
+    // signaled readiness on stdout; only once every child has done so does
+    // the driver release them via stdin, holding every publisher at the
+    // same starting line first. This test's own assertions don't depend on
+    // which child wins the lock, only that every child converges on one
+    // `0666` file — the deterministic EEXIST-loses-a-publish-race case
+    // (which the lock now rules out here entirely) is covered separately by
     // `a_lost_publish_race_uses_the_winners_file` in
     // `src/coordination/publish_tests.rs`.
     let mut children: Vec<std::process::Child> = (0..PUBLISHERS)

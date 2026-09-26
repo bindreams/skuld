@@ -167,10 +167,42 @@ pub(super) fn open_lock_target(db_path: &Path) -> File {
 /// module doc for why Unix goes through [`rustix::fs::flock`] here instead
 /// of `std::fs::File::lock` — std's version isn't implemented on every Unix
 /// target this crate supports.
+///
+/// Retries on `EINTR` alone, uncapped: a blocking `flock` is interruptible
+/// by any signal delivered to this thread, including ones this crate has no
+/// control over — a test process installs its own handlers for all sorts of
+/// reasons — and a handler registered without `SA_RESTART` makes the kernel
+/// hand back `EINTR` instead of resuming the wait. That is not a real
+/// failure (the lock is neither held nor denied), so this loops back into
+/// the same blocking call rather than surfacing it as one; std's own
+/// `File::lock` makes the identical choice for the targets it supports.
+/// Nothing else this function can receive from `flock` is retryable.
 #[cfg(unix)]
-fn lock_exclusive(target: &File) -> std::io::Result<()> {
-    rustix::fs::flock(target, rustix::fs::FlockOperation::LockExclusive).map_err(Into::into)
+pub(super) fn lock_exclusive(target: &File) -> std::io::Result<()> {
+    loop {
+        match rustix::fs::flock(target, rustix::fs::FlockOperation::LockExclusive) {
+            Ok(()) => return Ok(()),
+            Err(rustix::io::Errno::INTR) => {
+                // Test-only: lets `lock_tests.rs` observe that a real EINTR
+                // was retried here, rather than just asserting the overall
+                // call eventually succeeded — which could pass even if the
+                // signal never actually landed inside this syscall. No
+                // effect on the retry itself; compiled out entirely in
+                // non-test builds.
+                #[cfg(test)]
+                EINTR_RETRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                continue;
+            }
+            Err(errno) => return Err(errno.into()),
+        }
+    }
 }
+
+/// Count of `EINTR` retries `lock_exclusive` has performed, process-wide.
+/// Test-only instrumentation — see the `#[cfg(test)]` increment site inside
+/// `lock_exclusive` above.
+#[cfg(all(unix, test))]
+pub(super) static EINTR_RETRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Block until `target`'s exclusive advisory lock is acquired, via
 /// `std::fs::File::lock` (`LockFileEx` under the hood) — Windows has no gap

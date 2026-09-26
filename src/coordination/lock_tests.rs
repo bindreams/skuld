@@ -7,6 +7,8 @@ use std::sync::Barrier;
 
 #[cfg(windows)]
 use super::lock::lock_path;
+#[cfg(unix)]
+use super::lock::{lock_exclusive, EINTR_RETRIES};
 use super::lock::{open_lock_target, try_lock_exclusive, with_init_lock};
 
 #[cfg(windows)]
@@ -156,5 +158,97 @@ fn with_init_lock_panics_immediately_when_the_profile_directory_does_not_exist_i
     assert!(
         result.is_err(),
         "with_init_lock must panic when db_path's parent directory doesn't exist, not hang"
+    );
+}
+
+/// `lock_exclusive`'s blocking `flock` must retry past `EINTR`, not surface
+/// it as a failure: a process with a handler installed without
+/// `SA_RESTART` for some signal unrelated to this crate — a test harness's
+/// own signal handling, for example — can have this call interrupted by it,
+/// and this crate has no say over that handler's flags.
+///
+/// Proven with a real interrupt, not a mocked error. `flock` locks are
+/// scoped to the open file description, not the process or thread, so a
+/// second, independently-opened handle on the same lock target genuinely
+/// blocks behind the first. A non-`SA_RESTART` `SIGUSR1` handler is
+/// installed, then the holder thread bombards the blocked thread with that
+/// signal — via its `pthread_t`, reported back over a channel rather than
+/// assumed, and with no sleep — until `EINTR_RETRIES` (incremented only on
+/// the real `EINTR` arm inside `lock_exclusive`, never anywhere in this
+/// test) proves a signal actually landed inside the blocking syscall, not
+/// just before or after it. Only then does the holder release the lock;
+/// the blocked call must still go on to succeed.
+#[cfg(unix)]
+#[test]
+fn lock_exclusive_retries_past_eintr_from_a_non_restarting_handler() {
+    // Other tests in this same process may also drive lock_exclusive's
+    // EINTR arm incidentally (unlikely, but the counter is process-wide,
+    // shared with every other #[test] in this binary) — pin the baseline
+    // actually observed instead of assuming zero.
+    let baseline = EINTR_RETRIES.load(SeqCst);
+
+    extern "C" fn noop_handler(_signum: libc::c_int) {}
+
+    // Safety: installs a process-wide handler for SIGUSR1 with no
+    // SA_RESTART, so a blocking syscall this handler interrupts reports
+    // EINTR instead of resuming — the exact condition under test. No other
+    // test in this binary sends or handles SIGUSR1.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = noop_handler as *const () as libc::sighandler_t;
+        assert_eq!(libc::sigemptyset(&mut action.sa_mask), 0, "sigemptyset failed");
+        action.sa_flags = 0; // deliberately omits SA_RESTART
+        assert_eq!(
+            libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+            0,
+            "sigaction(SIGUSR1) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join(".skuld.db");
+
+    let holder = open_lock_target(&db_path);
+    lock_exclusive(&holder).expect("uncontended lock must succeed immediately");
+    let waiter = open_lock_target(&db_path);
+
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let waiter_thread = std::thread::spawn(move || {
+        // Report this thread's own id before doing anything blocking, so
+        // the main thread never has to guess whether the id it has is
+        // still valid.
+        tid_tx
+            .send(unsafe { libc::pthread_self() })
+            .expect("main thread must still be waiting to receive the pthread id");
+        lock_exclusive(&waiter)
+    });
+    let waiter_pthread = tid_rx.recv().expect("waiter thread must report its pthread id");
+
+    // Bombard the blocked thread with the non-restarting signal until
+    // there's direct evidence — lock_exclusive's own retry counter moving —
+    // that a real EINTR was retried, not just that the call eventually
+    // returned. Uncapped: it only stops once that evidence exists. The
+    // holder keeps the lock the whole time, so the waiter thread has
+    // nowhere to go but blocked inside flock (or the brief gap between a
+    // delivered signal and re-entering it) for as long as this loop runs.
+    while EINTR_RETRIES.load(SeqCst) == baseline {
+        // Safety: waiter_pthread names a thread that is still alive and
+        // unjoined for the entire loop — its JoinHandle isn't joined until
+        // after the loop exits below.
+        let rc = unsafe { libc::pthread_kill(waiter_pthread, libc::SIGUSR1) };
+        assert_eq!(rc, 0, "pthread_kill(SIGUSR1) failed with errno {rc}");
+    }
+
+    drop(holder);
+
+    waiter_thread
+        .join()
+        .expect("waiter thread must not panic")
+        .expect("lock_exclusive must still succeed once EINTR is retried past and the lock is free");
+
+    assert!(
+        EINTR_RETRIES.load(SeqCst) > baseline,
+        "test precondition: at least one EINTR must have been retried inside lock_exclusive"
     );
 }

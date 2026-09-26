@@ -50,20 +50,19 @@ fn main() {
     if std::env::var_os("SKULD_PUBLISH_PROBE_BARRIER").is_some() {
         // Signal readiness, then block for the driver's release: a real
         // blocking-I/O handshake, not a sleep, so the driver can hold every
-        // publisher at the same starting line, maximising the chance that
-        // `probe_coordination_connect`'s publish race is genuinely
-        // contended instead of relying on process-launch scheduling to
-        // overlap it. Releasing all children together does not *guarantee*
-        // the EEXIST path is hit on any given run — the driver still
-        // releases them one write() at a time, and `connect_with` tries the
-        // open before ever publishing, so a child whose open lands after the
-        // winner's rename has already landed just opens the now-published
-        // file directly and never calls `ensure_published` at all; only a
-        // child whose open lands during the initial absence window attempts
-        // its own publish, and if it loses the race that rename fails
-        // `EEXIST` against the winner's file and no-ops before it loops back
-        // and reopens successfully — so this test's assertions don't depend
-        // on which timing is hit; the deterministic EEXIST case is
+        // child at the same starting line, maximising the chance every
+        // child's `probe_coordination_connect` call is genuinely contending
+        // to acquire `path`'s init lock, rather than relying on
+        // process-launch scheduling to overlap them. `probe_coordination_connect`
+        // goes through `open_db`, which holds that lock for its whole
+        // open-or-publish-and-initialize sequence, so the children never
+        // race a rename against each other: only the first child to take
+        // the lock finds the DB absent and publishes it; every other child,
+        // once it acquires the lock in its turn, finds the file already
+        // published and just opens it directly — `ensure_published` never
+        // runs a second time here, so there's no `EEXIST` to hit in this
+        // probe at all. The deterministic EEXIST-loses-a-publish-race case
+        // is covered separately, without the lock in the way, by
         // `a_lost_publish_race_uses_the_winners_file` in
         // `src/coordination/publish_tests.rs`.
         let mut out = std::io::stdout();
