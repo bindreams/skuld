@@ -5,7 +5,7 @@
 //! - [`TestRunner::add`] (runtime-generated tests)
 
 use std::io::Write;
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::panic::resume_unwind;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -108,8 +108,27 @@ fn dump_nextest_metadata_if_requested(tests: Vec<NextestTestMetadata>) {
 /// around the body. When `capture` is true, wraps the body in an
 /// [`FdCapture`] that redirects stdout/stderr to an in-process pipe and
 /// dumps the captured bytes to stderr on failure.
-fn run_with_observability(name: &str, capture: bool, serial_filter: &str, labels: &[Label], body: impl FnOnce()) {
+///
+/// Runs on a fresh, trial-named thread rather than libtest-mimic's
+/// dispatching thread, so `thread_local!` state left dirty by one trial can
+/// never leak into the next. `JoinHandle::join()` catches a body panic
+/// automatically; the payload is re-thrown via `resume_unwind` below so
+/// libtest-mimic still reports it as a normal trial failure.
+fn run_with_observability(
+    name: &str,
+    capture: bool,
+    serial_filter: &str,
+    labels: &[Label],
+    body: impl FnOnce() + Send + 'static,
+) {
     use crate::coordination;
+
+    // Check the name before anything else, including the "starting" line and
+    // `FdCapture::begin`: a panic here must never land inside the capture
+    // window, where `FdCapture`'s `Drop` (not `end`) would run and silently
+    // discard it instead of dumping it (see the comment on `FdCapture`'s
+    // `Drop` impl in `capture.rs`).
+    ensure_valid_thread_name(name);
 
     let db_path = coordination::db_path();
 
@@ -139,25 +158,47 @@ fn run_with_observability(name: &str, capture: bool, serial_filter: &str, labels
     // this thread to stdout/stderr go into the pipe. Do NOT eprintln!
     // debug output in this window — it would land in the capture buffer.
 
-    let result = catch_unwind(AssertUnwindSafe(|| {
+    // Run on a fresh, trial-named thread rather than libtest-mimic's
+    // dispatching thread. `thread::Builder::spawn` requires 'static captures,
+    // so everything borrowed from the caller is cloned into the closure. The
+    // name was already checked above, before the capture window opened;
+    // `spawn` would otherwise panic on an interior NUL byte with a generic
+    // std message that doesn't say which trial's name was the problem.
+    let thread_name = name.to_string();
+    let coordinate_name = thread_name.clone();
+    let serial_filter_owned = serial_filter.to_string();
+    let labels_owned = labels.to_vec();
+    let handle = match std::thread::Builder::new().name(thread_name).spawn(move || {
         // Coordinate: register in DB, block if serial constraints aren't met.
         // The registration guard unregisters on drop (including panic unwind).
-        let _reg = coordination::coordinate(&db_path, name, labels, serial_filter);
+        let _reg = coordination::coordinate(&db_path, &coordinate_name, &labels_owned, &serial_filter_owned);
         body();
-    }));
+    }) {
+        Ok(h) => h,
+        Err(e) => {
+            // Restore stdio first (see the NOTE above) so this panic message
+            // reaches the real terminal — see `FdCapture::drop`'s comment in
+            // `capture.rs`. `ensure_valid_thread_name` above sidesteps the
+            // same concern by running before the capture window opens; a
+            // spawn failure can't be checked that early.
+            if let Some(c) = capture_guard.take() {
+                let captured_bytes = captured_bytes_or_warn(name, c.end(), |msg| eprintln!("{msg}"));
+                dump_captured_bytes(name, &captured_bytes);
+            }
+            panic!("skuld: failed to spawn trial thread for {name:?}: {e}");
+        }
+    };
+    // JoinHandle::join() already catches a body panic and returns it as
+    // Err — no manual catch_unwind needed. The payload propagates below via
+    // resume_unwind so libtest-mimic still reports it as a normal failure.
+    let result = handle.join();
 
     let duration = started.elapsed();
 
     // Restore stdio before any further diagnostic output so we print to
     // the real terminal, not the capture buffer.
     let captured_bytes: Vec<u8> = match capture_guard.take() {
-        Some(c) => match c.end() {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                eprintln!("[skuld] {name}: warning: capture teardown failed: {e}");
-                Vec::new()
-            }
-        },
+        Some(c) => captured_bytes_or_warn(name, c.end(), |msg| eprintln!("{msg}")),
         None => Vec::new(),
     };
 
@@ -166,17 +207,71 @@ fn run_with_observability(name: &str, capture: bool, serial_filter: &str, labels
     let outcome = if result.is_ok() { "pass" } else { "fail" };
     eprintln!("[skuld] {name}: {outcome} ({} ms)", duration.as_millis());
 
-    if result.is_err() && !captured_bytes.is_empty() {
-        eprintln!("[skuld] {name}: ---- captured ----");
-        let _ = std::io::stderr().write_all(&captured_bytes);
-        if !captured_bytes.ends_with(b"\n") {
-            let _ = std::io::stderr().write_all(b"\n");
-        }
-        eprintln!("[skuld] {name}: ---- end capture ----");
+    if result.is_err() {
+        dump_captured_bytes(name, &captured_bytes);
     }
 
     if let Err(payload) = result {
         resume_unwind(payload);
+    }
+}
+
+/// Print the `---- captured ----` block for `captured_bytes` to stderr, or
+/// do nothing if there's nothing captured. Shared by the normal post-join
+/// path and the spawn-failure path (`Builder::spawn` erroring before
+/// there's a trial thread to join) — both must show what was captured
+/// before reporting the failure, not just a trial body that itself failed.
+pub(crate) fn dump_captured_bytes(name: &str, captured_bytes: &[u8]) {
+    dump_captured_bytes_to(name, captured_bytes, |bytes| {
+        let _ = std::io::stderr().write_all(bytes);
+    });
+}
+
+/// [`dump_captured_bytes`]'s implementation, parameterized over the writer
+/// so the exact block it produces can be pinned in a unit test without
+/// capturing real stderr.
+pub(crate) fn dump_captured_bytes_to(name: &str, captured_bytes: &[u8], mut write: impl FnMut(&[u8])) {
+    if captured_bytes.is_empty() {
+        return;
+    }
+    write(format!("[skuld] {name}: ---- captured ----\n").as_bytes());
+    write(captured_bytes);
+    if !captured_bytes.ends_with(b"\n") {
+        write(b"\n");
+    }
+    write(format!("[skuld] {name}: ---- end capture ----\n").as_bytes());
+}
+
+/// Turn `FdCapture::end`'s result into the bytes to report on, calling
+/// `warn` instead of silently discarding a teardown failure. Shared by both
+/// callers of `end()`: the normal post-join path, and the spawn-failure
+/// path, which must warn exactly like the normal path does rather than
+/// swallow the error with `let _ = c.end();`.
+///
+/// `warn` is injected (rather than this calling `eprintln!` directly) so
+/// the warn-on-`Err` behavior can be pinned in a unit test without needing
+/// a real OS-level capture-teardown failure.
+pub(crate) fn captured_bytes_or_warn(
+    name: &str,
+    result: std::io::Result<Vec<u8>>,
+    mut warn: impl FnMut(String),
+) -> Vec<u8> {
+    match result {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn(format!("[skuld] {name}: warning: capture teardown failed: {e}"));
+            Vec::new()
+        }
+    }
+}
+
+/// Reject a trial name `thread::Builder::spawn` can't use as a thread name.
+/// The only such name is one with an interior NUL byte (`CString::new`
+/// rejects it); std's own panic for that case doesn't say which trial it
+/// was, so check first and panic with the trial name attached.
+pub(crate) fn ensure_valid_thread_name(name: &str) {
+    if name.contains('\0') {
+        panic!("skuld: trial name {name:?} contains a NUL byte and can't be used as a thread name");
     }
 }
 
@@ -187,14 +282,14 @@ fn run_with_observability(name: &str, capture: bool, serial_filter: &str, labels
 /// body is always passed in — the ignored flag gates execution, not
 /// construction. Mirrors the dynamic-tests path.
 fn build_inventory_trial(
-    trial_name: &'static str,
+    trial_name: String,
     labels: Vec<Label>,
     effective_serial: String,
     body: fn(),
     capture: bool,
     ignored: bool,
 ) -> Trial {
-    let observed_name = trial_name.to_string();
+    let observed_name = trial_name.clone();
     let trial = Trial::test(trial_name, move || {
         run_with_observability(&observed_name, capture, &effective_serial, &labels, body);
         Ok(())
@@ -206,10 +301,101 @@ fn build_inventory_trial(
     }
 }
 
+// Trial names =========================================================================================
+
+/// Compute a test's final trial name.
+///
+/// `display_name` always wins. Otherwise: bare `name` by default, or —
+/// with `libtest_names` on — `module_path!()` with its first segment (the
+/// crate name) stripped, joined to `name` with `::`. A crate-root test
+/// (module has no `::`) keeps its bare name either way.
+pub(crate) fn effective_trial_name(
+    module: &str,
+    name: &str,
+    display_name: Option<&str>,
+    libtest_names: bool,
+) -> String {
+    if let Some(d) = display_name {
+        return d.to_string();
+    }
+    if !libtest_names {
+        return name.to_string();
+    }
+    match module.split_once("::") {
+        Some((_crate_name, rest)) => format!("{rest}::{name}"),
+        None => name.to_string(),
+    }
+}
+
+/// Gather `(trial_name, origin)` pairs for every inventory-registered and
+/// dynamic test, for the startup duplicate-name check. `origin` is a
+/// human-readable location used only in panic messages.
+pub(crate) fn collect_trial_name_entries(libtest_names: bool, dynamic: &[DynTest]) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    for def in inventory::iter::<TestDef> {
+        let trial_name = effective_trial_name(def.module, def.name, def.display_name, libtest_names);
+        let origin = format!("{}::{}", def.module, def.name);
+        entries.push((trial_name, origin));
+    }
+    for dyn_test in dynamic {
+        let origin = format!("dynamically-added: {}", dyn_test.name);
+        entries.push((dyn_test.name.clone(), origin));
+    }
+    entries
+}
+
+/// Inner validation that returns the error message instead of panicking, so
+/// unit tests can assert on specific failures. Modeled on
+/// [`check_label_registry`](crate::label::check_label_registry).
+///
+/// Buckets all entries by trial name and returns an error for every bucket
+/// with more than one entry, including every origin so a single run
+/// surfaces all duplicates.
+pub(crate) fn check_duplicate_trial_names(entries: &[(String, String)]) -> Result<(), String> {
+    use std::collections::HashMap;
+
+    let mut by_name: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (name, origin) in entries {
+        by_name.entry(name.as_str()).or_default().push(origin.as_str());
+    }
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut sorted_names: Vec<&&str> = by_name.keys().collect();
+    sorted_names.sort();
+    for name in sorted_names {
+        let origins = &by_name[name];
+        if origins.len() > 1 {
+            let locations: Vec<String> = origins.iter().map(|o| format!("  {o}")).collect();
+            errors.push(format!(
+                "trial name {name:?} declared multiple times:\n{}",
+                locations.join("\n")
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("skuld: trial name validation failed:\n{}", errors.join("\n")))
+    }
+}
+
+/// Validate that the final set of trial names (inventory and dynamic,
+/// after `display_name` and `libtest_names()`) has no duplicates. Called at
+/// the start of [`TestRunner::run_tests()`], before `self` is consumed by
+/// [`TestRunner::collect_dynamic_tests`]. Runs whether or not
+/// `libtest_names()` is on.
+pub(crate) fn validate_trial_names(libtest_names: bool, dynamic: &[DynTest]) {
+    let entries = collect_trial_name_entries(libtest_names, dynamic);
+    if let Err(msg) = check_duplicate_trial_names(&entries) {
+        panic!("{msg}");
+    }
+}
+
 // Test runner =====================================================================================
 
 /// A dynamically-added test (registered at runtime, not via proc macro).
-struct DynTest {
+pub(crate) struct DynTest {
     name: String,
     ignored: bool,
     serial: String,
@@ -224,6 +410,8 @@ pub struct TestRunner {
     dynamic: Vec<DynTest>,
     /// Custom args to strip before passing to libtest-mimic/clap.
     strip: Vec<String>,
+    /// Opt-in libtest-style trial names. See [`effective_trial_name`].
+    libtest_names: bool,
 }
 
 impl TestRunner {
@@ -237,6 +425,19 @@ impl TestRunner {
     /// otherwise be rejected by the standard argument parser.
     pub fn strip_args(&mut self, args: &[&str]) -> &mut Self {
         self.strip.extend(args.iter().map(|s| s.to_string()));
+        self
+    }
+
+    /// Opt into libtest-style trial names: `module_path!()` with its first
+    /// segment (the crate name) stripped, joined to the fn name with `::`.
+    /// A crate-root test keeps its bare name. An explicit `display_name`
+    /// (from `#[skuld::test(name = "...")]`) always wins over this.
+    ///
+    /// Regardless of this setting, the final set of trial names (inventory
+    /// and dynamic together) must be free of duplicates — checked at
+    /// startup, in [`TestRunner::run_tests`].
+    pub fn libtest_names(&mut self) -> &mut Self {
+        self.libtest_names = true;
         self
     }
 
@@ -303,6 +504,7 @@ impl TestRunner {
     pub fn run_tests(self) -> libtest_mimic::Conclusion {
         validate_labels();
         validate_serial_filters();
+        validate_trial_names(self.libtest_names, &self.dynamic);
         let label_filter = read_label_filter();
         let mut remaining_args: Vec<String> = std::env::args().collect();
         remaining_args.retain(|a| !self.strip.contains(a));
@@ -377,7 +579,7 @@ impl TestRunner {
                 }
             }
 
-            let trial_name = def.display_name.unwrap_or(def.name);
+            let trial_name = effective_trial_name(def.module, def.name, def.display_name, self.libtest_names);
             let fixture_serial = collect_fixture_serial(def.fixture_names);
             let effective_serial = merge_serial_filters(def.serial, &fixture_serial);
 
@@ -413,14 +615,14 @@ impl TestRunner {
                 // invariant instead of leaking a raw, possibly-mixed-case declaration
                 // (e.g. `serial = FAST` from a user-declared label identifier).
                 metadata.push(NextestTestMetadata {
-                    name: trial_name.to_string(),
+                    name: trial_name.clone(),
                     labels: resolved.iter().map(|l| l.name().to_string()).collect(),
                     serial_filter: crate::coordination::to_storage(&effective_serial),
                 });
             }
 
             trials.push(build_inventory_trial(
-                trial_name,
+                trial_name.clone(),
                 resolved.clone(),
                 effective_serial,
                 def.body,
@@ -429,7 +631,7 @@ impl TestRunner {
             ));
 
             if let Some(reason) = unavailable_reason {
-                unavailable.push((trial_name.to_string(), reason));
+                unavailable.push((trial_name, reason));
             }
         }
     }

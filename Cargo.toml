@@ -46,6 +46,12 @@ tokio = { version = "1", features = ["rt"], optional = true }
 [target.'cfg(unix)'.dependencies]
 # dup/dup2/close for swapping stdout/stderr fds during per-test capture.
 libc = "0.2"
+# src/coordination/lock.rs's flock calls: std::fs::File::lock()/try_lock()
+# aren't implemented on every Unix target std itself lists as flock-capable
+# (Android is the concrete gap — see that module's doc), so lock.rs calls
+# rustix::fs::flock directly on every Unix instead. Already pulled in
+# transitively via tempfile; this only promotes it to a direct dependency.
+rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 # Two parallel fd namespaces exist on Windows:
@@ -54,7 +60,14 @@ libc = "0.2"
 #     io::stdout()/io::stderr(), which bypass the CRT fd table entirely.
 # We must swap both during capture or one stream silently escapes.
 libc = "0.2"
-windows = { version = "0.62", features = ["Win32_System_Console", "Win32_System_Threading"] }
+windows = { version = "0.62", features = [
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    # FILE_SHARE_READ/FILE_SHARE_WRITE, for src/coordination/lock.rs's
+    # Windows init lock file: opened without FILE_SHARE_DELETE so it can
+    # never be deleted or renamed out from under a holder.
+    "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 skuld = { path = ".", features = ["tokio"] }
@@ -143,3 +156,101 @@ doc = false
 name = "coordination_debug_fixture"
 path = "tests/support_bins/coordination_debug_fixture/main.rs"
 test = false
+doc = false
+
+# Subject fixture for thread_per_trial_cli.rs. Two dynamic trials that
+# record their thread's id and name, plus the main thread's id, to marker
+# files.
+[[bin]]
+name = "thread_per_trial"
+path = "tests/support_bins/thread_per_trial/main.rs"
+test = false
+doc = false
+
+# Subject fixture for fixture_setup_should_panic_cli.rs. A should_panic
+# test that depends on a fixture whose setup always fails.
+[[bin]]
+name = "broken_fixture_should_panic"
+path = "tests/support_bins/broken_fixture_should_panic/main.rs"
+test = false
+doc = false
+
+# Subject fixtures for libtest_names_cli.rs: opt-in libtest-style trial
+# names, and a hard error on duplicate final trial names.
+[[bin]]
+name = "libtest_names"
+path = "tests/support_bins/libtest_names/main.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "duplicate_names"
+path = "tests/support_bins/duplicate_names/main.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "duplicate_display_names"
+path = "tests/support_bins/duplicate_display_names/main.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "display_name_collides_with_libtest_path"
+path = "tests/support_bins/display_name_collides_with_libtest_path/main.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "dynamic_name_collides_with_inventory"
+path = "tests/support_bins/dynamic_name_collides_with_inventory/main.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "duplicate_names_ignored"
+path = "tests/support_bins/duplicate_names_ignored/main.rs"
+test = false
+doc = false
+
+# See tests/support_bins/publish_probe/main.rs's module doc.
+[[bin]]
+name = "publish_probe"
+path = "tests/support_bins/publish_probe/main.rs"
+test = false
+doc = false
+
+# See tests/support_bins/drop_panic_during_unwind_probe/main.rs's module doc.
+[[bin]]
+name = "drop_panic_during_unwind_probe"
+path = "tests/support_bins/drop_panic_during_unwind_probe/main.rs"
+test = false
+doc = false
+
+# See tests/support_bins/panicking_at_drop_probe/main.rs's module doc.
+[[bin]]
+name = "panicking_at_drop_probe"
+path = "tests/support_bins/panicking_at_drop_probe/main.rs"
+test = false
+doc = false
+
+# See tests/support_bins/lock_hold_probe/main.rs's module doc.
+[[bin]]
+name = "lock_hold_probe"
+path = "tests/support_bins/lock_hold_probe/main.rs"
+test = false
+doc = false
+
+# See tests/support_bins/lock_try_probe/main.rs's module doc.
+[[bin]]
+name = "lock_try_probe"
+path = "tests/support_bins/lock_try_probe/main.rs"
+test = false
+doc = false
+
+# See tests/support_bins/lock_emfile_probe/main.rs's module doc.
+[[bin]]
+name = "lock_emfile_probe"
+path = "tests/support_bins/lock_emfile_probe/main.rs"
+test = false
+doc = false

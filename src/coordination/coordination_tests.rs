@@ -326,7 +326,27 @@ fn is_retryable_matches_busy_and_locked_only() {
     assert!(!is_retryable(&Error::QueryReturnedNoRows));
 }
 
-// Canonicalization at the storage boundary (azhukova/35) =====
+// is_pid_alive PID range guard =====
+//
+// See `is_pid_alive`'s own doc comment in `coordination.rs` for why a PID
+// of `0` or `>= 2^31` must be rejected before the `kill(pid as i32, 0)` cast.
+
+#[cfg(unix)]
+#[test]
+fn is_pid_alive_rejects_pid_zero_instead_of_checking_its_own_process_group() {
+    // A naive `kill(0, 0)` always succeeds (checks the caller's own process
+    // group), which would make a bogus PID-0 entry look permanently alive.
+    assert!(!crate::coordination::is_pid_alive(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn is_pid_alive_rejects_pids_that_would_wrap_negative_as_an_i32() {
+    assert!(!crate::coordination::is_pid_alive(1u32 << 31));
+    assert!(!crate::coordination::is_pid_alive(u32::MAX));
+}
+
+// Canonicalization at the storage boundary =====
 //
 // Verify that `coordinate()` collapses redundant and tautological serial
 // filters before INSERTing them, so the DB invariant holds: every stored
@@ -438,4 +458,338 @@ fn migration_leaves_unparseable_live_rows_alone() {
         })
         .expect("live unparseable row should be preserved");
     assert_eq!(kept, "this is not a filter!!");
+}
+
+// Drop-panic-during-unwind downgrade path =====
+
+/// Regression guard for the `&payload` vs `payload.as_ref()` footgun
+/// documented on `downgraded_warning_message` in `coordination.rs`. These
+/// cases exercise `panic_payload_message`'s extraction logic in isolation —
+/// the `.as_ref()` deref already happened before the payload reaches it.
+/// `downgraded_warning_message_carries_the_real_panic_message_through_the_box`
+/// below, and `drop_panic_during_unwind_cli.rs`'s subprocess test, guard the
+/// `&payload` vs `.as_ref()` choice itself.
+#[test]
+fn panic_payload_message_extracts_a_runtime_formatted_string_payload() {
+    let payload = std::panic::catch_unwind(|| {
+        let uid = 502;
+        panic!("dynamic message uid {uid}");
+    })
+    .unwrap_err();
+    assert_eq!(
+        crate::coordination::panic_payload_message(payload.as_ref()),
+        "dynamic message uid 502"
+    );
+}
+
+#[test]
+fn panic_payload_message_extracts_a_static_str_payload() {
+    let payload = std::panic::catch_unwind(|| {
+        panic!("static message");
+    })
+    .unwrap_err();
+    assert_eq!(
+        crate::coordination::panic_payload_message(payload.as_ref()),
+        "static message"
+    );
+}
+
+#[test]
+fn panic_payload_message_falls_back_on_a_non_string_payload() {
+    let payload = std::panic::catch_unwind(|| {
+        std::panic::panic_any(42_i32);
+    })
+    .unwrap_err();
+    assert_eq!(
+        crate::coordination::panic_payload_message(payload.as_ref()),
+        "<non-string panic payload>"
+    );
+}
+
+/// Exercises the exact call convention `Drop::drop` uses —
+/// `downgraded_warning_message(&payload)` — which is what actually
+/// regression-guards the footgun documented on `downgraded_warning_message`
+/// in `coordination.rs`: passing the un-deref'd `&payload` here would wrongly
+/// fall back to `"<non-string panic payload>"` for a real, runtime-formatted
+/// string payload.
+#[test]
+fn downgraded_warning_message_carries_the_real_panic_message_through_the_box() {
+    let payload = std::panic::catch_unwind(|| {
+        let uid = 502;
+        panic!("dynamic message uid {uid}");
+    })
+    .unwrap_err();
+
+    let msg = crate::coordination::downgraded_warning_message(&payload);
+
+    assert!(
+        msg.contains("dynamic message uid 502"),
+        "must surface the real panic message through the Box, not the \
+         non-string-payload fallback: {msg:?}"
+    );
+    assert!(
+        !msg.contains("<non-string panic payload>"),
+        "regression: `&payload` was passed instead of `payload.as_ref()`, so the \
+         downcast silently missed and fell back to the placeholder: {msg:?}"
+    );
+}
+
+/// The downgrade in `TestRegistration::drop` is conditioned on
+/// `std::thread::panicking()`: it must fire *only* while the thread is
+/// already unwinding from another panic. A normal drop (nothing else
+/// unwinding) with a DB that's gone unusable between registration and drop
+/// must still panic loudly — that's the whole point of `connect()` calling
+/// `unwrap_or_else(|e| panic!(...))` on the underlying SQLite open, and
+/// downgrading unconditionally would silently swallow every one of them.
+///
+/// Corrupts by replacing the DB file with a directory rather than
+/// `chmod`ing it narrow, so this runs on every platform, for the reasons
+/// documented on `probe_drop_panic_during_unwind` in `src/lib.rs`.
+#[test]
+fn drop_panics_loudly_on_a_corrupt_db_when_nothing_else_is_unwinding() {
+    let (_dir, path) = temp_db();
+    let reg = coordinate(&path, "normal_drop_corrupt_db", &[], SERIAL_NONE);
+
+    // Corrupt the DB after registration so the connect() call inside
+    // `reg`'s drop, below, fails.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(reg)));
+    assert!(
+        result.is_err(),
+        "drop must panic when the DB is unusable and no other unwind is already in flight"
+    );
+}
+
+// Init lock file permissions =====
+
+/// Unix locks `db_path`'s parent directory itself, not a sibling `.lock`
+/// file (see `lock.rs`'s module doc), so `open_db` must succeed — and
+/// never touch that file at all — even when a `.lock` file left behind by
+/// an older Skuld release (one that did lock a sibling file, published at
+/// whatever mode a root lane's umask gave it) has no owner write bit.
+#[cfg(unix)]
+#[test]
+fn open_db_succeeds_and_ignores_a_leftover_lock_file_with_no_owner_write_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, path) = temp_db();
+    let mut leftover_lock_name = path.as_os_str().to_owned();
+    leftover_lock_name.push(".lock");
+    let leftover_lock_path = std::path::PathBuf::from(leftover_lock_name);
+    std::fs::write(&leftover_lock_path, b"").unwrap();
+    std::fs::set_permissions(&leftover_lock_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let conn = open_db(&path);
+    conn.execute_batch("PRAGMA journal_mode = WAL;")
+        .expect("open_db must return a usable connection regardless of a leftover lock file's permissions");
+
+    let meta = std::fs::metadata(&leftover_lock_path).unwrap();
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o444,
+        "open_db must never touch a leftover lock file at all, let alone change its mode"
+    );
+}
+
+// connect() ask-forgiveness retry =====
+
+/// `connect()` opens first and only publishes on a `CANTOPEN` that
+/// `symlink_metadata` confirms is genuine absence. A dangling symlink is
+/// the other shape: `ensure_published`'s rename cannot replace it
+/// (`RENAME_NOREPLACE` reports `EEXIST` against a symlink regardless of
+/// what it points to, so publishing silently no-ops), and `symlink_metadata`
+/// reports the link itself, not `NotFound` — so this is never treated as
+/// absence. The open must not paper over that with `SQLITE_OPEN_CREATE`
+/// either: doing so would silently create a fresh `0644 & ~umask` file
+/// through the symlink, which is exactly the lockout this module exists to
+/// prevent. `connect()` must instead panic loudly, naming the path, rather
+/// than resurrect the file or retry forever.
+#[cfg(unix)]
+#[test]
+fn connect_panics_loudly_on_a_dangling_symlink_instead_of_recreating_the_db() {
+    let (_dir, path) = temp_db();
+    std::os::unix::fs::symlink(path.with_file_name("does-not-exist"), &path).unwrap();
+
+    let result = std::panic::catch_unwind(|| crate::coordination::connect(&path));
+    let payload = result.expect_err("connect() must panic on a dangling symlink, not create a fresh file");
+    let msg = crate::coordination::panic_payload_message(payload.as_ref());
+    assert!(
+        msg.contains(&path.to_string_lossy().into_owned()),
+        "panic message should name the path: {msg:?}"
+    );
+    assert!(
+        msg.contains("could not open coordination DB"),
+        "panic message should be the neutral open-failure wording, not claim the DB vanished \
+         (it doesn't: ensure_published recreates a plain absence): {msg:?}"
+    );
+
+    let meta = std::fs::symlink_metadata(&path).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "connect() must not have replaced the dangling symlink with a fresh file"
+    );
+}
+
+/// `connect_with` runs under `path`'s init lock (via `connect`/`open_db`),
+/// which excludes every other *Skuld* process, not external interference —
+/// something outside Skuld (a human, another tool) can still delete
+/// `.skuld.db` between `ensure_published` returning and the retried open
+/// running, repeatedly, and `connect`'s own doc promises that any such
+/// absence gets recreated fresh rather than panicking. This drives the
+/// publish hook to leave `path` absent for the first two rounds and only
+/// really publish on the third, proving the loop keeps retrying through
+/// repeated genuine absence rather than giving up after one round trip —
+/// there is no attempt cap.
+#[cfg(unix)]
+#[test]
+fn connect_with_retries_through_repeated_genuine_absence_with_no_attempt_cap() {
+    let (_dir, path) = temp_db();
+    let mut publish_calls = 0u32;
+
+    let conn = crate::coordination::connect_with(&path, |p| {
+        publish_calls += 1;
+        if publish_calls < 3 {
+            return;
+        }
+        crate::coordination::publish::ensure_published(p);
+    });
+
+    conn.execute_batch("PRAGMA journal_mode = WAL;")
+        .expect("the connection returned after the retries must be a usable, open database");
+    assert_eq!(
+        publish_calls, 3,
+        "connect_with must call the publish hook again for every round of genuine absence"
+    );
+}
+
+/// Many threads racing `open_db` against the same, initially-absent path,
+/// each serialized through `path`'s init lock: since every `open_db` call
+/// runs its whole open/recheck/publish sequence under that lock (see
+/// `connect_with`'s doc), no two threads' opens, rechecks, or publishes can
+/// interleave — at most one thread ever sees genuine absence and publishes;
+/// every other thread, once it acquires the lock, finds the file already
+/// published and just opens it on the first try. Every thread must return a
+/// connection, never panic.
+///
+/// This does not exercise a recheck landing after a *concurrent* publish —
+/// the lock rules that out entirely for real callers; see
+/// `connect_with_panics_when_a_publish_lands_between_the_failed_open_and_the_recheck`
+/// for that interleaving, driven directly against the unlocked
+/// `connect_with` instead.
+///
+/// Repeated across many fresh paths in one test (rather than relying on a
+/// single race) because a missing exclusion would only show up on some
+/// iterations, not all of them.
+#[cfg(unix)]
+#[test]
+fn connect_survives_many_threads_racing_the_same_absent_path() {
+    const THREADS: usize = 16;
+    const ROUNDS: usize = 20;
+
+    for _ in 0..ROUNDS {
+        let (_dir, path) = temp_db();
+        let barrier = Barrier::new(THREADS);
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(|| {
+                    barrier.wait();
+                    // `open_db`, not a bare `connect()`, matches how every
+                    // real caller reaches `connect()`: it sets
+                    // `busy_timeout` before touching the DB, which a raw
+                    // `connect()` deliberately doesn't (that's `open_db`'s
+                    // job, not `connect`'s) — asserting through a bare
+                    // `PRAGMA` here would conflate `SQLITE_BUSY` from that
+                    // missing timeout with the lock-serialized absence race
+                    // this test targets.
+                    let _conn = open_db(&path);
+                });
+            }
+        });
+    }
+}
+
+/// `connect_with` alone — unlike `connect()`/`open_db`, which always run it
+/// under `path`'s init lock — has no way to tell a legitimate concurrent
+/// publisher's rename, landing between the failed open and the
+/// `symlink_metadata` recheck, apart from a genuinely broken entry (a
+/// dangling symlink or a directory): both present as "something's there
+/// now" to that recheck, and `connect_with` panics either way (see its own
+/// doc). That is exactly the interleaving the init lock exists to rule out
+/// for every real caller. Proven here via `connect_with_hooks` — the same
+/// implementation `connect_with` itself runs on, with a hook landing a real
+/// publish in the gap between the failed open and the recheck
+/// deterministically, rather than via a race between threads: `connect_with`
+/// must panic, not silently succeed, confirming the lock — not the recheck
+/// logic itself — is what makes that interleaving safe.
+#[cfg(unix)]
+#[test]
+fn connect_with_panics_when_a_publish_lands_between_the_failed_open_and_the_recheck() {
+    let (_dir, path) = temp_db();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::coordination::connect_with_hooks(
+            &path,
+            // The simulated concurrent publisher: a legitimate publish,
+            // landing right where `connect_with`'s doc says an unlocked
+            // caller cannot tell it apart from a genuinely broken entry.
+            crate::coordination::publish::ensure_published,
+            |_p| {
+                panic!(
+                    "ensure_published must not run: the recheck should already have found the \
+                     path present (from the simulated concurrent publish) and panicked before \
+                     ever calling the publish hook"
+                )
+            },
+        )
+    }));
+
+    let payload = result.expect_err(
+        "connect_with must panic, not silently succeed, when its recheck finds a path a \
+         concurrent (lock-unexcluded) publisher already landed — this is why every real caller \
+         holds path's init lock for connect_with's whole open/recheck/publish sequence",
+    );
+    let msg = crate::coordination::panic_payload_message(payload.as_ref());
+    assert!(
+        msg.contains("could not open coordination DB"),
+        "panic message should be connect_with's own open-failure wording: {msg:?}"
+    );
+}
+
+// The `SQLITE_READONLY` WAL cold-start race documented on `open_db` has no
+// direct regression test anywhere in this crate: SQLite's own unix VFS
+// serializes `-shm` creation across every thread *of one process* through a
+// process-local mutex, so the race is only observable between genuinely
+// separate OS processes and isn't reliably reproducible in-process.
+// `tests/lock_contention_regression.rs` instead deterministically guards the
+// mechanism that removes this race outright — `lock::with_init_lock`'s
+// mutual exclusion — which is provable without needing to reproduce the
+// race it was built to remove.
+
+// Windows is_pid_alive: only "no such process" means dead =====
+
+/// `clean_stale_entries` must not delete a live process's row just because
+/// `OpenProcess` failed for a reason other than "no such process" —
+/// `ERROR_ACCESS_DENIED` (a process owned by another user, or a
+/// protected/elevated one) means the process exists but we can't query it,
+/// same shape as Unix's `EPERM`. Only `ERROR_INVALID_PARAMETER` — what
+/// `OpenProcess` returns for a nonexistent PID — means dead.
+#[cfg(windows)]
+#[test]
+fn win32_open_process_error_means_dead_only_for_invalid_parameter() {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER};
+
+    assert!(
+        crate::coordination::win32_open_process_error_means_dead(ERROR_INVALID_PARAMETER.to_hresult()),
+        "ERROR_INVALID_PARAMETER (no such process) must mean dead"
+    );
+    assert!(
+        !crate::coordination::win32_open_process_error_means_dead(ERROR_ACCESS_DENIED.to_hresult()),
+        "ERROR_ACCESS_DENIED must mean alive-but-inaccessible, mirroring Unix's EPERM"
+    );
+    assert!(
+        !crate::coordination::win32_open_process_error_means_dead(ERROR_FILE_NOT_FOUND.to_hresult()),
+        "an unrelated error code must not be treated as 'no such process' either"
+    );
 }

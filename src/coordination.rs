@@ -6,6 +6,13 @@
 
 #[cfg(test)]
 mod coordination_tests;
+mod lock;
+#[cfg(test)]
+mod lock_tests;
+#[cfg(unix)]
+mod publish;
+#[cfg(all(test, unix))]
+mod publish_tests;
 
 use crate::label::{Label, LabelFilter};
 
@@ -48,23 +55,195 @@ fn instance_id() -> String {
 
 // Database initialization =====
 
-/// Current schema version. Bumped to 1 when LabelFilter canonicalization landed
-/// (azhukova/35). Older DBs may contain non-canonical `serial_filter` strings
+/// Current schema version. Bumped to 1 when LabelFilter canonicalization landed.
+/// Older DBs may contain non-canonical `serial_filter` strings
 /// from pre-canonicalization skuld; the migration in [`migrate_schema`] scrubs
 /// them on first open after upgrade.
 const SCHEMA_VERSION: i64 = 1;
 
+/// Open a connection to `path`, serialized against every other
+/// `connect`/`open_db` call for the same path by [`lock::with_init_lock`].
+/// On Unix this asks forgiveness rather than permission: the open (no
+/// `SQLITE_OPEN_CREATE`) is tried first, and [`publish::ensure_published`]
+/// only runs — followed by another open — when that open fails with
+/// `SQLITE_CANTOPEN` *and* nothing is at `path` (`symlink_metadata` reports
+/// `NotFound`). [`connect_locked`] — this function's body, and the same
+/// ask-forgiveness retry described below — is what every real caller
+/// actually uses: [`open_db`] calls it directly under its own longer-lived
+/// lock acquisition, and so does [`TestRegistration::drop`]'s cleanup, for
+/// the same reason: composing a second, nested [`lock::with_init_lock`] call
+/// (which this function itself does) inside a closure that already holds
+/// the lock would self-deadlock, since `flock`/`LockFileEx` locks are scoped
+/// to the open file description, not the process — a second open on the
+/// same path blocks even from the very thread already holding the first.
+/// This standalone wrapper exists only for tests that want [`connect_locked`]'s
+/// exact contract — including the lock acquisition — without also paying for
+/// [`open_db`]'s schema initialization.
+///
+/// Holding the init lock for the whole sequence removes any *Skuld* process
+/// as a source of that `CANTOPEN`+absence: while it's held, this call is the
+/// only create-or-publish attempt for `path` anywhere in the system, so a
+/// `symlink_metadata` recheck that still finds nothing there cannot be a
+/// concurrent Skuld publisher's rename landing in the gap — it is either
+/// genuine absence (something outside Skuld deleted `path`; `ensure_published`
+/// republishes and the open is retried, uncapped, for as long as that keeps
+/// happening) or a genuinely broken entry (a dangling symlink or a
+/// directory, which `ensure_published`'s no-replace rename can't turn into a
+/// usable file and `symlink_metadata` reports as present rather than
+/// `NotFound`) — external interference either way, not a Skuld-internal race
+/// to retry through. A broken entry panics loudly, naming the path, rather
+/// than being waited out.
+///
+/// A `.skuld.db` deleted mid-run is *not* what makes this panic, no matter
+/// how many times it happens: every absence the open discovers, including a
+/// repeat one after `ensure_published` already ran once, gets recreated
+/// fresh at 0666, same as the very first connection of the run. Recreation
+/// gets a new inode; any process that still holds a connection open to the
+/// deleted file's old inode (POSIX doesn't invalidate an open fd on unlink)
+/// keeps operating on that old inode, coordinating separately from
+/// processes that connect afterward and see the new one. That split is
+/// accepted under this module's minimal-publish design (see the module
+/// doc): there's no verification of what's actually at `path` beyond
+/// "something is," so nothing here would notice the swap to tell the two
+/// groups apart, let alone reconcile them.
+///
+/// Windows is unchanged: no Windows lane mixes uids, so there's nothing for
+/// the publish step to protect against there, and the open keeps its
+/// default `SQLITE_OPEN_CREATE`. It still goes through the init lock, since
+/// [`open_db`] needs that regardless of platform (see its doc) and a
+/// single lock covering every `connect` call, not just the ones that could
+/// race, keeps this function's contract uniform.
+///
+/// `#[cfg(all(test, unix))]`, not just `#[cfg(test)]`: its only caller,
+/// `connect_panics_loudly_on_a_dangling_symlink_instead_of_recreating_the_db`,
+/// is itself Unix-only (dangling symlinks and `ensure_published`'s
+/// no-replace rename are both Unix-only concepts), so on a Windows test
+/// build this would be dead code even under `cfg(test)`.
+#[cfg(all(test, unix))]
+pub(crate) fn connect(path: &std::path::Path) -> rusqlite::Connection {
+    lock::with_init_lock(path, || connect_locked(path))
+}
+
+/// [`connect`]'s body, run by both [`connect`] and [`open_db`] while each
+/// already holds `path`'s init lock — a shared inner helper so [`open_db`]
+/// can keep its own connect-then-initialize sequence under one lock
+/// acquisition instead of two, which would otherwise leave the gap between
+/// them unprotected again.
+fn connect_locked(path: &std::path::Path) -> rusqlite::Connection {
+    #[cfg(unix)]
+    {
+        connect_with(path, publish::ensure_published)
+    }
+
+    #[cfg(not(unix))]
+    rusqlite::Connection::open(path)
+        .unwrap_or_else(|e| panic!("skuld: failed to open coordination DB at {path:?}: {e}"))
+}
+
+/// [`connect_locked`]'s Unix implementation, parameterized over the publish
+/// step so `coordination_tests` can drive it without a real filesystem
+/// race.
+///
+/// A single `symlink_metadata` call after a failed open can't, on its own,
+/// tell a genuinely broken entry apart from genuine absence — see
+/// [`connect`]'s doc for how holding `path`'s init lock resolves that
+/// ambiguity.
+///
+/// Absence loops, uncapped, republishing and reopening each time: nothing
+/// bounds how many times something outside Skuld can delete `path` between
+/// this loop's publish and open, and giving up after one round would panic
+/// on exactly the case [`connect`]'s own doc promises recreates fresh. A
+/// broken entry never loops — it can't become un-broken by retrying — and
+/// panics immediately.
+#[cfg(unix)]
+fn connect_with(path: &std::path::Path, ensure_published: impl FnMut(&std::path::Path)) -> rusqlite::Connection {
+    connect_with_hooks(path, |_| {}, ensure_published)
+}
+
+/// [`connect_with`]'s actual implementation, additionally parameterized
+/// over a hook run right after a failed open but before the
+/// `symlink_metadata` recheck that follows it. Exists only so
+/// `coordination_tests` can land a real publish in that exact gap and prove
+/// `connect_with` panics — rather than silently succeeding — when a
+/// concurrent, lock-unexcluded publisher wins that race; every real caller
+/// goes through [`connect_with`] above, which passes a no-op here.
+#[cfg(unix)]
+fn connect_with_hooks(
+    path: &std::path::Path,
+    mut before_recheck: impl FnMut(&std::path::Path),
+    mut ensure_published: impl FnMut(&std::path::Path),
+) -> rusqlite::Connection {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    loop {
+        match rusqlite::Connection::open_with_flags(path, flags) {
+            Ok(conn) => return conn,
+            Err(e) => {
+                if !is_cantopen(&e) {
+                    panic!("skuld: could not open coordination DB {path:?}: {e}");
+                }
+                before_recheck(path);
+                if !path_is_absent(path) {
+                    panic!("skuld: could not open coordination DB {path:?}: {e}");
+                }
+                ensure_published(path);
+                // Loop back and reopen; if something outside Skuld keeps
+                // deleting `path` between publish and open, keep
+                // republishing — see this function's doc.
+            }
+        }
+    }
+}
+
+/// True when `err` is SQLite's own `SQLITE_CANTOPEN`.
+#[cfg(unix)]
+fn is_cantopen(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(inner, _) if inner.code == rusqlite::ErrorCode::CannotOpen
+    )
+}
+
+/// True when nothing exists at `path` (`symlink_metadata`, not `exists()` —
+/// a dangling symlink is still "something is there," same distinction
+/// `ensure_published`'s own fast path draws).
+#[cfg(unix)]
+fn path_is_absent(path: &std::path::Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Open a connection to the coordination database, creating it and the schema
 /// if necessary. Each call returns a fresh connection suitable for single-thread
 /// use.
+///
+/// Schema initialization requires a write lock. Under heavy concurrent
+/// access, `PRAGMA journal_mode = WAL`'s own cold-start negotiation over the
+/// (also just-being-created) `-shm` file can report `SQLITE_READONLY` to
+/// whichever connection loses that particular race — not a lock-contention
+/// error `busy_timeout` retries past, nor one a fresh connection retrying
+/// the same `PRAGMA` reliably resolves either: the negotiation resolves the
+/// *file*'s `-shm`, not any one connection's already-formed opinion of it,
+/// so a connection that lands `SQLITE_READONLY` here can stay readonly for
+/// its own lifetime regardless of retries on that connection. This race
+/// itself has no direct reproduction in this crate's own test suite — see
+/// the comment in `coordination_tests.rs` just above the Windows
+/// `is_pid_alive` tests for what was tried and why it didn't reproduce
+/// against pre-lock code. `tests/lock_contention_regression.rs` instead
+/// guards the mechanism that removes the race deterministically:
+/// [`lock::with_init_lock`]'s mutual exclusion itself, not the race's own
+/// historical symptom.
+///
+/// [`lock::with_init_lock`] removes the race outright instead of retrying
+/// past it: this whole function — [`connect_locked`] plus the WAL pragma,
+/// schema creation and migration below — runs while holding `path`'s init
+/// lock, so no other connection anywhere in the system can be negotiating
+/// the same cold-start `-shm` creation concurrently. With nothing left to
+/// race, one `execute_batch` attempt is enough.
 pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
-    let conn = rusqlite::Connection::open(path)
-        .unwrap_or_else(|e| panic!("skuld: failed to open coordination DB at {path:?}: {e}"));
-    conn.busy_timeout(Duration::from_secs(5))
-        .unwrap_or_else(|e| panic!("skuld: failed to set busy_timeout: {e}"));
-    // Schema initialization requires a write lock. Under heavy concurrent access
-    // (multiple test threads opening the DB simultaneously), the PRAGMA journal_mode
-    // change may not honor busy_timeout on all platforms. Retry on "database is locked".
     let init_sql = "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS running (
@@ -77,19 +256,40 @@ pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
              running_id INTEGER NOT NULL REFERENCES running(id) ON DELETE CASCADE,
              label      TEXT    NOT NULL
          );";
-    for attempt in 0..50 {
-        match conn.execute_batch(init_sql) {
-            Ok(()) => {
-                migrate_schema(&conn);
-                return conn;
-            }
-            Err(e) if e.to_string().contains("database is locked") && attempt < 49 => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => panic!("skuld: failed to initialize coordination DB at {path:?}: {e}"),
-        }
-    }
-    unreachable!()
+    lock::with_init_lock(path, || {
+        let conn = connect_locked(path);
+        conn.busy_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("skuld: failed to set busy_timeout: {e}"));
+        conn.execute_batch(init_sql)
+            .unwrap_or_else(|e| panic!("skuld: failed to initialize coordination DB at {path:?}: {e}"));
+        migrate_schema(&conn);
+        conn
+    })
+}
+
+// Test probe hooks =====
+
+/// Probe hook for Skuld's own test suite (`tests/lock_contention_regression.rs`,
+/// via the `lock_hold_probe` support binary): hold `path`'s real init lock —
+/// the same [`lock::with_init_lock`] `connect`/`open_db` use — for exactly the
+/// duration of `while_held`, so a driver process can deterministically prove
+/// a second process's `try_lock` on the same lock file reports `WouldBlock`
+/// while this one is running, then succeeds once it returns.
+pub(crate) fn probe_hold_init_lock(path: &std::path::Path, while_held: impl FnOnce()) {
+    lock::with_init_lock(path, while_held)
+}
+
+/// Probe hook for Skuld's own test suite (`tests/lock_contention_regression.rs`,
+/// via the `lock_try_probe` support binary): open a *fresh* handle on `path`'s
+/// lock target — never the one [`probe_hold_init_lock`] or any real
+/// `connect`/`open_db` call holds — and attempt a non-blocking `try_lock` on
+/// it, returning the raw result. A fresh handle matters here the same way it
+/// does in `lock_tests.rs`'s in-process `try_lock` test: `flock`/`LockFileEx`
+/// locks are scoped to the open file description/handle, not the process, so
+/// only a genuinely separate handle (here, in a genuinely separate process)
+/// can observe contention against the held lock.
+pub(crate) fn probe_try_init_lock(path: &std::path::Path) -> Result<(), std::fs::TryLockError> {
+    lock::try_lock_exclusive(&lock::open_lock_target(path))
 }
 
 // Transient error classification =====
@@ -236,6 +436,24 @@ fn pid_from_instance_id(instance_id: &str) -> Option<u32> {
 /// Check whether a process with the given PID is still alive.
 #[cfg(unix)]
 fn is_pid_alive(pid: u32) -> bool {
+    // `pid as i32` below is only meaningful for `0 < pid < 2^31`: `0` casts
+    // to `kill(0, 0)`, which checks the *caller's own process group* (always
+    // "exists") instead of a single process, and anything `>= 2^31` wraps
+    // negative — `-1` (only `u32::MAX`) makes `kill` check every process the
+    // caller may signal, and any other negative value makes it check the
+    // process *group* whose id is the absolute value — neither is "this one
+    // process still running". Every
+    // caller of this function (the schema scrub, `clean_stale_entries`)
+    // feeds it a `pid_from_instance_id`-parsed value, which only ever holds
+    // a real `std::process::id()` in ordinary use and can't produce either
+    // value — but the DB is world-writable, so any local uid can
+    // insert a row with a `"0:..."` or out-of-range instance_id, and a
+    // corrupted row could hold one too. No real process can have that PID,
+    // so it's always safe to report it as not alive rather than let the
+    // cast reinterpret it as a different check entirely.
+    if pid == 0 || pid >= (1u32 << 31) {
+        return false;
+    }
     // kill(pid, 0) checks existence without sending a signal.
     // Returns 0 on success, or EPERM if the process exists but we lack permission.
     let ret = unsafe { libc::kill(pid as i32, 0) };
@@ -244,6 +462,35 @@ fn is_pid_alive(pid: u32) -> bool {
     }
     let err = std::io::Error::last_os_error();
     err.raw_os_error() == Some(libc::EPERM)
+}
+
+/// Classify a failed `OpenProcess`'s error as meaning the process is gone,
+/// or something else. Mirrors Unix's `EPERM` handling above: only "no such
+/// process" means dead. `OpenProcess` reports a nonexistent PID as
+/// `ERROR_INVALID_PARAMETER`; anything else — `ERROR_ACCESS_DENIED`
+/// included, e.g. a process owned by another user, or a
+/// protected/elevated one — means the process exists but we can't query
+/// it, same shape as Unix's EPERM. A small pure function, taking just the
+/// `HRESULT` rather than the live `windows::core::Error`, so this
+/// classification can be unit-tested without needing a real failing
+/// `OpenProcess` call.
+///
+/// **Known hang hazard, same class as Unix `EPERM` above, not fixed here:**
+/// `clean_stale_entries` treats an "exists but we can't query it" PID as
+/// alive and leaves its `running` row in place. If that PID was actually
+/// this instance's *own* long-dead owner, and the OS has since reused the
+/// number for an unrelated process this uid can't `OpenProcess` (protected,
+/// elevated, or another user's) — `ERROR_ACCESS_DENIED` — the row is never
+/// cleaned up. A later test whose serial filter conflicts with that row then
+/// blocks in `coordinate`'s loop for as long as the unrelated process lives,
+/// which can be indefinitely. Fixing this needs a way to tell "this PID,
+/// this instance" apart from "this PID, coincidentally reused," which
+/// `instance_id`'s `"{pid}:{timestamp}"` format doesn't do across a reuse —
+/// the same gap the existing cross-namespace `is_pid_alive` issue tracks.
+/// That's an owner design question, not addressed by this change.
+#[cfg(windows)]
+fn win32_open_process_error_means_dead(code: windows::core::HRESULT) -> bool {
+    code == windows::Win32::Foundation::ERROR_INVALID_PARAMETER.to_hresult()
 }
 
 #[cfg(windows)]
@@ -256,7 +503,7 @@ fn is_pid_alive(pid: u32) -> bool {
             let _ = unsafe { CloseHandle(handle) };
             true
         }
-        Err(_) => false,
+        Err(e) => !win32_open_process_error_means_dead(e.code()),
     }
 }
 
@@ -385,16 +632,85 @@ pub(crate) struct TestRegistration {
 
 impl Drop for TestRegistration {
     fn drop(&mut self) {
+        // Runs the connect *and* the first statement on it under `db_path`'s
+        // init lock (like `open_db` does), not just a raw `connect()`: a
+        // fresh connection's first write against a WAL database still
+        // touches the `-shm` mapping, so this cleanup is itself a
+        // participant in the cold-start negotiation `open_db`'s doc
+        // describes, not a bystander exempt from it.
         let cleanup = || -> Result<(), rusqlite::Error> {
-            let conn = rusqlite::Connection::open(&self.db_path)?;
-            conn.busy_timeout(Duration::from_secs(5))?;
-            conn.execute_batch("PRAGMA foreign_keys = ON")?;
-            conn.execute("DELETE FROM running WHERE id = ?1", [self.id])?;
-            Ok(())
+            lock::with_init_lock(&self.db_path, || {
+                let conn = connect_locked(&self.db_path);
+                conn.busy_timeout(Duration::from_secs(5))?;
+                conn.execute_batch("PRAGMA foreign_keys = ON")?;
+                conn.execute("DELETE FROM running WHERE id = ?1", [self.id])?;
+                Ok(())
+            })
         };
-        if let Err(e) = cleanup() {
-            eprintln!("[skuld] warning: failed to unregister test from coordination DB: {e}");
+
+        // `connect_locked` can panic (a publish failure, or SQLite itself
+        // rejecting the file — e.g. it's been replaced by a directory —
+        // is loud by design). Ordinarily that panic should propagate: a
+        // genuinely broken DB is worth failing loudly over. But if this
+        // drop is running because the *thread* is already unwinding
+        // from a different, unrelated panic (e.g. the test itself failed), a
+        // second uncaught panic here is a panic during a panic — Rust turns
+        // that into `std::process::abort()` (`SIGABRT`), killing the whole
+        // process rather than just this one failing test. `catch_unwind`
+        // this call so we can tell those two cases apart and only let the
+        // panic through in the case where it's safe to.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup));
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("[skuld] warning: failed to unregister test from coordination DB: {e}");
+            }
+            Err(payload) => {
+                if std::thread::panicking() {
+                    // Already unwinding from another panic: downgrade to a
+                    // loud warning instead of letting this one escape and
+                    // aborting the process.
+                    eprintln!("{}", downgraded_warning_message(&payload));
+                } else {
+                    // Normal drop, no concurrent unwind: this is the only
+                    // panic in flight, so it's safe to let it through and
+                    // fail loudly as designed.
+                    std::panic::resume_unwind(payload);
+                }
+            }
         }
+    }
+}
+
+/// Build the downgraded-warning line for a panic payload caught from the
+/// cleanup closure above, for the case where the drop is already running
+/// during another panic's unwind. Pulled out of `Drop::drop` as its own
+/// function, taking `payload` by the same `&Box<dyn Any + Send>` shape
+/// `Drop::drop` holds it in, so unit tests exercise the exact call
+/// convention production code uses — not a stand-in for it. That matters
+/// because of a real footgun: `Box<dyn Any + Send>` is itself `Any` via the
+/// blanket impl, so `&payload` coerces to `&dyn Any` *over the Box*, not its
+/// contents, and `downcast_ref` inside `panic_payload_message` would then
+/// always miss. `payload.as_ref()` derefs through the Box first.
+fn downgraded_warning_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    let msg = panic_payload_message(payload.as_ref());
+    format!(
+        "[skuld] warning: coordination DB cleanup panicked while already unwinding from another \
+         panic (not re-raised, to avoid aborting the process): {msg}"
+    )
+}
+
+/// Best-effort extraction of a panic payload's message, for the downgraded
+/// warning path above. Panics are conventionally `&'static str` (from
+/// `panic!("literal")`) or `String` (from `panic!("{}", ...)` and friends);
+/// anything else prints as a fixed placeholder rather than guessing.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<non-string panic payload>"
     }
 }
 
