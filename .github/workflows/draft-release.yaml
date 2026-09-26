@@ -48,44 +48,6 @@ jobs:
           V=$(.github/scripts/normalize-version.sh "$INPUT_VERSION")
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
-      - name: Fail if release tag already exists
-        timeout-minutes: 5
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          VERSION: ${{ steps.version.outputs.version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG="v${VERSION}"
-
-          # "Get a release by tag name" excludes drafts — it resolves against
-          # the git tag, which a draft does not have yet — so this lists
-          # releases instead (which does include drafts) and searches by
-          # `tag_name`. `--paginate` merges every page into one JSON array.
-          if ! releases_json=$(gh api "repos/${GH_REPO}/releases" --paginate); then
-            echo "::error::Could not list releases for ${GH_REPO} to check whether $TAG already exists — refusing to guess. Re-run once the GitHub API is confirmed reachable."
-            exit 1
-          fi
-
-          # Distinguish "confirmed not found" (jq exit 1: valid JSON, no
-          # match) from any other outcome. A malformed or unexpected body
-          # must not silently read as "not found" and let a duplicate tag
-          # through.
-          match=0
-          printf '%s' "$releases_json" | jq -e --arg t "$TAG" 'any(.[]; .tag_name == $t)' >/dev/null || match=$?
-          case "$match" in
-            0)
-              echo "::error::Release $TAG already exists (draft or published). Delete it or pick a new version."
-              exit 1
-              ;;
-            1) ;; # confirmed not found — proceed
-            *)
-              echo "::error::Could not parse GitHub's releases list for ${GH_REPO} while checking whether $TAG exists — refusing to guess."
-              exit 1
-              ;;
-          esac
-
       - name: Create local tag for xtask check
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -150,8 +112,11 @@ jobs:
       # passes stage 1 and fails part-way through the irreversible upload.
       #
       # Uses `crate-state.sh` (crates.io JSON API, not the sparse index — see
-      # its header) so a version published seconds ago still reads correctly
-      # here. It fails closed on any ambiguous response instead of guessing.
+      # its header), which sidesteps the index's 600s CDN cache. That is not
+      # the same as a read-after-write guarantee from the API itself, which
+      # crates.io does not document — see Recovery in CONTRIBUTING.md for
+      # what to do if a read looks stale right after an upload. This step
+      # fails closed on any ambiguous response instead of guessing either way.
       - name: Check crates.io state for every publishable member
         timeout-minutes: 10
         env:
@@ -197,13 +162,10 @@ jobs:
           while read -r c; do
             [ -n "$c" ] || continue
 
-            # One request per member answers both questions crate-state.sh can
-            # answer from a single crate-level fetch: never-published means
-            # stage 2 could never publish this member at all (see "Adding a
-            # publishable member" in CONTRIBUTING.md); otherwise, crates.io
-            # reserves a version permanently on first upload, whether or not
-            # it later gets yanked, so both `published` and `yanked` mean this
-            # version can never be published again.
+            # never-published means stage 2 could never publish this member at all
+            # (see "Adding a publishable member" in CONTRIBUTING.md); published and
+            # yanked both mean crates.io permanently reserved this version on first
+            # upload (crate-state.sh's header covers why one request tells us both).
             #
             # `state=$(...)` as a plain assignment, not inside a `[` test —
             # `set -e` sees a failing command substitution there and aborts,
@@ -256,6 +218,60 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
+
+      # Runs here, immediately before the create below, rather than in
+      # `validate`: GitHub's "list releases" only returns drafts to a token
+      # with push access, and `validate` deliberately stays `contents: read`.
+      # A `contents: read` token gets a 200 with every draft silently
+      # omitted, not a permissions error — so running this check under that
+      # token would not fail, it would just never see the very releases it
+      # exists to catch. Placing it right before the create, in the job that
+      # already needs `contents: write` for the create itself, also shrinks
+      # the gap between "confirmed not there" and "created" to as little as
+      # this job can make it.
+      - name: Fail if release tag already exists
+        timeout-minutes: 5
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+
+          # "Get a release by tag name" excludes drafts — it resolves against
+          # the git tag, which a draft does not have yet — so this lists
+          # releases instead (which does include drafts, to a push-access
+          # token) and searches by `tag_name`.
+          #
+          # `--paginate` alone does NOT merge pages into one array: each page
+          # is its own top-level JSON array on its own line, and `jq -e`'s
+          # exit status reflects only the last one it evaluates — a match on
+          # an earlier page would print `true` and then be overwritten by a
+          # later page's `false`, reading as not-found. `--slurp` wraps every
+          # page into a single outer array instead, so `.[][]` here iterates
+          # every release across every page as one flat sequence.
+          if ! releases_json=$(gh api "repos/${GH_REPO}/releases" --paginate --slurp); then
+            echo "::error::Could not list releases for ${GH_REPO} to check whether $TAG already exists — refusing to guess. Re-run once the GitHub API is confirmed reachable."
+            exit 1
+          fi
+
+          # Distinguish "confirmed not found" (jq exit 1: valid JSON, no
+          # match) from any other outcome. A malformed or unexpected body
+          # must not silently read as "not found" and let a duplicate tag
+          # through.
+          match=0
+          printf '%s' "$releases_json" | jq -e --arg t "$TAG" 'any(.[][]; .tag_name == $t)' >/dev/null || match=$?
+          case "$match" in
+            0)
+              echo "::error::Release $TAG already exists (draft or published). Delete it or pick a new version."
+              exit 1
+              ;;
+            1) ;;
+            *)
+              echo "::error::Could not parse GitHub's releases list for ${GH_REPO} while checking whether $TAG exists — refusing to guess."
+              exit 1
+              ;;
+          esac
 
       - name: Create draft release pinned to commit SHA
         env:
