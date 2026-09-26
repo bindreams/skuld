@@ -7,11 +7,6 @@ on:
         description: "Release version (e.g. 1.0.0)"
         required: true
         type: string
-      first-publish-ok:
-        description: "Acknowledge that a member is publishing for the first time (its crate scope must be on the Deploy token)"
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   group: draft-release-${{ inputs.version }}
@@ -24,6 +19,7 @@ jobs:
   validate:
     name: Validate version
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     outputs:
@@ -37,6 +33,7 @@ jobs:
 
       - name: Normalize and validate version
         id: version
+        timeout-minutes: 5
         # inputs.version is passed via env to avoid shell injection on
         # interpolation. GitHub's actionlint specifically flags direct
         # ${{ inputs.* }} interpolation in run: blocks.
@@ -45,14 +42,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          V="${INPUT_VERSION#v}"
-          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Invalid version: '${INPUT_VERSION}'"
-            exit 1
-          fi
+          # Validation, and its rationale (leading-`v` and leading-zero
+          # rejection), live in normalize-version.sh — shared with
+          # publish-release.yaml so both copies stay identical.
+          V=$(.github/scripts/normalize-version.sh "$INPUT_VERSION")
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Fail if release tag already exists
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -72,11 +69,15 @@ jobs:
         run: git tag "v${VERSION}"
 
       - name: Validate workspace version and dep pin against tag
-        # Runs workspace_version() (version agreement + every intra-workspace pin) AND
-        # nearest-tag comparison with --exact. Fails on any inconsistency.
-        # Catches operator mistypes: if input version != Cargo.toml version,
-        # the newly-created local tag disagrees with Cargo.toml and --exact
-        # rejects it.
+        # Runs workspace_version() (version agreement + every intra-workspace
+        # pin) AND nearest-tag comparison with --exact.
+        #
+        # This does NOT catch an operator mistyping the version. `--exact` is
+        # satisfied by any version tag on the nearest tagged ancestor, so when
+        # that commit already carries a tag matching the manifest, the tag
+        # created above is just one more alternative and any input passes. The
+        # manifest/input comparison in "Check crates.io state" below is what
+        # actually catches it.
         run: cargo xtask version --check --exact
 
   ci:
@@ -92,6 +93,7 @@ jobs:
     name: Verify publishable
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -100,6 +102,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
 
       - name: Dry-run publish workspace
+        timeout-minutes: 30
         # cargo 1.90+ dry-runs multi-package publishes in topological order.
         #
         # Verification stays on. Multi-package publishing — `--workspace` or
@@ -109,64 +112,116 @@ jobs:
         # stage 2, compiling each crate as packaged rather than as checked out.
         run: cargo publish --workspace --dry-run --locked
 
-      # `--dry-run` never authenticates, so nothing up to this point has
-      # exercised the Deploy token's crate scope — and a member publishing for
-      # the first time publishes last, so a scope miss lands the worst partial
-      # state. Detect first-publishes here, in the reversible stage, and make
-      # the operator confirm the scope rather than discover it mid-upload.
-      - name: Flag first-time publishes
+      # Two questions must be settled before a draft can exist, and the
+      # dry-run above answers neither.
+      #
+      # A crate that does not yet exist on crates.io cannot have a trusted
+      # publisher configured, so stage 2 cannot publish a new member at all —
+      # and a leaf publishes after its dependencies, landing the worst partial
+      # state. See "Adding a publishable member" in CONTRIBUTING.md.
+      #
+      # A version already on crates.io can never be published again: the
+      # registry reserves it permanently and yanking does not free it.
+      # `cargo publish --dry-run` warns "already exists on crates.io" and still
+      # exits 0, so without this check a re-dispatch of a published version
+      # passes stage 1 and fails part-way through the irreversible upload.
+      - name: Check crates.io state for every publishable member
+        timeout-minutes: 10
         env:
-          VERSION: ${{ inputs.version }}
-          ACK: ${{ inputs.first-publish-ok }}
+          INPUT_VERSION: ${{ needs.validate.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          # Read the member list into a variable rather than piping a process
-          # substitution into the loop: `done < <(cargo metadata | jq)` discards
-          # the exit status of both commands, so a metadata or jq failure would
-          # feed the loop zero names and report every crate as already published.
-          # An assignment propagates the failure, and `set -e` stops the step.
-          members=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
-          if [ -z "$members" ]; then
-            echo "::error::No publishable workspace members found. Expected at least one."
+          # Read the member list into a variable rather than feeding a loop from
+          # a process substitution: `< <(cargo metadata | jq)` discards the exit
+          # status of both commands, so a failure there would run the loop zero
+          # times and report every member as fine — this gate failing open in
+          # the stage that exists to catch exactly that.
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          members=$(.github/scripts/publishable-members.sh)
+
+          # The version that gets uploaded is the manifest's, not the operator's
+          # input, and the two can differ: `cargo xtask version --check --exact`
+          # is satisfied by ANY version tag on HEAD, so when main already carries
+          # the last release tag it accepts a mistyped input. Checking the input
+          # would then clear a version nobody is publishing while the one cargo
+          # actually uploads goes unchecked.
+          versions=$(printf '%s' "$metadata" | jq -r '.packages[] | select(.publish != []) | .version' | sort -u)
+          version_count=$(printf '%s\n' "$versions" | wc -l)
+          if [ "$version_count" -ne 1 ]; then
+            # Unreachable: the validate job's `cargo xtask version --check
+            # --exact` (needs: validate, same commit) already asserted every
+            # publishable member agrees on version before this job could even
+            # start. If this fires, xtask and this check have drifted out of
+            # sync — treat it as a bug in the tooling, not a manifest problem.
+            version_list=$(printf '%s' "$versions" | tr '\n' ' ')
+            echo "::error::BUG: publishable members disagree on version (${version_list}) despite the validate job's cargo xtask version --check --exact already asserting agreement."
+            exit 1
+          fi
+          VERSION="$versions"
+          if [ "$VERSION" != "$INPUT_VERSION" ]; then
+            echo "::error::Input version ${INPUT_VERSION} does not match the workspace manifest version ${VERSION}; cargo would publish ${VERSION}. Bump the manifests, or re-dispatch with ${VERSION}."
             exit 1
           fi
 
-          # PR #60 replaces this whole step with crate-state.sh, which
-          # classifies via the JSON API properly. Fixed here regardless since
-          # #60 isn't merged and this step has to be correct in the meantime.
           new=()
+          taken=()
           while read -r c; do
-            prefix=$(printf '%s' "$c" | sed -E 's|^(..)(..).*|\1/\2|')
-            # -f would make any non-2xx exit the same way as a network
-            # failure, which is the same masking this step's comment above
-            # already calls out for the metadata|jq pipeline: a transient
-            # DNS/5xx/rate-limit hit would be relabeled as "first publish".
-            # Branch on the status code instead; a real transport failure
-            # still exits curl non-zero and `set -e` stops the step.
-            code=$(curl -sS -o /dev/null -w '%{http_code}' "https://index.crates.io/$prefix/$c")
+            [ -n "$c" ] || continue
+            path=$(.github/scripts/crate-index-path.sh "$c")
+
+            # Branch on curl's exit status, not on the status code it wrote.
+            # curl emits `%{http_code}` even when the transfer fails, and once
+            # response headers have arrived that value is 200 — so a connection
+            # cut mid-body yields "200" plus a SHORT body. The index lists
+            # versions in publication order, which puts the one being checked on
+            # the last line: exactly what a truncation drops. Trusting the
+            # written code would clear a version that is in fact taken.
+            if out=$(curl -sS --retry 3 --retry-all-errors --max-time 30 \
+                -w '\n%{http_code}' -X GET "https://index.crates.io/$path"); then
+              code=$(printf '%s\n' "$out" | tail -n 1)
+            else
+              code="000"
+            fi
+
+            # `-f` would collapse "404, never published" into the same non-zero
+            # exit as a network failure, and the two need opposite handling; it
+            # also treats a 3xx as success, reading a redirect as "published".
             case "$code" in
-              200) ;; # already published
+              200)
+                # -F: the version is a literal, and an unescaped `.` would match
+                # any character.
+                if printf '%s\n' "$out" | grep -qF "\"vers\":\"${VERSION}\""; then
+                  taken+=("$c")
+                fi
+                ;;
               404) new+=("$c") ;;
               *)
-                echo "::error::Unexpected HTTP $code checking $c on crates.io index"
+                echo "::error::Unexpected HTTP $code from the crates.io index for '$c'. Refusing to guess; re-run when the registry is reachable."
                 exit 1
                 ;;
             esac
           done <<< "$members"
-          if [ ${#new[@]} -eq 0 ]; then
-            echo "All publishable members already exist on crates.io."
-          elif [ "$ACK" = "true" ]; then
-            echo "::notice::First publish for: ${new[*]} — acknowledged."
-          else
-            echo "::error::First publish for: ${new[*]}. Confirm the Deploy token's crate scope covers these, then re-run with first-publish-ok=true."
-            exit 1
+
+          # Report both problems in one run rather than one per re-dispatch.
+          fail=0
+          if [ ${#new[@]} -ne 0 ]; then
+            echo "::error::Never published: ${new[*]}. Stage 2 authenticates by trusted publishing, and a crate that does not exist cannot have a publisher configured. Follow \"Adding a publishable member\" in CONTRIBUTING.md, then re-run."
+            fail=1
           fi
+          if [ ${#taken[@]} -ne 0 ]; then
+            echo "::error::crates.io already has ${VERSION} for: ${taken[*]}. That version is reserved permanently and can never be republished. Bump and re-run."
+            fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+
+          echo "All publishable members exist, and none has ${VERSION} yet."
 
   release:
     name: Create draft release
     needs: [validate, ci, verify]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     env:

@@ -103,6 +103,13 @@ jobs:
 
       - uses: j178/prek-action@v2
 
+      # A wrong sparse-index path here 404s and reads as "never published" —
+      # silently, and only during an irreversible publish or a stressed manual
+      # recovery. Kept as a cheap shell check in the lint job rather than
+      # `cargo test`: it is workflow tooling, not Rust.
+      - name: Test crate-index-path.sh
+        run: .github/scripts/crate-index-path.test.sh
+
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
     strategy:
