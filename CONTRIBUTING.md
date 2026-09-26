@@ -72,7 +72,7 @@ This workflow:
 
 ### Recovery
 
-**Check the job summary first.** A red run whose summary says `RELEASE COMPLETE` is a finished release: the failure came from a post step that runs after the flip — most often the auth action revoking its short-lived token. Take no action: do not yank, bump, or re-dispatch. Everything below applies only to runs _without_ that marker.
+**Check the job summary first.** A red run whose summary says `RELEASE COMPLETE` is a finished release: the failure came from a post step that runs after the flip — most often the auth action revoking its short-lived token. Take no action: do not yank, bump, or re-dispatch. If the summary does not show the marker, check the step's raw log too before concluding the flip never happened: the marker is written to both the log and the summary specifically so a summary write failure (`GITHUB_STEP_SUMMARY` unwritable, say) cannot hide a release that did complete — `tee` still writes to its other outputs, including stdout, even when one output fails. Everything below applies only to runs where the marker is absent from both.
 
 Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` — and `cargo publish` is not atomic, so a server-side error part-way through leaves the workspace partially published.
 
@@ -160,8 +160,11 @@ Then bump every publishable member's manifest to `X.Y.Z+1` (`cargo metadata` abo
 
 **All three published.** Whatever failed afterwards — the GitHub-release flip, or `cargo publish` itself during the index-visibility wait — nothing is wrong on crates.io. Do **not** yank, and do **not** bump: the release is complete apart from its tag.
 
+Pin `--target` explicitly rather than trusting the draft's current target field. The automated flip does the same, and for the same reason: an edit to the draft since the run checked out and built the tree — plausible here, since a manual recovery can happen well after the run, unlike the run's own few-second gap between resolving the SHA and flipping — would otherwise tag a commit that was never actually published. Read `SHA` from the failed run's own **"Verify draft release exists and resolve commit SHA"** step output (`commit_sha`), not from re-querying the live draft:
+
 ```sh
-gh release edit "vX.Y.Z" --draft=false
+SHA=<commit_sha from the failed run's "Verify draft release exists and resolve commit SHA" step>
+gh release edit "vX.Y.Z" --draft=false --target "$SHA"
 ```
 
 ### Useful commands during a release
