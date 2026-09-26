@@ -20,11 +20,10 @@ jobs:
     # upload carry their own instead. A job deadline spans the publish step,
     # and crates.io commits each upload server-side, so cancelling part-way
     # through leaves the workspace partially published with no tag: the state
-    # the timeout would exist to avoid, caused by the timeout. A job timer starts before the token is minted, and
-    # the only case where it could bite is a cold cache (`cargo publish
-    # --workspace` runs a full verification build of all three crates, and
-    # rusqlite's bundled SQLite is not fast) — which also slows every step
-    # ahead of it, so it would arrive earliest exactly when least wanted.
+    # the timeout would exist to avoid, caused by the timeout. A job timer
+    # would also start before the token exists, so on a cold cache the
+    # up-front verification build (see the step below) could itself eat much
+    # of any deadline before the upload even begins.
     #
     # Two deadlines remain that no timeout setting here can remove: the minted
     # token lives ~30 minutes, and GitHub caps any job at 6 hours. Both span
