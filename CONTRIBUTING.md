@@ -8,7 +8,7 @@ Releases go through two GitHub Actions workflows. Both are triggered by hand —
 
 - `Cargo.toml`, `macros/Cargo.toml` and `cargo-skuld/Cargo.toml` already have the intended release version (say `X.Y.Z`) on `main`, and the exact pins between them match it. `cargo xtask version --check --exact` enumerates workspace members dynamically, so it validates version agreement and every intra-workspace `=` pin across all three.
 - You have the GitHub CLI (`gh`) authenticated for the `bindreams/skuld` repo.
-- **For recovery only:** a personal crates.io token with the `yank` scope on every publishable member, via `cargo login` or `cargo yank --token`. Publishing mints its own short-lived token inside the job, so there is none to borrow. Without this, the first command of either partial-publish recovery fails on authentication.
+- **For recovery only:** a personal crates.io token with the `yank` scope on every publishable member, via `cargo login` or `cargo yank --token`. Publishing mints its own short-lived token inside the job, so there is none to borrow. Without this, the first command of the abandon-and-bump recovery path fails on authentication.
 - Every publishable member has a **trusted publisher** configured on crates.io — GitHub, owner `bindreams`, repository `skuld`, workflow `publish-release.yaml`, environment `Deploy`. Stage 2 mints a short-lived token by OIDC and carries no long-lived secret. All four fields are matched exactly, so both the workflow **filename** and the environment name are load-bearing: renaming the file or dropping `environment: Deploy` breaks publishing, and neither is visible until the irreversible step.
 - **Open action item, not yet configured:** the `Deploy` environment needs a **deployment branch policy limiting it to `main`**. A trusted-publisher config has no ref field — it matches only the four values above — so GitHub's branch policy is the one place a ref restriction can live. Until it is set, any branch carrying this workflow filename and this environment name can mint a token valid for all three crates and publish from unreviewed code, going around `main`'s protection. Set it under Settings → Environments → Deploy → Deployment branches. Unlike the bullets above, this one describes work still to do; the comment on the job in `publish-release.yaml` says the same.
 
@@ -67,84 +67,61 @@ This workflow:
 - Checks out that commit.
 - Re-runs `cargo xtask version --check --exact` against the checked-out tree.
 - Packages and verify-builds the publishable members, **before** minting the token. `cargo publish` would otherwise run that build inside the credential's ~30-minute life, and a cold build can consume most of it — expiring the token between uploads, which is a partial publish. The member list comes from `cargo metadata` rather than `--workspace`, which would also package `publish = false` members: a superset that both lengthens this build and enforces packaging rules on crates that are never packaged.
-- Publishes them with `cargo publish --workspace --locked --no-verify` (cargo handles topological ordering and index-visibility waiting, and skips `publish = false` members). Deliberately not a hand-written `-p` list. `--no-verify` is safe only because the step above just did that verification over exactly this member set; what it still skips is the registry-side checks cargo makes at upload time, such as the size cap.
-- Flips the GitHub release from draft to published, which creates the `vX.Y.Z` git tag.
+- Classifies every publishable member's state **at this version** via the crates.io JSON API (`.github/scripts/crate-state.sh`), and skips whichever are already `published` — this is what makes a re-dispatch after a partial or interrupted publish safe: it will not try to re-upload a member that already went out. Refuses outright, publishing nothing, if any member is `yanked` at this version — that slot can never be reused; see Recovery below.
+- Publishes whatever is left with `cargo publish --workspace --locked --no-verify --exclude <already-published member>...` (cargo handles topological ordering and index-visibility waiting among what remains, and skips `publish = false` members). Skipped entirely if every member is already published. `--no-verify` is safe only because the packaging step above just did that verification over the whole set; what it still skips is the registry-side checks cargo makes at upload time, such as the size cap.
+- Flips the GitHub release from draft to published, which creates the `vX.Y.Z` git tag. This step has no `if:` — it runs even when publishing was skipped, so a re-dispatch that finds everything already on crates.io still finishes the release.
 
 ### Recovery
 
 **Check the job summary first.** A red run whose summary says `RELEASE COMPLETE` is a finished release: the failure came from a post step that runs after the flip — most often the auth action revoking its short-lived token. Take no action: do not yank, bump, or re-dispatch. If the summary does not show the marker, check the step's raw log too before concluding the flip never happened: the marker is written to both the log and the summary specifically so a summary write failure (`GITHUB_STEP_SUMMARY` unwritable, say) cannot hide a release that did complete — `tee` still writes to its other outputs, including stdout, even when one output fails. Everything below applies only to runs where the marker is absent from both.
 
-Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` — and `cargo publish` is not atomic, so a server-side error part-way through leaves the workspace partially published.
+Publishing is topological — `skuld-macros`, then `skuld`, then `cargo-skuld` — and `cargo publish` is not atomic, so a server-side error, a cancellation, or an expiring token can leave the workspace partially published.
 
-**First, establish which state you are in.** The workflow log says where it stopped; the registry is authoritative. Use the sparse index, which needs no `User-Agent` — the crates.io JSON API answers `403` with an empty body to curl's default one.
+**In every case below except a `yanked` version, the fix is the same: re-run stage 2 at the same version.** Before touching the registry, stage 2 now classifies every publishable member's state at that version via the crates.io JSON API and skips whichever are already `published` — including all of them, if every upload from the previous attempt actually succeeded and only the GitHub-release flip failed. A member reaching `published` already passed packaging and verification in the run that published it — that step runs for the whole set before any upload — so nothing still pending can fail for a code reason; only `yanked` blocks a re-run, because that slot can never be reused.
 
-The snippet reads the status code separately from the body, and that is why it does not use `--fail`. `curl -s` alone exits `0` whatever the server said, so judging by the body only cannot tell a 404 from a 503; `--fail` collapses them the other way, into one non-zero exit. Either way a transient error reads as "absent", which reports an untouched registry and routes you into re-running stage 2 at a version that is in fact already taken. Reading `%{http_code}` is necessary but not sufficient: curl writes that value even when the transfer fails, and once response headers have arrived it reads `200`, so a connection cut mid-body yields `200` with a short body. The index lists versions in publication order, so the one you are asking about is the last line — exactly what a truncation drops. The snippet therefore branches on curl's **exit status** and only trusts the code when the transfer completed. Any `UNKNOWN` line means re-run the check rather than act on it. The block runs in a subshell so a refusal cannot close your terminal.
+**First, establish which state you are in.** The workflow log says where it stopped, but the registry is authoritative. This uses the same scripts the workflow does, so it cannot disagree with them — run it from the repository root:
 
 ```bash
 (
 V=X.Y.Z   # the version you were publishing — the only thing to edit
 
-# Both guards exist because the failure they prevent is silent: every crate
-# reads `absent`, which is exactly what an untouched registry looks like.
 if [ "$V" = X.Y.Z ]; then
   echo "Set V to the version you were publishing, then re-run."; exit 1
 fi
 
-members=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
-if [ -z "$members" ]; then
-  echo "Could not enumerate publishable members. Fix that before trusting anything below."; exit 1
-fi
-
+members=$(.github/scripts/publishable-members.sh) || exit 1
 for c in $members; do
-  # Same helper the release workflow uses, so the two cannot disagree about
-  # where a crate lives in the index.
-  path=$(.github/scripts/crate-index-path.sh "$c") || exit 1
-
-  if out=$(curl -sS -w '\n%{http_code}' --retry 3 --retry-all-errors --max-time 30 \
-      -X GET "https://index.crates.io/$path"); then
-    code=$(printf '%s\n' "$out" | tail -n 1)
+  if state=$(.github/scripts/crate-state.sh "$c" "$V"); then
+    printf '%-14s %s: %s\n' "$c" "$V" "$state"
   else
-    code=000   # transfer failed: $out may be truncated, so code gates its use
-  fi
-  # Only consulted on the 200 branch below, where the transfer completed.
-  line=$(printf '%s\n' "$out" | grep -F "\"vers\":\"$V\"" || true)
-
-  if [ "$code" != "200" ] && [ "$code" != "404" ]; then
-    printf '%-14s %s: UNKNOWN (HTTP %s) — do not act on this line\n' "$c" "$V" "$code"
-  elif [ -z "$line" ]; then
-    printf '%-14s %s: absent\n' "$c" "$V"
-  elif printf '%s' "$line" | grep -q '"yanked":true'; then
-    printf '%-14s %s: YANKED — slot consumed, bump\n' "$c" "$V"
-  else
-    printf '%-14s %s: PUBLISHED\n' "$c" "$V"
+    printf '%-14s %s: refused — see the error above; do not act on this line\n' "$c" "$V"
   fi
 done
 )
 ```
 
-The member list is derived rather than written out, so it stays right as the workspace grows. **Run this from the repository root**: it invokes `.github/scripts/crate-index-path.sh` by a root-relative path — the same helper the release workflow uses, so the two cannot disagree about where a crate lives in the index.
+`crate-state.sh` reads the crates.io JSON API rather than the sparse index, which is CDN-cached for 600s — long enough to still read `absent` right after a real upload — and refuses instead of guessing on anything ambiguous, so a `refused` line means re-run the check rather than act on it.
 
-**Any `YANKED` means the version slot is gone.** crates.io reserves a version permanently on publish; yanking hides it but never frees it, so stage 2 can never succeed at that version again. Go to the bump path below regardless of what the other crates report. If a crate reads `absent` immediately after a successful-looking upload, wait a minute and re-check before yanking anything — index propagation lags.
+**Any `yanked`.** The version slot is gone — crates.io reserves a version permanently on publish, and yanking hides it but never frees it, so stage 2 refuses to publish anything at this version regardless of how the other members read. Skip to "Abandoning this version" below. If a member reads `absent` immediately after a successful-looking upload, wait a minute and re-check before concluding anything — index propagation lags, though `crate-state.sh` itself is not index-based and should not.
 
-**Nothing published** (every crate `absent`, none `YANKED`). crates.io is untouched and there is nothing to undo. What to do next depends on why it stopped:
+**No `yanked`, at least one `published`.** Just re-run stage 2 with the same version. It will skip whatever already succeeded — including finishing a release where every upload went out but the flip did not — and publish only what is left.
+
+**Nothing published** (every member `absent`, none `yanked`). crates.io is untouched and there is nothing to undo. What to do next depends on why it stopped:
 
 - _Environmental_ (registry outage, runner failure): re-run **stage 2** with the same version once the cause has cleared. The draft's pinned commit is still correct, so nothing else needs doing. Note that a cause you can only fix by committing is a _tree_ cause, not this one — a commit changes the tree, so it takes the path below.
-- _Tree_ (packaging, verification, or the version re-check): stage 2 checks out the draft's pinned commit, so re-running replays the identical failure. Delete the draft with `gh release delete "vX.Y.Z" --yes`, push the fix, then re-run **stage 1** and stage 2. Stage 1 refuses to create a draft while a release with that tag exists, which is why the delete comes first.
+- _Tree_ (packaging, verification, or the version re-check): stage 2 checks out the draft's pinned commit, so re-running replays the identical failure. Delete the draft with `gh release delete "vX.Y.Z" --yes`, push the fix, then re-run **stage 1** and stage 2. Stage 1 refuses to create a draft while a release with that tag exists, which is why the delete comes first. A tree cause can only happen here, before anything has published: packaging and verification cover the whole member set and run before any upload, so once even one member is `published` the remaining ones already passed that gate.
 
-**Only `skuld-macros` published:**
+### Abandoning this version
 
-```sh
-cargo yank skuld-macros@X.Y.Z
-```
+Only needed when a member reads `yanked`, or the release is being pulled for a content reason unrelated to publish mechanics. Otherwise use the re-run path above instead — it is strictly less work and does not spend a version slot.
 
-**`skuld-macros` and `skuld` published** (the likelier partial: `cargo-skuld` publishes last):
+Yank every member the diagnostic above reported as `published` (skip ones already `yanked` or `absent`):
 
 ```sh
-cargo yank skuld-macros@X.Y.Z
-cargo yank skuld@X.Y.Z
+cargo yank <crate>@X.Y.Z
 ```
 
-**In either partial case above**, capture the commit before deleting the draft — the draft is its only source:
+Capture the commit before deleting the draft — the draft is its only source:
 
 ```sh
 SHA=$(gh release view "vX.Y.Z" --json targetCommitish -q .targetCommitish) &&
@@ -154,18 +131,9 @@ SHA=$(gh release view "vX.Y.Z" --json targetCommitish -q .targetCommitish) &&
   gh release delete "vX.Y.Z" --yes   # NOT --cleanup-tag: that deletes the tag just pushed
 ```
 
-The tag has to be created by hand because only the final GitHub-release flip creates it, and that never ran — so the newest tag is still `vX.Y.(Z-1)` and `cargo xtask version --check` would reject `X.Y.Z+1` as a two-step jump, blocking the bump commit both locally and in Lint.
+The tag has to be created by hand because only the final GitHub-release flip creates it, and that never ran — so the newest tag is still `vX.Y.(Z-1)` and `cargo xtask version --check` would reject `X.Y.(Z+1)` as a two-step jump, blocking the bump commit both locally and in Lint.
 
-Then bump every publishable member's manifest to `X.Y.Z+1` (`cargo metadata` above lists them; today that is `Cargo.toml`, `macros/Cargo.toml` and `cargo-skuld/Cargo.toml`), fix the root cause, and re-run both workflows with the new version. Because the bump is lockstep, `cargo-skuld` then has no `X.Y.Z` at all — a gap in its version line is the accepted cost of a shared workspace version, not a problem to work around.
-
-**All three published.** Whatever failed afterwards — the GitHub-release flip, or `cargo publish` itself during the index-visibility wait — nothing is wrong on crates.io. Do **not** yank, and do **not** bump: the release is complete apart from its tag.
-
-Pin `--target` explicitly rather than trusting the draft's current target field. The automated flip does the same, and for the same reason: an edit to the draft since the run checked out and built the tree — plausible here, since a manual recovery can happen well after the run, unlike the run's own few-second gap between resolving the SHA and flipping — would otherwise tag a commit that was never actually published. Read `SHA` from the failed run's own **"Verify draft release exists and resolve commit SHA"** step output (`commit_sha`), not from re-querying the live draft:
-
-```sh
-SHA=<commit_sha from the failed run's "Verify draft release exists and resolve commit SHA" step>
-gh release edit "vX.Y.Z" --draft=false --target "$SHA"
-```
+Then bump every publishable member's manifest to `X.Y.(Z+1)` (`.github/scripts/publishable-members.sh` lists them; today that is `Cargo.toml`, `macros/Cargo.toml` and `cargo-skuld/Cargo.toml`), fix the root cause if there is one, and re-run both workflows with the new version. Because the bump is lockstep, a member that published cleanly at `X.Y.Z` and was never yanked keeps that version in its history, while a yanked or never-reached one does not — a gap or a yank in one crate's version line is the accepted cost of a shared workspace version, not a problem to work around.
 
 ### Useful commands during a release
 
