@@ -16,9 +16,30 @@ jobs:
   publish:
     name: Verify and publish
     runs-on: ubuntu-latest
-    # The Deploy environment scopes CARGO_REGISTRY_TOKEN to this job and
-    # enforces any environment protection rules (required reviewers, wait
-    # timers) configured in the repo.
+    # Deliberately no *job-level* `timeout-minutes` — the steps before the
+    # upload carry their own instead. A job deadline spans the publish step,
+    # and crates.io commits each upload server-side, so cancelling part-way
+    # through leaves the workspace partially published with no tag: the state
+    # the timeout would exist to avoid, caused by the timeout. A job timer
+    # would also start before the token exists, so on a cold cache the
+    # up-front verification build (see the step below) could itself eat much
+    # of any deadline before the upload even begins.
+    #
+    # Two deadlines remain that no timeout setting here can remove: the minted
+    # token lives ~30 minutes, and GitHub caps any job at 6 hours. Both span
+    # the upload. What keeps them from mattering is the step order below — the
+    # verification build runs before the token is minted, so only the uploads
+    # themselves race the credential. Should one still expire mid-upload, the
+    # run stops without the RELEASE COMPLETE marker, and CONTRIBUTING.md's
+    # recovery section covers that state.
+    #
+    # The Deploy environment is named in each crate's crates.io trusted-publisher
+    # config, so the OIDC token minted below is only accepted from a run that
+    # declares it.
+    #
+    # It deliberately has no protection rules or deployment branch policy — the
+    # owner decided against restricting it to `main` (2026-09-26) — so it is
+    # not an authorization control. See CONTRIBUTING.md.
     #
     # Real preflight (version validation, CI matrix, cargo publish dry-run)
     # happens in draft-release.yaml before a draft can exist. This workflow
@@ -30,27 +51,35 @@ jobs:
       # returns drafts: per GitHub docs, drafts are only returned "if the
       # user has push access", which means write-level auth.
       contents: write
+      # Lets the runner mint the OIDC JWT that crates.io exchanges for a
+      # short-lived publish token. Both scopes must be listed: declaring any
+      # `permissions:` block sets every unlisted scope to `none`.
+      id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Normalize and validate version
         id: version
+        timeout-minutes: 5
         env:
           INPUT_VERSION: ${{ inputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          V="${INPUT_VERSION#v}"
-          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Invalid version: '${INPUT_VERSION}'"
-            exit 1
-          fi
+          # Validation, and its rationale (leading-`v` and leading-zero
+          # rejection), live in normalize-version.sh — shared with
+          # draft-release.yaml so both copies stay identical.
+          V=$(.github/scripts/normalize-version.sh "$INPUT_VERSION")
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "tag=v${V}" >> "$GITHUB_OUTPUT"
 
       - name: Verify draft release exists and resolve commit SHA
         id: release
+        # Every step ahead of the upload is bounded, so a hung run cannot sit on
+        # the concurrency group until GitHub's 6-hour cap. The upload itself and
+        # the draft flip are deliberately unbounded: see the note on the job.
+        timeout-minutes: 5
         env:
           TAG: ${{ steps.version.outputs.tag }}
         shell: bash
@@ -75,7 +104,16 @@ jobs:
           fi
           echo "commit_sha=$TARGET" >> "$GITHUB_OUTPUT"
 
+          # A step *output* is not visible anywhere in the log or the UI, only
+          # to later steps/jobs — so an operator reading this run to recover
+          # manually has nowhere to find $TARGET unless it is also printed
+          # here. Both the log and the summary, same reasoning as the
+          # RELEASE COMPLETE marker below: a summary write failure must not
+          # hide the one value manual recovery needs.
+          echo "Resolved $TAG -> $TARGET" | tee -a "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/checkout@v4
+        timeout-minutes: 10
         with:
           ref: ${{ steps.release.outputs.commit_sha }}
           # fetch-depth: 0 so `cargo xtask version --check --exact` sees
@@ -83,33 +121,118 @@ jobs:
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-rust
+        timeout-minutes: 15
 
       - name: Re-verify workspace version matches release
-        # Belt-and-suspenders: the checked-out commit's Cargo.toml must agree
-        # with the version being published.
+        timeout-minutes: 20
         env:
           TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
           git tag "$TAG"
           cargo xtask version --check --exact
 
+          # `--exact` alone does not tie the input to the manifest. It is
+          # satisfied by ANY version tag on the nearest tagged ancestor, so once
+          # that commit carries a tag matching the manifest, the tag created
+          # just above is merely one more alternative and any input passes.
+          #
+          # Stage 1 gates this, but stage 1's verdict is only transitive — it
+          # applies to the commit the draft recorded, and this job already
+          # treats the draft's target as mutable (which is why the flip below
+          # re-asserts the SHA). Re-assert the version against the tree that is
+          # actually about to be uploaded; this is the irreversible stage.
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          versions=$(printf '%s' "$metadata" | jq -r '.packages[] | select(.publish != []) | .version' | sort -u)
+          version_count=$(printf '%s\n' "$versions" | wc -l)
+          if [ "$version_count" -ne 1 ]; then
+            # Unreachable: `cargo xtask version --check --exact` two lines
+            # above already asserted every publishable member agrees on
+            # version, on this exact tree. If this fires, xtask and this check
+            # have drifted out of sync — treat it as a bug in the tooling, not
+            # a manifest problem to fix by re-tagging.
+            version_list=$(printf '%s' "$versions" | tr '\n' ' ')
+            echo "::error::BUG: publishable members disagree on version (${version_list}) despite cargo xtask version --check --exact already asserting agreement above."
+            exit 1
+          fi
+          if [ "$versions" != "$VERSION" ]; then
+            echo "::error::The commit this release points at has manifest version ${versions}, but this run is publishing ${VERSION}. cargo would upload ${versions} under the tag ${TAG}. Recreate the draft from a commit whose manifests say ${VERSION}."
+            exit 1
+          fi
+
+      # The verification build runs BEFORE the token exists. `cargo publish`
+      # would otherwise do it inside the credential's ~30-minute window, and on
+      # a cold cache compiling the publishable crates (rusqlite builds SQLite
+      # from C) can consume most of that — expiring the token part-way through
+      # the uploads, which is precisely a partial publish. Doing it here leaves
+      # only the upload inside the window.
+      #
+      # The member list is built explicitly rather than using `--workspace`,
+      # which packages `publish = false` members too. That is a superset of what
+      # `cargo publish --workspace` uploads, in both directions that matter: it
+      # drags unpublishable members' dependency trees into the very build this
+      # step exists to keep short, and it enforces packaging rules on crates
+      # that are never packaged — an unversioned path dependency is legal in a
+      # `publish = false` member and fails `cargo package`, so stage 1 would
+      # pass and this step would fail after the draft exists.
+      - name: Package and verify the publishable members
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+          members=$(.github/scripts/publishable-members.sh)
+          args=()
+          while read -r c; do
+            [ -n "$c" ] || continue
+            args+=(-p "$c")
+          done <<< "$members"
+          cargo package --locked "${args[@]}"
+
+      - name: Mint a short-lived crates.io token by OIDC
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+        timeout-minutes: 5
+
       - name: Publish the workspace to crates.io
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         # cargo 1.90+ publishes multiple workspace members in topological order
-        # (skuld-macros, then skuld, then cargo-skuld) and waits for each to appear on the
-        # sparse index before publishing the next. This replaces the manual
-        # publish-wait-publish dance.
-        run: cargo publish --workspace --locked
+        # (skuld-macros, then skuld, then cargo-skuld), waiting for each to
+        # appear on the sparse index before the next.
+        #
+        # `--no-verify` because the step above already ran the verification
+        # build, on this commit and over exactly this member set — that is what
+        # keeps the token window down to the uploads. Stage 1's dry-run is not
+        # the justification: it runs against `github.sha`, while this job builds
+        # the draft's target, and those can differ (which is why the flip below
+        # re-asserts the SHA). `--no-verify` skips only that local verification
+        # build; registry-side limits such as crates.io's upload size cap still
+        # apply at upload regardless, and nothing before this step exercises
+        # them.
+        run: cargo publish --workspace --locked --no-verify
 
       - name: Publish GitHub release
         env:
           TAG: ${{ steps.version.outputs.tag }}
           REPO: ${{ github.repository }}
+          COMMIT_SHA: ${{ steps.release.outputs.commit_sha }}
         shell: bash
         run: |
           set -euo pipefail
-          gh release edit "$TAG" --draft=false
-          echo "Release published: https://github.com/${REPO}/releases/tag/$TAG"
+          # Re-assert the target. The flip is what creates the tag, and it uses
+          # the release's target as it stands *now* — an edit to the draft
+          # between the earlier resolution and this point would otherwise tag a
+          # commit nobody verified. Pin it to the SHA this run actually built.
+          gh release edit "$TAG" --draft=false --target "$COMMIT_SHA"
+
+          # Completion marker, to both the log and the summary: the operator is
+          # told to read the log, and the summary is what a reader sees first.
+          #
+          # `crates-io-auth-action` revokes its minted token in a post step, and
+          # fails the job if that revoke fails — post steps run after every
+          # regular step, so after this one. A red run carrying this marker is a
+          # finished release: take no action.
+          echo "RELEASE COMPLETE: $TAG published to crates.io and GitHub — https://github.com/${REPO}/releases/tag/$TAG. If this run is red, the failure came after this point and the release is done." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
