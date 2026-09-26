@@ -90,10 +90,7 @@ if [ "$V" = X.Y.Z ]; then
   echo "Set V to the version you were publishing, then re-run."; exit 1
 fi
 
-members=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
-if [ -z "$members" ]; then
-  echo "Could not enumerate publishable members. Fix that before trusting anything below."; exit 1
-fi
+members=$(.github/scripts/publishable-members.sh) || exit 1
 
 for c in $members; do
   # Same helper the release workflow uses, so the two cannot disagree about

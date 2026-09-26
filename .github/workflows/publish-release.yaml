@@ -170,11 +170,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          members=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
-          if [ -z "$members" ]; then
-            echo "::error::No publishable workspace members found. Expected at least one."
-            exit 1
-          fi
+          members=$(.github/scripts/publishable-members.sh)
           args=()
           while read -r c; do
             [ -n "$c" ] || continue

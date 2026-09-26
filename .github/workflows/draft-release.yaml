@@ -138,11 +138,7 @@ jobs:
           # times and report every member as fine — this gate failing open in
           # the stage that exists to catch exactly that.
           metadata=$(cargo metadata --no-deps --format-version 1)
-          members=$(printf '%s' "$metadata" | jq -r '.packages[] | select(.publish != []) | .name')
-          if [ -z "$members" ]; then
-            echo "::error::No publishable workspace members found. Expected at least one."
-            exit 1
-          fi
+          members=$(.github/scripts/publishable-members.sh)
 
           # The version that gets uploaded is the manifest's, not the operator's
           # input, and the two can differ: `cargo xtask version --check --exact`
