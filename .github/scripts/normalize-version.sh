@@ -16,10 +16,10 @@
 # a tag — the one check tying input to manifest would no-op for exactly those
 # spellings.
 #
-# This lives in a script, alongside crate-index-path.sh, because both release
-# workflows validate the same operator input the same way: a fix to one copy
-# of this regex and not the other would silently reopen the double-publish
-# race described above.
+# This lives in a script, alongside publishable-members.sh and crate-state.sh,
+# because both release workflows validate the same operator input the same
+# way: a fix to one copy of this regex and not the other would silently
+# reopen the double-publish race described above.
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
