@@ -136,6 +136,12 @@ jobs:
       # `cargo publish --dry-run` warns "already exists on crates.io" and still
       # exits 0, so without this check a re-dispatch of a published version
       # passes stage 1 and fails part-way through the irreversible upload.
+      #
+      # Uses `crate-state.sh`, which reads the crates.io JSON API, rather than
+      # the sparse index: the index is CDN-cached for 600s, long enough to
+      # still read "absent" right after a real upload, which is exactly the
+      # state this check exists to catch. `crate-state.sh` fails closed on any
+      # ambiguous response instead of guessing.
       - name: Check crates.io state for every publishable member
         timeout-minutes: 10
         env:
@@ -177,44 +183,49 @@ jobs:
 
           new=()
           taken=()
+          yanked=()
           while read -r c; do
             [ -n "$c" ] || continue
-            path=$(.github/scripts/crate-index-path.sh "$c")
 
-            # Branch on curl's exit status, not on the status code it wrote.
-            # curl emits `%{http_code}` even when the transfer fails, and once
-            # response headers have arrived that value is 200 — so a connection
-            # cut mid-body yields "200" plus a SHORT body. The index lists
-            # versions in publication order, which puts the one being checked on
-            # the last line: exactly what a truncation drops. Trusting the
-            # written code would clear a version that is in fact taken.
-            if out=$(curl -sS --retry 3 --retry-all-errors --max-time 30 \
-                -w '\n%{http_code}' -X GET "https://index.crates.io/$path"); then
-              code=$(printf '%s\n' "$out" | tail -n 1)
-            else
-              code="000"
-            fi
-
-            # `-f` would collapse "404, never published" into the same non-zero
-            # exit as a network failure, and the two need opposite handling; it
-            # also treats a 3xx as success, reading a redirect as "published".
-            case "$code" in
-              200)
-                # -F: the version is a literal, and an unescaped `.` would match
-                # any character.
-                if printf '%s\n' "$out" | grep -qF "\"vers\":\"${VERSION}\""; then
-                  taken+=("$c")
-                fi
+            # No-version query: never-published means stage 2 could never
+            # publish this member at all (see "Adding a publishable member"
+            # in CONTRIBUTING.md). `state=$(...)` as a plain assignment, not
+            # inside a `[` test — `set -e` sees a failing command substitution
+            # there and aborts, which is what makes crate-state.sh's own
+            # refusals fatal here instead of silently read as "exists".
+            state=$(.github/scripts/crate-state.sh "$c")
+            case "$state" in
+              exists) ;;
+              never-published)
+                new+=("$c")
+                continue
                 ;;
-              404) new+=("$c") ;;
               *)
-                echo "::error::Unexpected HTTP $code from the crates.io index for '$c'. Refusing to guess; re-run when the registry is reachable."
+                echo "::error::Unrecognized state '$state' for $c — refusing to continue."
+                exit 1
+                ;;
+            esac
+
+            # With-version query: crates.io reserves a version permanently on
+            # first upload, whether or not it later gets yanked, so both
+            # `published` and `yanked` mean this version can never be
+            # published again.
+            vstate=$(.github/scripts/crate-state.sh "$c" "$VERSION")
+            case "$vstate" in
+              absent) ;;
+              published) taken+=("$c") ;;
+              yanked)
+                taken+=("$c")
+                yanked+=("$c")
+                ;;
+              *)
+                echo "::error::Unrecognized state '$vstate' for $c ${VERSION} — refusing to continue."
                 exit 1
                 ;;
             esac
           done <<< "$members"
 
-          # Report both problems in one run rather than one per re-dispatch.
+          # Report every problem in one run rather than one per re-dispatch.
           fail=0
           if [ ${#new[@]} -ne 0 ]; then
             echo "::error::Never published: ${new[*]}. Stage 2 authenticates by trusted publishing, and a crate that does not exist cannot have a publisher configured. Follow \"Adding a publishable member\" in CONTRIBUTING.md, then re-run."
@@ -222,6 +233,10 @@ jobs:
           fi
           if [ ${#taken[@]} -ne 0 ]; then
             echo "::error::crates.io already has ${VERSION} for: ${taken[*]}. That version is reserved permanently and can never be republished. Bump and re-run."
+            fail=1
+          fi
+          if [ ${#yanked[@]} -ne 0 ]; then
+            echo "::error::Of those, ${yanked[*]} are specifically YANKED at ${VERSION} — that slot is spent for good."
             fail=1
           fi
           [ "$fail" -eq 0 ] || exit 1

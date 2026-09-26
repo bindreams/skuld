@@ -193,27 +193,103 @@ jobs:
           done <<< "$members"
           cargo package --locked "${args[@]}"
 
+      # Idempotency guard: makes a run that failed or was cancelled after this
+      # point safe to re-dispatch at the same version. `cargo publish
+      # --workspace` is not itself idempotent — re-uploading an already-published
+      # member errors immediately and aborts the whole multi-package publish, so
+      # without this a partial publish could only be finished by hand (see
+      # Recovery in CONTRIBUTING.md).
+      #
+      # Uses the crates.io JSON API (`crate-state.sh`), not the sparse index:
+      # the index is CDN-cached for 600s, and a re-dispatch after a cancelled
+      # run can land seconds after the prior attempt's uploads. Every branch
+      # fails closed — a wrong "absent" verdict would try to re-publish a
+      # member that is already live, and a wrong "published" verdict would
+      # skip one that never went out, leaving the release incomplete.
+      - name: Classify crates.io state for every publishable member
+        id: crate_state
+        timeout-minutes: 10
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # `$(...)` in a plain assignment, not inside a `[` test — `set -e`
+          # aborts on that, which is what makes publishable-members.sh's own
+          # fail-closed refusal fatal here instead of an empty member list.
+          members=$(.github/scripts/publishable-members.sh)
+
+          already=""
+          pending=""
+          total=0
+          for c in $members; do
+            total=$((total + 1))
+            state=$(.github/scripts/crate-state.sh "$c" "$VERSION")
+            case "$state" in
+              published) already="$already $c" ;;
+              absent) pending="$pending $c" ;;
+              yanked)
+                echo "::error::$c ${VERSION} is published but YANKED — that version slot is spent for good."
+                echo "::error::Re-running cannot fix this. Follow the Recovery section (abandon-and-bump path) in CONTRIBUTING.md."
+                exit 1
+                ;;
+              *)
+                echo "::error::Unrecognized state '$state' for $c — refusing to continue."
+                exit 1
+                ;;
+            esac
+          done
+
+          already="${already# }"
+          pending="${pending# }"
+          echo "already_published=$already" >> "$GITHUB_OUTPUT"
+          if [ -z "$pending" ]; then
+            echo "all_published=true" >> "$GITHUB_OUTPUT"
+            echo "All $total publishable members are already at ${VERSION}; finishing the release without publishing again."
+          else
+            echo "all_published=false" >> "$GITHUB_OUTPUT"
+            echo "Already at ${VERSION}: ${already:-none}. Publishing the rest: ${pending}."
+          fi
+
       - name: Mint a short-lived crates.io token by OIDC
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
+        if: steps.crate_state.outputs.all_published != 'true'
         timeout-minutes: 5
 
       - name: Publish the workspace to crates.io
+        if: steps.crate_state.outputs.all_published != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          ALREADY_PUBLISHED: ${{ steps.crate_state.outputs.already_published }}
         # cargo 1.90+ publishes multiple workspace members in topological order
         # (skuld-macros, then skuld, then cargo-skuld), waiting for each to
-        # appear on the sparse index before the next.
+        # appear on the sparse index before the next. `--exclude` drops
+        # whichever ones the guard step above found already `published` at this
+        # version — cargo then resolves them from the registry like any other
+        # dependency, since they are genuinely there.
         #
-        # `--no-verify` because the step above already ran the verification
-        # build, on this commit and over exactly this member set — that is what
-        # keeps the token window down to the uploads. Stage 1's dry-run is not
-        # the justification: it runs against `github.sha`, while this job builds
-        # the draft's target, and those can differ (which is why the flip below
-        # re-asserts the SHA). What `--no-verify` does skip is the registry-side
-        # checks cargo makes at upload time, such as the size cap.
-        run: cargo publish --workspace --locked --no-verify
+        # `--no-verify` because the packaging step above already ran the
+        # verification build, on this commit and over the whole member set —
+        # that is what keeps the token window down to the uploads. Stage 1's
+        # dry-run is not the justification: it runs against `github.sha`, while
+        # this job builds the draft's target, and those can differ (which is
+        # why the flip below re-asserts the SHA). What `--no-verify` does skip
+        # is the registry-side checks cargo makes at upload time, such as the
+        # size cap.
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--workspace --locked --no-verify)
+          for c in $ALREADY_PUBLISHED; do
+            args+=(--exclude "$c")
+          done
+          cargo publish "${args[@]}"
 
+      # No `if:` — this runs even when the guard step above found every member
+      # already published, so a re-dispatch that only needs to finish the flip
+      # (see Recovery in CONTRIBUTING.md) still completes the release.
       - name: Publish GitHub release
         env:
           TAG: ${{ steps.version.outputs.tag }}
