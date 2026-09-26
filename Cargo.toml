@@ -46,6 +46,12 @@ tokio = { version = "1", features = ["rt"], optional = true }
 [target.'cfg(unix)'.dependencies]
 # dup/dup2/close for swapping stdout/stderr fds during per-test capture.
 libc = "0.2"
+# src/coordination/lock.rs's flock calls: std::fs::File::lock()/try_lock()
+# aren't implemented on every Unix target std itself lists as flock-capable
+# (Android is the concrete gap — see that module's doc), so lock.rs calls
+# rustix::fs::flock directly on every Unix instead. Already pulled in
+# transitively via tempfile; this only promotes it to a direct dependency.
+rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 # Two parallel fd namespaces exist on Windows:

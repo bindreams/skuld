@@ -11,7 +11,7 @@
 //! this doesn't depend on whatever the platform's real (much higher, and
 //! environment-dependent) default limit happens to be.
 //!
-//! Regression guard for M-a: `open_lock_target`'s single open-and-panic (no
+//! Regression guard: `open_lock_target`'s single open-and-panic (no
 //! retry loop) must turn that `EMFILE` into an immediate panic, not an
 //! infinite spin that mistakes "can't open" for "try again."
 //!

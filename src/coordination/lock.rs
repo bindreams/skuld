@@ -1,19 +1,25 @@
 //! Blocking cross-process advisory lock serializing creation, publication,
 //! and schema initialization of the coordination database.
 //!
-//! Whoever holds a blocking, exclusive advisory lock (`flock` on Unix,
-//! `LockFileEx` on Windows, via [`std::fs::File`]'s own native
-//! `lock`/`unlock`, stable since Rust 1.89.0 — `fs4`/`fd-lock` expose the
-//! identical primitive through the same method names, but an inherent
-//! method always wins Rust's resolution over an identically-named trait
-//! method, so depending on either crate here would only add a dead `use`
-//! line) on the lock target below is the only actor in the whole system
-//! allowed to create, publish, or initialize `.skuld.db` at that instant;
-//! every other [`super::connect`]/[`super::open_db`] call blocks until it
-//! releases. That removes the specific create/publish and
-//! cold-start-negotiation races those two functions document, not all
-//! waiting: `busy_timeout` and SQLite's own locking still apply to work
-//! done *while* this lock is held.
+//! Whoever holds a blocking, exclusive advisory lock on the lock target
+//! below is the only actor in the whole system allowed to create, publish,
+//! or initialize `.skuld.db` at that instant; every other
+//! [`super::connect`]/[`super::open_db`] call blocks until it releases. That
+//! removes the specific create/publish and cold-start-negotiation races
+//! those two functions document, not all waiting: `busy_timeout` and
+//! SQLite's own locking still apply to work done *while* this lock is held.
+//!
+//! The lock itself is `flock` on Unix, `LockFileEx` on Windows — but the two
+//! platforms reach it through different code. Windows goes through
+//! [`std::fs::File`]'s own native `lock`/`try_lock` (stable since Rust
+//! 1.89.0). Unix goes through [`rustix::fs::flock`] instead of that same
+//! `std::fs::File` API: std only implements `lock`/`try_lock` on a subset of
+//! the Unix targets it otherwise treats as `flock`-capable, and Android is
+//! missing from that subset — calling `std`'s version there panics
+//! `"lock() not supported"` on every `open_db`/`TestRegistration::drop`
+//! instead of ever acquiring anything. `rustix::fs::flock` calls the same
+//! underlying syscall directly on every Unix this crate supports, Android
+//! included.
 //!
 //! **The lock target can't be deleted or replaced by anything short of
 //! recreating the directory (Unix) or the file (Windows) it lives at.** That
@@ -63,7 +69,7 @@
 //! nothing to retry. On Unix specifically, a filesystem whose `flock` refuses
 //! to operate on a directory at all (some network filesystems' emulated
 //! `flock`, NFS's included) surfaces the same way: the `open` above still
-//! succeeds, but the subsequent `lock()` call in [`with_init_lock`] fails and
+//! succeeds, but the subsequent acquire in [`with_init_lock`] fails and
 //! panics, naming the path — there is no fallback to a different locking
 //! mechanism.
 
@@ -100,19 +106,16 @@ pub(super) fn lock_path(db_path: &Path) -> PathBuf {
 /// therefore can never leave the lock held.
 pub(super) fn with_init_lock<T>(db_path: &Path, f: impl FnOnce() -> T) -> T {
     let target = open_lock_target(db_path);
-    target
-        .lock()
+    lock_exclusive(&target)
         .unwrap_or_else(|e| panic!("skuld: failed to acquire coordination DB init lock for {db_path:?}: {e}"));
     f()
 }
 
-/// Open `db_path`'s lock target, ready to be `lock()`ed or `try_lock()`ed:
-/// `db_path`'s parent directory on Unix, [`lock_path`]'s file on Windows
-/// (see the module doc for why either one is safe to open once and never
-/// recheck). A single open, never retried: any failure here is either
-/// external interference (a missing parent directory) or resource
-/// exhaustion (`EMFILE`), and neither resolves by trying again, so this
-/// panics immediately instead of looping.
+/// Open `db_path`'s lock target, ready to be locked or try-locked (via
+/// [`lock_exclusive`]/[`try_lock_exclusive`]): `db_path`'s parent directory
+/// on Unix, [`lock_path`]'s file on Windows (see the module doc for why
+/// either one is safe to open once and never recheck, and why a failed open
+/// here panics immediately instead of retrying).
 pub(super) fn open_lock_target(db_path: &Path) -> File {
     #[cfg(unix)]
     {
@@ -158,4 +161,50 @@ pub(super) fn open_lock_target(db_path: &Path) -> File {
             .open(&path)
             .unwrap_or_else(|e| panic!("skuld: failed to open coordination DB init lock file {path:?}: {e}"))
     }
+}
+
+/// Block until `target`'s exclusive advisory lock is acquired. See the
+/// module doc for why Unix goes through [`rustix::fs::flock`] here instead
+/// of `std::fs::File::lock` — std's version isn't implemented on every Unix
+/// target this crate supports.
+#[cfg(unix)]
+fn lock_exclusive(target: &File) -> std::io::Result<()> {
+    rustix::fs::flock(target, rustix::fs::FlockOperation::LockExclusive).map_err(Into::into)
+}
+
+/// Block until `target`'s exclusive advisory lock is acquired, via
+/// `std::fs::File::lock` (`LockFileEx` under the hood) — Windows has no gap
+/// for this to work around, see the module doc.
+#[cfg(windows)]
+fn lock_exclusive(target: &File) -> std::io::Result<()> {
+    target.lock()
+}
+
+/// Attempt to acquire `target`'s exclusive advisory lock without blocking,
+/// reporting [`std::fs::TryLockError::WouldBlock`] if another handle
+/// already holds it rather than waiting. Used only by this crate's own test
+/// probes (`super::probe_try_init_lock`, and the in-process `try_lock` tests
+/// in `lock_tests.rs`) — `with_init_lock` itself always blocks via
+/// [`lock_exclusive`].
+#[cfg(unix)]
+pub(super) fn try_lock_exclusive(target: &File) -> Result<(), std::fs::TryLockError> {
+    match rustix::fs::flock(target, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(()),
+        Err(errno) => {
+            let err: std::io::Error = errno.into();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                Err(std::fs::TryLockError::WouldBlock)
+            } else {
+                Err(std::fs::TryLockError::Error(err))
+            }
+        }
+    }
+}
+
+/// Attempt to acquire `target`'s exclusive advisory lock without blocking,
+/// via `std::fs::File::try_lock` (`LockFileEx` under the hood) — Windows has
+/// no gap for this to work around, see the module doc.
+#[cfg(windows)]
+pub(super) fn try_lock_exclusive(target: &File) -> Result<(), std::fs::TryLockError> {
+    target.try_lock()
 }

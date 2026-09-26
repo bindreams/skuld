@@ -1980,6 +1980,7 @@ dependencies = [
  "pest_derive",
  "proptest",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yml",

@@ -582,6 +582,7 @@ dependencies = [
  "pest",
  "pest_derive",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yml",

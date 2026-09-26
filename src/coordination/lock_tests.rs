@@ -7,7 +7,7 @@ use std::sync::Barrier;
 
 #[cfg(windows)]
 use super::lock::lock_path;
-use super::lock::{open_lock_target, with_init_lock};
+use super::lock::{open_lock_target, try_lock_exclusive, with_init_lock};
 
 #[cfg(windows)]
 #[test]
@@ -132,7 +132,7 @@ fn a_fresh_try_lock_reports_would_block_while_with_init_lock_holds_the_lock() {
 
     with_init_lock(&db_path, || {
         let fresh = open_lock_target(&db_path);
-        match fresh.try_lock() {
+        match try_lock_exclusive(&fresh) {
             Err(std::fs::TryLockError::WouldBlock) => {}
             other => panic!(
                 "a fresh handle's try_lock() must report WouldBlock while with_init_lock \
@@ -142,15 +142,10 @@ fn a_fresh_try_lock_reports_would_block_while_with_init_lock_holds_the_lock() {
     });
 }
 
-/// Regression guard for M-b: a missing parent directory must panic
-/// `with_init_lock` immediately, not spin forever treating "can't open" as
-/// "try again." Before this module's redesign, the identity-check retry
-/// loop treated a `NotFound` from the lock file's own open the same way
-/// `connect_with`'s absence loop treats a genuinely-absent `.skuld.db` —
-/// worth retrying — which is wrong for the lock target itself: a missing
-/// parent directory doesn't resolve on its own by trying the open again.
-/// `open_lock_target` now has no loop at all, so there's nothing left to
-/// spin; this proves the failure surfaces as an immediate panic instead.
+/// Regression guard: a missing parent directory must panic `with_init_lock`
+/// immediately, not spin forever treating "can't open" as "try again."
+/// `open_lock_target` has no retry loop, so a missing directory can't
+/// resolve itself by trying the open again.
 #[test]
 fn with_init_lock_panics_immediately_when_the_profile_directory_does_not_exist_instead_of_spinning() {
     let dir = tempfile::tempdir().unwrap();

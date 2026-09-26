@@ -1,4 +1,4 @@
-//! Regression guard for M-a: with zero file descriptors left to spend (the
+//! Regression guard: with zero file descriptors left to spend (the
 //! probe's `RLIMIT_NOFILE` soft limit is lowered to exactly the 3 already
 //! open — stdin/stdout/stderr — leaving none free), opening the coordination
 //! DB's lock target fails `EMFILE`; `open_lock_target` must turn that into

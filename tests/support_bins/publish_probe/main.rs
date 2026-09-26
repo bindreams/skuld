@@ -55,11 +55,15 @@ fn main() {
         // contended instead of relying on process-launch scheduling to
         // overlap it. Releasing all children together does not *guarantee*
         // the EEXIST path is hit on any given run — the driver still
-        // releases them one write() at a time, and a child that only starts
-        // after the winner's rename still attempts its own publish, but the
-        // rename itself fails `EEXIST` against the now-published file and
-        // no-ops — so this test's assertions don't depend on which timing
-        // is hit; the deterministic EEXIST case is
+        // releases them one write() at a time, and `connect_with` tries the
+        // open before ever publishing, so a child whose open lands after the
+        // winner's rename has already landed just opens the now-published
+        // file directly and never calls `ensure_published` at all; only a
+        // child whose open lands during the initial absence window attempts
+        // its own publish, and if it loses the race that rename fails
+        // `EEXIST` against the winner's file and no-ops before it loops back
+        // and reopens successfully — so this test's assertions don't depend
+        // on which timing is hit; the deterministic EEXIST case is
         // `a_lost_publish_race_uses_the_winners_file` in
         // `src/coordination/publish_tests.rs`.
         let mut out = std::io::stdout();

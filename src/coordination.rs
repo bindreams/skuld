@@ -145,15 +145,9 @@ fn connect_locked(path: &std::path::Path) -> rusqlite::Connection {
 /// race.
 ///
 /// A single `symlink_metadata` call after a failed open can't, on its own,
-/// tell a genuinely broken entry (dangling symlink, directory) apart from
-/// genuine absence — a concurrent publisher's rename landing between this
-/// open and the recheck would present identically. The caller holding
-/// `path`'s init lock resolves that ambiguity: no other *Skuld* connection
-/// can be publishing `path` right now, so a `symlink_metadata` recheck that
-/// still finds nothing there is genuine absence — caused only by something
-/// outside Skuld, since the lock excludes every other Skuld process — and a
-/// recheck that finds something there despite `ensure_published`'s
-/// guarantee is genuinely broken, not a race to wait out.
+/// tell a genuinely broken entry apart from genuine absence — see
+/// [`connect`]'s doc for how holding `path`'s init lock resolves that
+/// ambiguity.
 ///
 /// Absence loops, uncapped, republishing and reopening each time: nothing
 /// bounds how many times something outside Skuld can delete `path` between
@@ -162,7 +156,23 @@ fn connect_locked(path: &std::path::Path) -> rusqlite::Connection {
 /// broken entry never loops — it can't become un-broken by retrying — and
 /// panics immediately.
 #[cfg(unix)]
-fn connect_with(path: &std::path::Path, mut ensure_published: impl FnMut(&std::path::Path)) -> rusqlite::Connection {
+fn connect_with(path: &std::path::Path, ensure_published: impl FnMut(&std::path::Path)) -> rusqlite::Connection {
+    connect_with_hooks(path, |_| {}, ensure_published)
+}
+
+/// [`connect_with`]'s actual implementation, additionally parameterized
+/// over a hook run right after a failed open but before the
+/// `symlink_metadata` recheck that follows it. Exists only so
+/// `coordination_tests` can land a real publish in that exact gap and prove
+/// `connect_with` panics — rather than silently succeeding — when a
+/// concurrent, lock-unexcluded publisher wins that race; every real caller
+/// goes through [`connect_with`] above, which passes a no-op here.
+#[cfg(unix)]
+fn connect_with_hooks(
+    path: &std::path::Path,
+    mut before_recheck: impl FnMut(&std::path::Path),
+    mut ensure_published: impl FnMut(&std::path::Path),
+) -> rusqlite::Connection {
     let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
         | rusqlite::OpenFlags::SQLITE_OPEN_URI
         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -173,6 +183,7 @@ fn connect_with(path: &std::path::Path, mut ensure_published: impl FnMut(&std::p
                 if !is_cantopen(&e) {
                     panic!("skuld: could not open coordination DB {path:?}: {e}");
                 }
+                before_recheck(path);
                 if !path_is_absent(path) {
                     panic!("skuld: could not open coordination DB {path:?}: {e}");
                 }
@@ -278,7 +289,7 @@ pub(crate) fn probe_hold_init_lock(path: &std::path::Path, while_held: impl FnOn
 /// only a genuinely separate handle (here, in a genuinely separate process)
 /// can observe contention against the held lock.
 pub(crate) fn probe_try_init_lock(path: &std::path::Path) -> Result<(), std::fs::TryLockError> {
-    lock::open_lock_target(path).try_lock()
+    lock::try_lock_exclusive(&lock::open_lock_target(path))
 }
 
 // Transient error classification =====

@@ -556,8 +556,7 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
         .collect();
 
     // Combined form for the plain arm, where there's no catch_unwind split
-    // to keep separate: fixture_get and its binding happen back to back,
-    // same as before this was split into three pieces.
+    // to keep separate: fixture_get and its binding happen back to back.
     let fixture_setup: Vec<_> = fixture_gets
         .iter()
         .zip(&fixture_bindings)

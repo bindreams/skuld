@@ -145,8 +145,10 @@ All notable changes to this project are documented in this file.
   mixes uids — but every connection now goes through one `connect()`
   helper (see below), which applies on every platform, Windows included.
   - `connect()` and `open_db()` now both run under a blocking, cross-process
-    advisory lock (`flock` on Unix, `LockFileEx` on Windows, via
-    `std::fs::File`'s own native `lock`/`unlock`), held for the whole
+    advisory lock (`flock` on Unix, via `rustix::fs::flock` — `std::fs::File`'s
+    own native `lock`/`unlock` isn't implemented on every Unix target this
+    crate supports, Android included; `LockFileEx` on Windows, via
+    `std::fs::File`'s own native `lock`/`unlock` there), held for the whole
     create-or-open-and-initialize sequence. Whoever holds it is the only
     actor in the system allowed to create, publish, or schema-initialize
     `.skuld.db` at that instant. On Windows, `connect()` still skips the

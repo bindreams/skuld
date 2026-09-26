@@ -564,17 +564,11 @@ fn drop_panics_loudly_on_a_corrupt_db_when_nothing_else_is_unwinding() {
 
 // Init lock file permissions =====
 
-/// Regression guard for H1, adapted to this module's directory-flock
-/// design: Unix locks `db_path`'s parent directory itself, not a sibling
-/// `.lock` file (see `lock.rs`'s module doc), so `open_db` must succeed
-/// (and never touch that file at all) even when a `.lock` file left behind
-/// by an older Skuld release — one that did lock a sibling file, published
-/// at whatever mode a root lane's umask gave it — has no owner write bit.
-/// Before this design, `open_lock_file` opened that file with
-/// `.write(true)`, which would fail `EACCES` here exactly the way a
-/// root-published, 0644-narrowed-by-umask lock file would fail a later
-/// non-root run; this proves the new design can't hit that failure mode at
-/// all, since it never opens the leftover file in the first place.
+/// Unix locks `db_path`'s parent directory itself, not a sibling `.lock`
+/// file (see `lock.rs`'s module doc), so `open_db` must succeed — and
+/// never touch that file at all — even when a `.lock` file left behind by
+/// an older Skuld release (one that did lock a sibling file, published at
+/// whatever mode a root lane's umask gave it) has no owner write bit.
 #[cfg(unix)]
 #[test]
 fn open_db_succeeds_and_ignores_a_leftover_lock_file_with_no_owner_write_bit() {
@@ -670,18 +664,24 @@ fn connect_with_retries_through_repeated_genuine_absence_with_no_attempt_cap() {
     );
 }
 
-/// Many threads racing `connect()` against the same, initially-absent path:
-/// one thread's failed open (genuinely absent at that instant) can have its
-/// `symlink_metadata` recheck land *after* a concurrent thread's publish has
-/// already landed the file — the open failed because of absence, but by the
-/// time this thread looks, absence is no longer what `symlink_metadata`
-/// reports. That must not be mistaken for a dangling-symlink/directory kind
-/// of brokenness and panic; the file is simply there now, and the very next
-/// open succeeds. Every thread must return a connection, never panic.
+/// Many threads racing `open_db` against the same, initially-absent path,
+/// each serialized through `path`'s init lock: since every `open_db` call
+/// runs its whole open/recheck/publish sequence under that lock (see
+/// `connect_with`'s doc), no two threads' opens, rechecks, or publishes can
+/// interleave — at most one thread ever sees genuine absence and publishes;
+/// every other thread, once it acquires the lock, finds the file already
+/// published and just opens it on the first try. Every thread must return a
+/// connection, never panic.
+///
+/// This does not exercise a recheck landing after a *concurrent* publish —
+/// the lock rules that out entirely for real callers; see
+/// `connect_with_panics_when_a_publish_lands_between_the_failed_open_and_the_recheck`
+/// for that interleaving, driven directly against the unlocked
+/// `connect_with` instead.
 ///
 /// Repeated across many fresh paths in one test (rather than relying on a
-/// single race) because the window this exercises is a handful of syscalls
-/// wide — one iteration is not a reliable enough probe on its own.
+/// single race) because a missing exclusion would only show up on some
+/// iterations, not all of them.
 #[cfg(unix)]
 #[test]
 fn connect_survives_many_threads_racing_the_same_absent_path() {
@@ -701,8 +701,8 @@ fn connect_survives_many_threads_racing_the_same_absent_path() {
                     // `connect()` deliberately doesn't (that's `open_db`'s
                     // job, not `connect`'s) — asserting through a bare
                     // `PRAGMA` here would conflate `SQLITE_BUSY` from that
-                    // missing timeout with the absence/TOCTOU race this
-                    // test targets.
+                    // missing timeout with the lock-serialized absence race
+                    // this test targets.
                     let _conn = open_db(&path);
                 });
             }
@@ -710,21 +710,62 @@ fn connect_survives_many_threads_racing_the_same_absent_path() {
     }
 }
 
-// The `SQLITE_READONLY` WAL cold-start race documented on `open_db` (a
-// connection that loses `PRAGMA journal_mode = WAL`'s negotiation over the
-// freshly-created `-shm` file can come back permanently readonly for its
-// own lifetime) has no direct regression test anywhere in this crate:
-// SQLite's own unix VFS serializes `-shm` creation across every thread *of
-// one process* through a process-local mutex, so the race is invisible to
-// threads sharing a process, only observable (if at all) between genuinely
-// separate OS processes — and even a genuine-subprocess version of this
-// same write-based probe (16 processes x 20 rounds, barrier-synchronized)
-// never reproduced it against pre-lock code either, so it was dropped
-// rather than kept as a test that had never demonstrably failed on the code
-// it was meant to guard. `tests/lock_contention_regression.rs` instead
-// deterministically guards the mechanism that removes this race outright —
-// `lock::with_init_lock`'s mutual exclusion — which is provable without
-// needing to reproduce the race it was built to remove.
+/// `connect_with` alone — unlike `connect()`/`open_db`, which always run it
+/// under `path`'s init lock — has no way to tell a legitimate concurrent
+/// publisher's rename, landing between the failed open and the
+/// `symlink_metadata` recheck, apart from a genuinely broken entry (a
+/// dangling symlink or a directory): both present as "something's there
+/// now" to that recheck, and `connect_with` panics either way (see its own
+/// doc). That is exactly the interleaving the init lock exists to rule out
+/// for every real caller. Proven here via `connect_with_hooks` — the same
+/// implementation `connect_with` itself runs on, with a hook landing a real
+/// publish in the gap between the failed open and the recheck
+/// deterministically, rather than via a race between threads: `connect_with`
+/// must panic, not silently succeed, confirming the lock — not the recheck
+/// logic itself — is what makes that interleaving safe.
+#[cfg(unix)]
+#[test]
+fn connect_with_panics_when_a_publish_lands_between_the_failed_open_and_the_recheck() {
+    let (_dir, path) = temp_db();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::coordination::connect_with_hooks(
+            &path,
+            // The simulated concurrent publisher: a legitimate publish,
+            // landing right where `connect_with`'s doc says an unlocked
+            // caller cannot tell it apart from a genuinely broken entry.
+            crate::coordination::publish::ensure_published,
+            |_p| {
+                panic!(
+                    "ensure_published must not run: the recheck should already have found the \
+                     path present (from the simulated concurrent publish) and panicked before \
+                     ever calling the publish hook"
+                )
+            },
+        )
+    }));
+
+    let payload = result.expect_err(
+        "connect_with must panic, not silently succeed, when its recheck finds a path a \
+         concurrent (lock-unexcluded) publisher already landed — this is why every real caller \
+         holds path's init lock for connect_with's whole open/recheck/publish sequence",
+    );
+    let msg = crate::coordination::panic_payload_message(payload.as_ref());
+    assert!(
+        msg.contains("could not open coordination DB"),
+        "panic message should be connect_with's own open-failure wording: {msg:?}"
+    );
+}
+
+// The `SQLITE_READONLY` WAL cold-start race documented on `open_db` has no
+// direct regression test anywhere in this crate: SQLite's own unix VFS
+// serializes `-shm` creation across every thread *of one process* through a
+// process-local mutex, so the race is only observable between genuinely
+// separate OS processes and isn't reliably reproducible in-process.
+// `tests/lock_contention_regression.rs` instead deterministically guards the
+// mechanism that removes this race outright — `lock::with_init_lock`'s
+// mutual exclusion — which is provable without needing to reproduce the
+// race it was built to remove.
 
 // Windows is_pid_alive: only "no such process" means dead =====
 
