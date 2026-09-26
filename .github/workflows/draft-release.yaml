@@ -149,8 +149,13 @@ jobs:
           versions=$(printf '%s' "$metadata" | jq -r '.packages[] | select(.publish != []) | .version' | sort -u)
           version_count=$(printf '%s\n' "$versions" | wc -l)
           if [ "$version_count" -ne 1 ]; then
+            # Unreachable: the validate job's `cargo xtask version --check
+            # --exact` (needs: validate, same commit) already asserted every
+            # publishable member agrees on version before this job could even
+            # start. If this fires, xtask and this check have drifted out of
+            # sync — treat it as a bug in the tooling, not a manifest problem.
             version_list=$(printf '%s' "$versions" | tr '\n' ' ')
-            echo "::error::Publishable members disagree on version: ${version_list}"
+            echo "::error::BUG: publishable members disagree on version (${version_list}) despite the validate job's cargo xtask version --check --exact already asserting agreement."
             exit 1
           fi
           VERSION="$versions"

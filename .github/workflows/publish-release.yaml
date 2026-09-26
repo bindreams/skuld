@@ -141,8 +141,13 @@ jobs:
           versions=$(printf '%s' "$metadata" | jq -r '.packages[] | select(.publish != []) | .version' | sort -u)
           version_count=$(printf '%s\n' "$versions" | wc -l)
           if [ "$version_count" -ne 1 ]; then
+            # Unreachable: `cargo xtask version --check --exact` two lines
+            # above already asserted every publishable member agrees on
+            # version, on this exact tree. If this fires, xtask and this check
+            # have drifted out of sync — treat it as a bug in the tooling, not
+            # a manifest problem to fix by re-tagging.
             version_list=$(printf '%s' "$versions" | tr '\n' ' ')
-            echo "::error::Publishable members disagree on version: ${version_list}"
+            echo "::error::BUG: publishable members disagree on version (${version_list}) despite cargo xtask version --check --exact already asserting agreement above."
             exit 1
           fi
           if [ "$versions" != "$VERSION" ]; then
