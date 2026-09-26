@@ -42,21 +42,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Reject a leading `v` rather than stripping it. The raw input is the
-          # concurrency key, so if `1.2.3` and `v1.2.3` both normalized to one
-          # version they would land in *different* groups while naming the same
-          # release — two runs of the same publish, in parallel, on an operation
-          # that cannot be undone. One accepted spelling keeps key and meaning
-          # in step.
-          # Leading zeros are rejected too: `01.2.3` is not valid semver, so
-          # `semver::Version::parse` fails on it and xtask's tag map silently
-          # skips such a tag — the one check tying input to manifest would
-          # no-op for exactly those spellings.
-          if ! [[ "$INPUT_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::Invalid version: '${INPUT_VERSION}'. Expected three dot-separated numbers with no leading zeros, no leading 'v', and no pre-release or build suffix (e.g. 1.2.3)."
-            exit 1
-          fi
-          V="$INPUT_VERSION"
+          # Validation, and its rationale (leading-`v` and leading-zero
+          # rejection), live in normalize-version.sh — shared with
+          # publish-release.yaml so both copies stay identical.
+          V=$(.github/scripts/normalize-version.sh "$INPUT_VERSION")
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Fail if release tag already exists
