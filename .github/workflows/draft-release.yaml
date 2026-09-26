@@ -58,10 +58,33 @@ jobs:
         run: |
           set -euo pipefail
           TAG="v${VERSION}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::error::Release $TAG already exists (draft or published). Delete it or pick a new version."
+
+          # "Get a release by tag name" excludes drafts — it resolves against
+          # the git tag, which a draft does not have yet — so this lists
+          # releases instead (which does include drafts) and searches by
+          # `tag_name`. `--paginate` merges every page into one JSON array.
+          if ! releases_json=$(gh api "repos/${GH_REPO}/releases" --paginate); then
+            echo "::error::Could not list releases for ${GH_REPO} to check whether $TAG already exists — refusing to guess. Re-run once the GitHub API is confirmed reachable."
             exit 1
           fi
+
+          # Distinguish "confirmed not found" (jq exit 1: valid JSON, no
+          # match) from any other outcome. A malformed or unexpected body
+          # must not silently read as "not found" and let a duplicate tag
+          # through.
+          match=0
+          printf '%s' "$releases_json" | jq -e --arg t "$TAG" 'any(.[]; .tag_name == $t)' >/dev/null || match=$?
+          case "$match" in
+            0)
+              echo "::error::Release $TAG already exists (draft or published). Delete it or pick a new version."
+              exit 1
+              ;;
+            1) ;; # confirmed not found — proceed
+            *)
+              echo "::error::Could not parse GitHub's releases list for ${GH_REPO} while checking whether $TAG exists — refusing to guess."
+              exit 1
+              ;;
+          esac
 
       - name: Create local tag for xtask check
         env:
@@ -126,11 +149,9 @@ jobs:
       # exits 0, so without this check a re-dispatch of a published version
       # passes stage 1 and fails part-way through the irreversible upload.
       #
-      # Uses `crate-state.sh`, which reads the crates.io JSON API, rather than
-      # the sparse index: the index is CDN-cached for 600s, long enough to
-      # still read "absent" right after a real upload, which is exactly the
-      # state this check exists to catch. `crate-state.sh` fails closed on any
-      # ambiguous response instead of guessing.
+      # Uses `crate-state.sh` (crates.io JSON API, not the sparse index — see
+      # its header) so a version published seconds ago still reads correctly
+      # here. It fails closed on any ambiguous response instead of guessing.
       - name: Check crates.io state for every publishable member
         timeout-minutes: 10
         env:
@@ -176,31 +197,22 @@ jobs:
           while read -r c; do
             [ -n "$c" ] || continue
 
-            # No-version query: never-published means stage 2 could never
-            # publish this member at all (see "Adding a publishable member"
-            # in CONTRIBUTING.md). `state=$(...)` as a plain assignment, not
-            # inside a `[` test — `set -e` sees a failing command substitution
-            # there and aborts, which is what makes crate-state.sh's own
-            # refusals fatal here instead of silently read as "exists".
-            state=$(.github/scripts/crate-state.sh "$c")
-            case "$state" in
-              exists) ;;
-              never-published)
-                new+=("$c")
-                continue
-                ;;
-              *)
-                echo "::error::Unrecognized state '$state' for $c — refusing to continue."
-                exit 1
-                ;;
-            esac
-
-            # With-version query: crates.io reserves a version permanently on
-            # first upload, whether or not it later gets yanked, so both
-            # `published` and `yanked` mean this version can never be
-            # published again.
-            vstate=$(.github/scripts/crate-state.sh "$c" "$VERSION")
-            case "$vstate" in
+            # One request per member answers both questions crate-state.sh can
+            # answer from a single crate-level fetch: never-published means
+            # stage 2 could never publish this member at all (see "Adding a
+            # publishable member" in CONTRIBUTING.md); otherwise, crates.io
+            # reserves a version permanently on first upload, whether or not
+            # it later gets yanked, so both `published` and `yanked` mean this
+            # version can never be published again.
+            #
+            # `state=$(...)` as a plain assignment, not inside a `[` test —
+            # `set -e` sees a failing command substitution there and aborts,
+            # which is what makes crate-state.sh's own refusals fatal here
+            # instead of silently read as "absent".
+            state=$(.github/scripts/crate-state.sh "$c" "$VERSION")
+            kind=${state%% *}
+            case "$kind" in
+              never-published) new+=("$c") ;;
               absent) ;;
               published) taken+=("$c") ;;
               yanked)
@@ -208,7 +220,7 @@ jobs:
                 yanked+=("$c")
                 ;;
               *)
-                echo "::error::Unrecognized state '$vstate' for $c ${VERSION} — refusing to continue."
+                echo "::error::Unrecognized state '$state' for $c ${VERSION} — refusing to continue."
                 exit 1
                 ;;
             esac
