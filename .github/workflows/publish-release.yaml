@@ -208,8 +208,10 @@ jobs:
         # keeps the token window down to the uploads. Stage 1's dry-run is not
         # the justification: it runs against `github.sha`, while this job builds
         # the draft's target, and those can differ (which is why the flip below
-        # re-asserts the SHA). What `--no-verify` does skip is the registry-side
-        # checks cargo makes at upload time, such as the size cap.
+        # re-asserts the SHA). `--no-verify` skips only that local verification
+        # build; registry-side limits such as crates.io's upload size cap still
+        # apply at upload regardless, and nothing before this step exercises
+        # them.
         run: cargo publish --workspace --locked --no-verify
 
       - name: Publish GitHub release
