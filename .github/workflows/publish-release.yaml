@@ -104,6 +104,14 @@ jobs:
           fi
           echo "commit_sha=$TARGET" >> "$GITHUB_OUTPUT"
 
+          # A step *output* is not visible anywhere in the log or the UI, only
+          # to later steps/jobs — so an operator reading this run to recover
+          # manually has nowhere to find $TARGET unless it is also printed
+          # here. Both the log and the summary, same reasoning as the
+          # RELEASE COMPLETE marker below: a summary write failure must not
+          # hide the one value manual recovery needs.
+          echo "Resolved $TAG -> $TARGET" | tee -a "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/checkout@v4
         timeout-minutes: 10
         with:
