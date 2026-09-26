@@ -119,9 +119,17 @@ done
 )
 ```
 
-The member list is derived rather than written out, so it stays right as the workspace grows. **Run this from the repository root**: it invokes `.github/scripts/crate-index-path.sh` by a root-relative path — the same helper the release workflow uses, so the two cannot disagree about where a crate lives in the index.
+The member list is derived rather than written out, so it stays right as the workspace grows. **Run this from the repository root** — the scripts are invoked by root-relative paths.
 
-**Any `YANKED` means the version slot is gone.** crates.io reserves a version permanently on publish; yanking hides it but never frees it, so stage 2 can never succeed at that version again. Go to the bump path below regardless of what the other crates report. If a crate reads `absent` immediately after a successful-looking upload, wait a minute and re-check before yanking anything — index propagation lags.
+**Any `YANKED` means the version slot is gone.** crates.io reserves a version permanently on publish; yanking hides it but never frees it, so stage 2 can never succeed at that version again. Go to the bump path below regardless of what the other crates report.
+
+If a crate reads `absent` immediately after a successful-looking upload, do not wait and re-check the same index — it is CDN-cached (600s) and can lag by more than any fixed wait would cover, and the wrong conclusion here is exactly the one you cannot recover from cheaply: `absent` when it is really `PUBLISHED` routes you into re-running stage 2 at a version that is already taken. Check the authoritative, non-cached source instead:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -A 'skuld-recovery' https://crates.io/api/v1/crates/<crate>/<V>
+```
+
+`200` means published — treat it the same as `PUBLISHED` above. `404` means genuinely absent. Anything else, re-run the check rather than act on it.
 
 **Nothing published** (every crate `absent`, none `YANKED`). crates.io is untouched and there is nothing to undo. What to do next depends on why it stopped:
 
