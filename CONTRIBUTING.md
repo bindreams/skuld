@@ -149,11 +149,11 @@ cargo yank skuld-macros@X.Y.Z
 cargo yank skuld@X.Y.Z
 ```
 
-**In either partial case above**, capture the commit before deleting the draft — the draft is its only source:
+**In either partial case above**, capture the commit before deleting the draft. Read `SHA` from the failed run's own **"Verify draft release exists and resolve commit SHA"** step — it prints `Resolved vX.Y.Z -> <sha>` to both the log and the job summary — not from the live draft's target field: the draft can be edited after the run resolved it, and re-querying it here would tag a commit nobody actually built or uploaded.
 
 ```sh
-SHA=$(gh release view "vX.Y.Z" --json targetCommitish -q .targetCommitish) &&
-  git fetch origin &&
+SHA=<commit_sha from the failed run's "Verify draft release exists and resolve commit SHA" step>
+git fetch origin &&
   git tag "vX.Y.Z" "$SHA" &&
   git push origin "vX.Y.Z" &&
   gh release delete "vX.Y.Z" --yes   # NOT --cleanup-tag: that deletes the tag just pushed
