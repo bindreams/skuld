@@ -137,7 +137,6 @@ jobs:
           # satisfied by ANY version tag on the nearest tagged ancestor, so once
           # that commit carries a tag matching the manifest, the tag created
           # just above is merely one more alternative and any input passes.
-          # That is live today: main sits on the v0.3.1 commit.
           #
           # Stage 1 gates this, but stage 1's verdict is only transitive — it
           # applies to the commit the draft recorded, and this job already

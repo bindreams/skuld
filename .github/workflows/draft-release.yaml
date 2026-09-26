@@ -74,10 +74,10 @@ jobs:
         #
         # This does NOT catch an operator mistyping the version. `--exact` is
         # satisfied by any version tag on the nearest tagged ancestor, so when
-        # that commit already carries a tag matching the manifest — main today —
-        # the tag created above is just one more alternative and any input
-        # passes. The manifest/input comparison in "Check crates.io state" below
-        # is what actually catches it.
+        # that commit already carries a tag matching the manifest, the tag
+        # created above is just one more alternative and any input passes. The
+        # manifest/input comparison in "Check crates.io state" below is what
+        # actually catches it.
         run: cargo xtask version --check --exact
 
   ci:
