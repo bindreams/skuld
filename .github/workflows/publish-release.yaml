@@ -37,8 +37,9 @@ jobs:
     # config, so the OIDC token minted below is only accepted from a run that
     # declares it.
     #
-    # It has no protection rules or deployment branch policy today, so it is
-    # not an authorization control — see "Open action item" in CONTRIBUTING.md.
+    # It deliberately has no protection rules or deployment branch policy — the
+    # owner decided against restricting it to `main` (2026-09-26) — so it is
+    # not an authorization control. See CONTRIBUTING.md.
     #
     # Real preflight (version validation, CI matrix, cargo publish dry-run)
     # happens in draft-release.yaml before a draft can exist. This workflow
