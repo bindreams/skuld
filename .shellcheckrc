@@ -1,0 +1,6 @@
+# Enables shellcheck's optional SC2249 (no-default-case) and SC2312 (masked
+# return) checks — see prek.toml for why these two.
+# actionlint runs shellcheck with --norc, so this file only covers standalone
+# scripts; the actionlint hook's env in prek.toml carries the same options for
+# workflow run: blocks — keep them in step.
+enable=add-default-case,check-extra-masked-returns

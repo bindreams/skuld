@@ -121,11 +121,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Read the member list into a variable rather than piping a process
+          # substitution into the loop: `done < <(cargo metadata | jq)` discards
+          # the exit status of both commands, so a metadata or jq failure would
+          # feed the loop zero names and report every crate as already published.
+          # An assignment propagates the failure, and `set -e` stops the step.
+          members=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
+          if [ -z "$members" ]; then
+            echo "::error::No publishable workspace members found. Expected at least one."
+            exit 1
+          fi
+
+          # PR #60 replaces this whole step with crate-state.sh, which
+          # classifies via the JSON API properly. Fixed here regardless since
+          # #60 isn't merged and this step has to be correct in the meantime.
           new=()
           while read -r c; do
             prefix=$(printf '%s' "$c" | sed -E 's|^(..)(..).*|\1/\2|')
-            curl -sfX GET "https://index.crates.io/$prefix/$c" >/dev/null || new+=("$c")
-          done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name')
+            # -f would make any non-2xx exit the same way as a network
+            # failure, which is the same masking this step's comment above
+            # already calls out for the metadata|jq pipeline: a transient
+            # DNS/5xx/rate-limit hit would be relabeled as "first publish".
+            # Branch on the status code instead; a real transport failure
+            # still exits curl non-zero and `set -e` stops the step.
+            code=$(curl -sS -o /dev/null -w '%{http_code}' "https://index.crates.io/$prefix/$c")
+            case "$code" in
+              200) ;; # already published
+              404) new+=("$c") ;;
+              *)
+                echo "::error::Unexpected HTTP $code checking $c on crates.io index"
+                exit 1
+                ;;
+            esac
+          done <<< "$members"
           if [ ${#new[@]} -eq 0 ]; then
             echo "All publishable members already exist on crates.io."
           elif [ "$ACK" = "true" ]; then

@@ -49,6 +49,18 @@ language = "system"
 files = '(^|/)Cargo\.toml$'
 pass_filenames = false
 
+[[repos.hooks]]
+id = "shellcheck-on-path"
+name = "shellcheck is on PATH for actionlint"
+# actionlint (below) shells out to `shellcheck` for `run:` blocks but
+# silently disables that check if the binary isn't on PATH. Fail loudly
+# instead, the same way in both places prek runs: a local pre-commit run and
+# CI's `prek run --all-files`.
+entry = "shellcheck --version"
+language = "system"
+files = '^\.github/workflows/'
+pass_filenames = false
+
 # External hooks =======================================================================================================
 
 [[repos]]
@@ -69,6 +81,44 @@ repo = "https://github.com/rbubley/mirrors-prettier"
 rev = "v3.8.2"
 hooks = [
   { id = "prettier", types = ["markdown"] },
+]
+
+[[repos]]
+# The release pipeline gates the only irreversible operation in the repo and
+# nothing checked its shell until now. Two failure modes it has produced are
+# *optional* checks in shellcheck rather than defaults, so they are enabled in
+# `.shellcheckrc`: a return masked by `< <(...)` (SC2312), which this repo's
+# own draft-release workflow tripped over, and a `case` with no default arm
+# (SC2249).
+#
+# shellcheck-py rather than the upstream Docker hook: this is a Rust repo and
+# a Docker daemon is a heavy thing to require of anyone running `prek` on a
+# staged shell script.
+repo = "https://github.com/shellcheck-py/shellcheck-py"
+rev = "v0.11.0.1"
+hooks = [
+  { id = "shellcheck" },
+]
+
+[[repos]]
+# Workflow syntax and expression errors, plus `run:` blocks, which actionlint
+# extracts and shells out to shellcheck for — conditional on shellcheck being
+# on PATH. actionlint only warns under -verbose when the binary is missing and
+# otherwise silently skips that rule; the `shellcheck-on-path` local hook
+# above turns a missing binary into a loud failure instead, so this can no
+# longer pass quietly in either a local `prek run` or CI's `prek run
+# --all-files`. ci.yaml derives the shellcheck version it installs from this
+# block's `rev` rather than pinning its own copy, so there is one version
+# number to bump, not two to keep in step.
+#
+# actionlint invokes shellcheck with `--norc`, so `.shellcheckrc` cannot reach
+# `run:` blocks. The options are therefore set as this hook's own environment,
+# which keeps them in the same file as every other lint setting. Keep this
+# list in step with `.shellcheckrc`, which governs standalone scripts.
+repo = "https://github.com/rhysd/actionlint"
+rev = "v1.7.12"
+hooks = [
+  { id = "actionlint", env = { SHELLCHECK_OPTS = "--enable=add-default-case,check-extra-masked-returns" } },
 ]
 
 [[repos]]
