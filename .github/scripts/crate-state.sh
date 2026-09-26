@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
-# Report a crate's state on crates.io. With a version: absent | yanked |
-# published. Without: never-published | exists.
+# Report a crate's state, at one version, on crates.io: never-published |
+# absent | yanked | "published <checksum>". The checksum is crates.io's own
+# sha256 of the uploaded `.crate` file, so a caller can compare it against a
+# local build's own hash to prove — not assume — that "published" is *this*
+# build.
+#
+# Queries the crate as a whole (`/api/v1/crates/<crate>`), not the per-version
+# endpoint: its `versions` array carries every version's `yanked` flag and
+# checksum, so one request answers both "does this crate exist at all" and
+# "what is this version's state" — a caller that needs both (draft-release.yaml
+# does, for every member) needs one request per crate instead of two.
 #
 # Uses the JSON API rather than the sparse index: the index is CDN-cached for
 # 600s and this runs seconds after a publish. The API needs a User-Agent —
@@ -13,67 +22,66 @@
 # does not see through `$(...)` in a `[` test or an unmatched `case`.
 set -euo pipefail
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-	echo "usage: ${0##*/} <crate> [version]" >&2
+if [ "$#" -ne 2 ]; then
+	echo "usage: ${0##*/} <crate> <version>" >&2
 	exit 2
 fi
 
 crate=$1
-version=${2-}
+version=$2
 ua="skuld-release-pipeline (https://github.com/bindreams/skuld)"
-url="https://crates.io/api/v1/crates/${crate}${version:+/$version}"
+url="https://crates.io/api/v1/crates/${crate}"
 
-# `--retry 3` covers transient 5xx and connection failures. Not
-# `--retry-all-errors`: without `--fail`, curl treats any HTTP response as a
-# successful transfer, so it would never engage for status codes anyway.
-resp=$(curl -sL -A "$ua" -w $'\n%{http_code}' --retry 3 --max-time 30 "$url") || resp=$'\n000'
+fail() {
+	local msg=$1
+	if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+		echo "::error::${msg}" >&2
+	else
+		echo "${0##*/}: ${msg}" >&2
+	fi
+	exit 1
+}
+
+# `--retry-max-time` bounds the retry phase by elapsed time instead of a fixed
+# attempt count, so a burst of transient failures does not eat all retries
+# before a real backoff window has passed. curl's own retry logic already
+# honors a `Retry-After` on 429/503 as long as `--retry` is set — no sleep of
+# our own. `--max-time` is the hard cap on the whole call, retries included.
+if ! resp=$(curl -sL -A "$ua" -w $'\n%{http_code}' --retry 5 --retry-max-time 30 --max-time 45 "$url"); then
+	fail "curl exit $? contacting crates.io for ${crate} — refusing to guess its state"
+fi
 code=${resp##*$'\n'}
 body=${resp%$'\n'*}
 
 if [ "$code" = 404 ]; then
-	if [ -n "$version" ]; then echo absent; else echo never-published; fi
+	echo never-published
 	exit 0
 fi
 
 if [ "$code" != 200 ]; then
-	msg="unexpected HTTP $code from crates.io for ${crate} ${version} — refusing to guess its state"
-	if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-		echo "::error::${msg}"
-	else
-		echo "${0##*/}: ${msg}" >&2
-	fi
-	exit 1
+	fail "unexpected HTTP $code from crates.io for ${crate} — refusing to guess its state"
 fi
 
-if [ -z "$version" ]; then
-	echo exists
+# `versions` must actually be an array before it is indexed below — an HTML
+# error page or an `{"errors": [...]}` body would otherwise read as "no
+# matching version" (i.e. absent) instead of refusing.
+kind=$(printf '%s' "$body" | jq -er '.versions | type') || fail "unreadable crates.io response for ${crate} — refusing to guess its state"
+if [ "$kind" != array ]; then
+	fail "unreadable crates.io response for ${crate}: '.versions' is ${kind}, not an array — refusing to guess its state"
+fi
+
+entry=$(printf '%s' "$body" | jq -c --arg v "$version" '[.versions[] | select(.num == $v)][0] // empty')
+if [ -z "$entry" ]; then
+	echo absent
 	exit 0
 fi
 
-# A 200 does not mean usable: crates.io serves yanked versions too, and a
-# yanked version's slot is spent forever. `-e` so a body that is not the JSON
-# we expect — an HTML error page, an errors object — refuses instead of
-# defaulting to "published".
-if ! yanked=$(printf '%s' "$body" | jq -er '.version.yanked | tostring'); then
-	msg="unreadable crates.io response for ${crate} ${version} — refusing to guess its state"
-	if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-		echo "::error::${msg}"
-	else
-		echo "${0##*/}: ${msg}" >&2
-	fi
-	exit 1
-fi
-
+yanked=$(printf '%s' "$entry" | jq -er '.yanked | tostring') || fail "unreadable version entry for ${crate} ${version} — refusing to guess its state"
 case "$yanked" in
 	true) echo yanked ;;
-	false) echo published ;;
-	*)
-		msg="unexpected .version.yanked='$yanked' for ${crate} ${version}"
-		if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-			echo "::error::${msg}"
-		else
-			echo "${0##*/}: ${msg}" >&2
-		fi
-		exit 1
+	false)
+		checksum=$(printf '%s' "$entry" | jq -er '.checksum') || fail "unreadable checksum for ${crate} ${version} — refusing to guess its state"
+		echo "published $checksum"
 		;;
+	*) fail "unexpected .yanked='$yanked' for ${crate} ${version}" ;;
 esac
