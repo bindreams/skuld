@@ -16,9 +16,13 @@ jobs:
   publish:
     name: Verify and publish
     runs-on: ubuntu-latest
-    # The Deploy environment scopes CARGO_REGISTRY_TOKEN to this job and
-    # enforces any environment protection rules (required reviewers, wait
-    # timers) configured in the repo.
+    # A clean cancellation well before the minted token's 30-minute life could
+    # expire mid-upload. The real run takes ~70s, so this is ~13x headroom.
+    timeout-minutes: 15
+    # The Deploy environment is named in each crate's crates.io trusted-publisher
+    # config, so the OIDC token minted below is only accepted from a run that
+    # declares it. It also enforces any environment protection rules (required
+    # reviewers, wait timers) configured in the repo.
     #
     # Real preflight (version validation, CI matrix, cargo publish dry-run)
     # happens in draft-release.yaml before a draft can exist. This workflow
@@ -30,6 +34,10 @@ jobs:
       # returns drafts: per GitHub docs, drafts are only returned "if the
       # user has push access", which means write-level auth.
       contents: write
+      # Lets the runner mint the OIDC JWT that crates.io exchanges for a
+      # short-lived publish token. Both scopes must be listed: declaring any
+      # `permissions:` block sets every unlisted scope to `none`.
+      id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -95,9 +103,75 @@ jobs:
           git tag "$TAG"
           cargo xtask version --check --exact
 
-      - name: Publish the workspace to crates.io
+      # Lets a re-dispatch finish a release whose publish already succeeded.
+      #
+      # The reachable cases are the flip step itself failing, and the job being
+      # cancelled or timing out between the publish and the flip. Not the auth
+      # action's post step: GitHub runs post steps after every regular step, so
+      # by then the flip has happened and a re-dispatch stops earlier, at the
+      # "release already published" check.
+      #
+      # Every branch fails closed. The flip step below carries no `if:`, so a
+      # wrong "already published" verdict would tag a release having published
+      # nothing — an empty member list, a failed query, or a yanked version must
+      # never reach that conclusion.
+      - name: Check whether this version is already on crates.io
+        id: crates_check
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Command substitution, not `mapfile < <(...)`: process substitution
+          # discards the script's exit status, so a fail-closed refusal inside
+          # it would arrive here as an empty list and read as "nothing to do".
+          members=$(./.github/scripts/publishable-members.sh)
+
+          published=0
+          absent=0
+          total=0
+          for c in $members; do
+            total=$((total + 1))
+            # Likewise `$(...)` in an assignment, so a refusal aborts the step.
+            state=$(./.github/scripts/crate-state.sh "$c" "$VERSION")
+            case "$state" in
+              published) published=$((published + 1)) ;;
+              absent)    absent=$((absent + 1)) ;;
+              yanked)
+                echo "::error::$c ${VERSION} is published but YANKED — that version slot is spent."
+                echo "::error::Re-running cannot fix this. Follow the Recovery section of CONTRIBUTING.md (bump path)."
+                exit 1
+                ;;
+              *)
+                echo "::error::Unrecognized state '$state' for $c — refusing to continue."
+                exit 1
+                ;;
+            esac
+          done
+
+          # Compared against the member count, not against zero: "absent is 0"
+          # would also be true if members went uncounted.
+          if [ "$published" -eq "$total" ]; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "All $total members are already at ${VERSION}; skipping publish and finishing the release."
+          elif [ "$absent" -eq "$total" ]; then
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+            echo "None of the $total members are at ${VERSION}; publishing."
+          else
+            echo "::error::Partial publish: $published of $total members are at ${VERSION}."
+            echo "::error::Re-running cannot fix this. Follow the Recovery section of CONTRIBUTING.md."
+            exit 1
+          fi
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+        if: steps.crates_check.outputs.already_published == 'false'
+
+      - name: Publish the workspace to crates.io
+        if: steps.crates_check.outputs.already_published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         # cargo 1.90+ publishes multiple workspace members in topological order
         # (skuld-macros, then skuld, then cargo-skuld) and waits for each to appear on the
         # sparse index before publishing the next. This replaces the manual
@@ -113,3 +187,10 @@ jobs:
           set -euo pipefail
           gh release edit "$TAG" --draft=false
           echo "Release published: https://github.com/${REPO}/releases/tag/$TAG"
+
+          # Completion marker. `crates-io-auth-action`'s post step revokes the
+          # minted token and fails the job if that revoke fails — after every
+          # regular step, so after this one. A red run carrying this marker is
+          # a finished release: take no action. A red run without it stopped
+          # somewhere above, and Recovery in CONTRIBUTING.md applies.
+          echo "RELEASE COMPLETE: $TAG published to crates.io and GitHub. If this run is red, the failure came after this point and the release is done." >> "$GITHUB_STEP_SUMMARY"
