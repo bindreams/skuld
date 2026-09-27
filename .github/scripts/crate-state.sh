@@ -46,32 +46,47 @@ fail() {
 # attempt count, so a burst of transient failures does not eat all retries
 # before a real backoff window has passed. curl's own retry logic already
 # honors a `Retry-After` on 429/503 as long as `--retry` is set — no sleep of
-# our own. `--max-time` is the hard cap on the whole call, retries included.
+# our own.
 #
-# The failure branch is `resp=$(...) || { ... }`, not `if ! resp=$(...); then
+# `--max-time` bounds one attempt, not the whole call — curl resets that
+# timer before every retry — so it does NOT cap the total time the way a
+# single top-level deadline would. The actual worst case is roughly
+# `--retry-max-time` (how long curl keeps retrying) plus one more
+# `--max-time` (the attempt that was in flight when the retry budget ran
+# out). `--retry` is set far higher than any attempt count reachable within
+# `--retry-max-time` seconds specifically so the count itself can never be
+# the thing that cuts retries short — `--retry-max-time` is the real bound,
+# not a number of attempts picked by guesswork.
+#
+# The body goes to a temp file via `-o`, not stdout: curl truncates that file
+# before each retry, so only the last attempt's body survives there. Left on
+# stdout (as `-w`'s own output also is), a failed attempt's body is never
+# cleared between retries, and the next attempt's output would print right
+# after it — one `jq` parse over what is now two concatenated response
+# bodies, however that happens to fail. Keeping only `%{http_code}` on
+# stdout means `code=$(curl ...)` captures exactly the final attempt's
+# status and nothing else.
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+# The failure branch is `code=$(...) || { ... }`, not `if ! code=$(...); then
 # ...`: inside an `if !`'s then-branch, `$?` reflects the negated `!` list,
 # which is 0 whenever curl actually failed — reporting "curl exit 0" on every
 # real failure. `||`'s right-hand side runs with `$?` still holding curl's own
 # exit code, captured here before anything else can overwrite it. `-S` un-silences
 # curl's own error line (`-s` alone swallows it) so that line still reaches the
-# log even though stderr isn't captured into `resp`.
-resp=$(curl -sSL -A "$ua" -w $'\n%{http_code}' --retry 5 --retry-max-time 30 --max-time 45 "$url") || {
+# log even though stderr isn't captured by this script.
+code=$(curl -sSL -A "$ua" -o "$tmp" -w '%{http_code}' --retry 1000 --retry-max-time 30 --max-time 45 "$url") || {
 	rc=$?
-	# A transport failure can still happen after curl wrote a response (e.g.
-	# a mid-body connection drop) — `-w` would then have appended a real
-	# status code. Report it when present; it narrows down what to check.
 	# curl writes literal `000` for %{http_code} when no response arrived at
 	# all (e.g. DNS failure, connection refused) — that is the absence of a
 	# code, not a code, so it is excluded here rather than reported as one.
-	seen_code=${resp##*$'\n'}
-	if [[ "$seen_code" =~ ^[0-9]{3}$ ]] && [ "$seen_code" != 000 ]; then
-		fail "curl exit $rc contacting crates.io for ${crate} (last HTTP status seen: $seen_code) — refusing to guess its state"
+	if [[ "$code" =~ ^[0-9]{3}$ ]] && [ "$code" != 000 ]; then
+		fail "curl exit $rc contacting crates.io for ${crate} (last HTTP status seen: $code) — refusing to guess its state"
 	else
 		fail "curl exit $rc contacting crates.io for ${crate} — refusing to guess its state"
 	fi
 }
-code=${resp##*$'\n'}
-body=${resp%$'\n'*}
+body=$(cat "$tmp")
 
 if [ "$code" = 404 ]; then
 	echo never-published
@@ -97,7 +112,7 @@ fi
 # with `+...` stripped) is what lets `1.2.3+meta` be found at all when the
 # caller asks about `1.2.3`; the exact-match check below is what stops that
 # from being silently treated as the same version.
-matches=$(printf '%s' "$body" | jq -c --arg v "$version" '[.versions[] | select((.num | split("+")[0]) == $v)]')
+matches=$(printf '%s' "$body" | jq -c --arg v "$version" '[.versions[] | select((.num | split("+")[0]) == $v)]') || fail "unreadable crates.io response for ${crate} — refusing to guess its state"
 match_count=$(printf '%s' "$matches" | jq -er 'length') || fail "unreadable crates.io response for ${crate} — refusing to guess its state"
 if [ "$match_count" -eq 0 ]; then
 	echo absent
@@ -107,7 +122,7 @@ if [ "$match_count" -gt 1 ]; then
 	fail "crates.io has ${match_count} versions of ${crate} whose version core matches ${version} (differing only in build metadata) — refusing to guess which one, if any, is ${version} exactly."
 fi
 
-entry=$(printf '%s' "$matches" | jq -c '.[0]')
+entry=$(printf '%s' "$matches" | jq -c '.[0]') || fail "unreadable crates.io response for ${crate} — refusing to guess its state"
 num=$(printf '%s' "$entry" | jq -er '.num') || fail "unreadable version entry for ${crate} ${version} — refusing to guess its state"
 if [ "$num" != "$version" ]; then
 	fail "crates.io has ${crate} ${num}, whose version core matches ${version} but carries build metadata — refusing to treat that as ${version} exactly."
