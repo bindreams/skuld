@@ -123,19 +123,31 @@ fn gen_on_a_workspace_with_no_skuld_binaries_is_a_harmless_noop() {
     assert!(value.get("test-groups").is_none() || value["test-groups"].as_table().unwrap().is_empty());
 }
 
-fn read_window(dir: &Path, name: &str) -> (u128, u128) {
-    let start: u128 = std::fs::read_to_string(dir.join(format!("{name}-proc-start")))
-        .unwrap_or_else(|e| panic!("start marker for {name} missing: {e}"))
-        .parse()
-        .unwrap();
-    let end: u128 = std::fs::read_to_string(dir.join(format!("{name}-proc-end")))
-        .unwrap_or_else(|e| panic!("end marker for {name} missing: {e}"))
-        .parse()
-        .unwrap();
+/// Reads the shared `order.log` (written by both fixture processes via
+/// `record_process_window`/`append_order_log`) and returns the 0-based line
+/// index of `name`'s `start`/`end` lines. The file's own append order — not
+/// any timestamp — is the ordering: `SystemTime::now()` is wall-clock and
+/// can step backward (e.g. an NTP adjustment), which would silently corrupt
+/// a timestamp-based overlap comparison. A single `write_all` per line under
+/// `O_APPEND` is atomic at or under `PIPE_BUF` on POSIX, so the two
+/// processes' lines can't interleave into a corrupt line, and the file's
+/// byte order is a real happens-before relation between them.
+fn read_window(dir: &Path, name: &str) -> (usize, usize) {
+    let log = std::fs::read_to_string(dir.join("order.log")).expect("read shared order log");
+    let start = log
+        .lines()
+        .position(|l| l == format!("start {name}"))
+        .unwrap_or_else(|| panic!("no start line for {name} in order log: {log}"));
+    let end = log
+        .lines()
+        .position(|l| l == format!("end {name}"))
+        .unwrap_or_else(|| panic!("no end line for {name} in order log: {log}"));
     (start, end)
 }
 
-fn windows_overlap(a: (u128, u128), b: (u128, u128)) -> bool {
+/// True when both `start` lines precede either `end` line, in the shared
+/// log's own order.
+fn windows_overlap(a: (usize, usize), b: (usize, usize)) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
@@ -378,17 +390,25 @@ fn kill_on_drop_reaps_the_child_even_if_the_scope_panics_before_wait() {
     }
 }
 
-/// Blocks for exactly the fixture's one-byte ready signal, then keeps
-/// draining `stdout` on a background thread for the rest of the child's
-/// lifetime, discarding whatever else arrives. Skuld's own libtest-mimic
-/// runner writes its normal progress/result lines to the *same* stdout
-/// regardless of `--nocapture` (that flag only controls the test body's
-/// own captured output) — stopping at one byte and dropping the handle
-/// would close the pipe's read end while the child still had more to
-/// write, and the child would panic on the resulting broken pipe.
+/// Blocks for exactly the fixture's one-byte ready signal, asserts it's
+/// really the handshake byte and not something else, then keeps draining
+/// `stdout` on a background thread for the rest of the child's lifetime,
+/// discarding whatever else arrives. The fixture writes this byte in
+/// main(), before run_tests() ever runs a test, so it is genuinely the
+/// first byte on this stream — skuld's own libtest-mimic runner writes its
+/// normal progress/result lines to the *same* stdout only once run_tests()
+/// starts, regardless of `--nocapture` (that flag only controls the test
+/// body's own captured output). Stopping at one byte and dropping the
+/// handle would close the pipe's read end while the child still had more
+/// to write, and the child would panic on the resulting broken pipe.
 fn read_ready_signal_then_drain(mut stdout: std::process::ChildStdout) {
     let mut ready = [0u8; 1];
     stdout.read_exact(&mut ready).expect("read ready signal");
+    assert_eq!(
+        ready[0], b'R',
+        "expected the fixture's handshake byte, got {:?}",
+        ready[0]
+    );
     std::thread::spawn(move || {
         let _ = std::io::copy(&mut stdout, &mut std::io::sink());
     });
@@ -402,12 +422,20 @@ fn negative_control_two_directly_spawned_processes_overlap() {
     // processes); the positive case below validates nextest's own
     // scheduling behavior separately.
     //
-    // Overlap is forced by a real handshake, not by timing: each fixture
-    // (under SKULD_NEXTEST_FIXTURE_HANDSHAKE, see crate-a's
-    // a_uses_shared_resource) signals readiness on its stdout and then
-    // blocks reading its stdin. This test only releases either one after
-    // confirming BOTH have signaled ready — so by the time either is
-    // released, both are provably alive at the same instant, deterministically.
+    // Overlap is forced by a real handshake, not by timing: each fixture's
+    // main() (under SKULD_NEXTEST_FIXTURE_HANDSHAKE, see crate-a's and
+    // crate-b's main()) records its start line, signals readiness on its
+    // stdout, runs its tests, then blocks reading its stdin before
+    // recording its end line. It does this in main() rather than inside
+    // the test body because skuld's own SHARED/serial coordination between
+    // a_uses_shared_resource and b_locks_shared_resource already prevents
+    // both bodies from being alive at once — a body-scoped handshake would
+    // deadlock against that coordination instead of testing around it.
+    // This test only releases either one after confirming BOTH have
+    // signaled ready — so by the time either is released, both are
+    // provably alive at the same instant, deterministically, and both of
+    // their start lines are already in the shared order log before either
+    // can be released to write its end line.
     let _guard = lock_fixture_workspace();
     let timing_dir = tempfile::tempdir().expect("tempdir");
     let binaries = cargo_skuld::discovery::discover_binaries(_guard.root()).expect("discovery");
