@@ -28,3 +28,20 @@ petgraph = "0.6"
 blake3 = "1"
 wait-timeout = "0.2"
 tempfile = "3"
+
+[dev-dependencies]
+# test_support.rs's ensure_target_dir uses this to create the fixture's
+# target directory the exact way cargo itself does — same atomicity, same
+# backup/content-indexing exclusion, same CACHEDIR.TAG. Test-only: nothing
+# outside test_support.rs (itself #[cfg(test)]/tests-only) touches it, so
+# it has no business being a normal, published dependency.
+cargo-util = "0.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+# test_support.rs's flock calls: std::fs::File::lock()/try_lock() aren't
+# implemented on every Unix target std itself lists as flock-capable (see
+# the root Cargo.toml's own comment on this) — rustix::fs::flock instead,
+# on every Unix. Already pulled in transitively via tempfile; this only
+# promotes it to a direct dependency. Test-only for the same reason as
+# cargo-util above.
+rustix = { version = "1", features = ["fs"] }

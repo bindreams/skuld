@@ -1,9 +1,8 @@
+#[path = "../src/test_support.rs"]
+mod fixture_lock;
+use fixture_lock::lock_fixture_workspace;
 use std::path::Path;
-use std::process::Command;
-
-fn fixture_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test-workspace")
-}
+use std::process::{Child, Command};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_cargo-skuld")
@@ -15,11 +14,12 @@ fn cargo_shaped_argv_strips_the_subcommand_name() {
     // running `cargo-skuld` directly does not. main() strips the former and
     // must leave the latter alone. Nesting the commands is what made that
     // strip necessary, and nothing else here covers it.
+    let _guard = lock_fixture_workspace();
     let out_dir = tempfile::tempdir().expect("tempdir");
     let output = out_dir.path().join("skuld-nextest.toml");
 
     let status = Command::new(bin())
-        .current_dir(fixture_root())
+        .current_dir(_guard.root())
         .args(["skuld", "nextest", "gen", "--output"])
         .arg(&output)
         .status()
@@ -30,11 +30,12 @@ fn cargo_shaped_argv_strips_the_subcommand_name() {
 
 #[test]
 fn gen_writes_groups_for_the_shared_resource_and_weird_name_conflicts() {
+    let _guard = lock_fixture_workspace();
     let out_dir = tempfile::tempdir().expect("tempdir");
     let output = out_dir.path().join("skuld-nextest.toml");
 
     let status = Command::new(bin())
-        .current_dir(fixture_root())
+        .current_dir(_guard.root())
         .args(["nextest", "gen", "--output"])
         .arg(&output)
         .status()
@@ -60,17 +61,18 @@ fn gen_writes_groups_for_the_shared_resource_and_weird_name_conflicts() {
 
 #[test]
 fn gen_check_matches_after_gen() {
+    let _guard = lock_fixture_workspace();
     let out_dir = tempfile::tempdir().expect("tempdir");
     let output = out_dir.path().join("skuld-nextest.toml");
     let gen_status = Command::new(bin())
-        .current_dir(fixture_root())
+        .current_dir(_guard.root())
         .args(["nextest", "gen", "--output"])
         .arg(&output)
         .status()
         .expect("spawn gen");
     assert!(gen_status.success());
     let check_status = Command::new(bin())
-        .current_dir(fixture_root())
+        .current_dir(_guard.root())
         .args(["nextest", "gen", "--check", "--output"])
         .arg(&output)
         .status()
@@ -83,11 +85,12 @@ fn gen_check_matches_after_gen() {
 
 #[test]
 fn gen_check_fails_on_stale_file() {
+    let _guard = lock_fixture_workspace();
     let out_dir = tempfile::tempdir().expect("tempdir");
     let output = out_dir.path().join("skuld-nextest.toml");
     std::fs::write(&output, "# stale, does not match current test set\n").unwrap();
     let check_status = Command::new(bin())
-        .current_dir(fixture_root())
+        .current_dir(_guard.root())
         .args(["nextest", "gen", "--check", "--output"])
         .arg(&output)
         .status()
@@ -135,6 +138,31 @@ fn windows_overlap(a: (u128, u128), b: (u128, u128)) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
+/// `std::process::Child` does not kill its process on drop, so a panic
+/// between `spawn` and `wait` (e.g. a failed `assert!`) would leave the
+/// fixture binary running after this test's stack unwinds. Declared after
+/// the fixture lock guard at each call site so it drops — and reaps the
+/// child — first, keeping it out of the fixture's target dir before the
+/// next test can touch it.
+struct KillOnDrop(Child);
+
+impl KillOnDrop {
+    fn spawn(cmd: &mut Command) -> std::io::Result<Self> {
+        cmd.spawn().map(KillOnDrop)
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0.wait()
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn negative_control_two_directly_spawned_processes_overlap() {
     // Bypasses nextest's scheduler entirely — spawns the two conflicting
@@ -144,8 +172,9 @@ fn negative_control_two_directly_spawned_processes_overlap() {
     // (process-lifetime windows correctly detect two simultaneously-alive
     // processes); the positive case below validates nextest's own
     // scheduling behavior separately.
+    let _guard = lock_fixture_workspace();
     let timing_dir = tempfile::tempdir().expect("tempdir");
-    let binaries = cargo_skuld::discovery::discover_binaries(&fixture_root()).expect("discovery");
+    let binaries = cargo_skuld::discovery::discover_binaries(_guard.root()).expect("discovery");
     let bin_a = &binaries
         .iter()
         .find(|b| b.binary_id.contains("fixture-crate-a"))
@@ -157,16 +186,18 @@ fn negative_control_two_directly_spawned_processes_overlap() {
         .expect("crate-b binary")
         .binary_path;
 
-    let mut child_a = Command::new(bin_a)
-        .args(["a_uses_shared_resource", "--exact"])
-        .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", timing_dir.path())
-        .spawn()
-        .expect("spawn crate-a binary directly");
-    let mut child_b = Command::new(bin_b)
-        .args(["b_locks_shared_resource", "--exact"])
-        .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", timing_dir.path())
-        .spawn()
-        .expect("spawn crate-b binary directly");
+    let mut child_a = KillOnDrop::spawn(
+        Command::new(bin_a)
+            .args(["a_uses_shared_resource", "--exact"])
+            .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", timing_dir.path()),
+    )
+    .expect("spawn crate-a binary directly");
+    let mut child_b = KillOnDrop::spawn(
+        Command::new(bin_b)
+            .args(["b_locks_shared_resource", "--exact"])
+            .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", timing_dir.path()),
+    )
+    .expect("spawn crate-b binary directly");
     assert!(child_a.wait().expect("wait a").success());
     assert!(child_b.wait().expect("wait b").success());
 
@@ -183,10 +214,11 @@ fn negative_control_two_directly_spawned_processes_overlap() {
 fn run_serializes_the_cross_binary_conflict_via_generated_tool_config() {
     // Positive case: with the generated tool-config, nextest must not
     // launch the second process until the first has fully exited.
+    let _guard = lock_fixture_workspace();
     let real_dir = tempfile::tempdir().expect("tempdir");
     let output_dir = tempfile::tempdir().expect("tempdir");
     let status = Command::new(bin())
-        .current_dir(fixture_root())
+        .current_dir(_guard.root())
         .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", real_dir.path())
         .args(["nextest", "run", "--output"])
         .arg(output_dir.path().join("skuld-nextest.toml"))
@@ -210,10 +242,11 @@ fn run_serializes_the_cross_binary_conflict_via_generated_tool_config() {
 /// tests must actually execute.
 #[test]
 fn run_correctly_selects_tests_with_special_characters_in_their_names() {
+    let _guard = lock_fixture_workspace();
     let dir = tempfile::tempdir().expect("tempdir");
     let output_dir = tempfile::tempdir().expect("tempdir");
     let status = Command::new(bin())
-        .current_dir(fixture_root())
+        .current_dir(_guard.root())
         .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", dir.path())
         .args(["nextest", "run", "--output"])
         .arg(output_dir.path().join("skuld-nextest.toml"))
