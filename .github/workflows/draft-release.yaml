@@ -219,72 +219,74 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Runs here, immediately before the create below, rather than in
-      # `validate`: GitHub's "list releases" only returns drafts to a token
-      # with push access, and `validate` deliberately stays `contents: read`.
-      # A `contents: read` token gets a 200 with every draft silently
-      # omitted, not a permissions error — so running this check under that
-      # token would not fail, it would just never see the very releases it
-      # exists to catch. Placing it right before the create, in the job that
-      # already needs `contents: write` for the create itself, also shrinks
-      # the gap between "confirmed not there" and "created" to as little as
-      # this job can make it.
-      - name: Fail if release tag already exists
+      # There is no check-then-create here: GitHub does not reject a second
+      # release (draft or published) with a `tag_name` that's already in
+      # use by another release, so a pre-check step can only ever narrow the
+      # race, never close it — between "confirmed not there" and "created"
+      # a concurrent run can still create the duplicate this step meant to
+      # catch. Creating first and then verifying, below, closes it instead:
+      # the check runs against the state that includes this run's own
+      # write, so "is this the only release with this tag" is a question
+      # this job can actually answer for certain, and clean up after itself
+      # if the answer is no.
+      #
+      # `gh release create` does not hand back the created release's id in
+      # a scriptable form, and the verify step below needs one to delete
+      # *this run's own* draft specifically (not just any release with this
+      # tag) if it turns out not to be alone. `gh api -X POST` gives the
+      # full JSON response `gh release create` would otherwise discard.
+      - name: Create draft release pinned to commit SHA
+        id: release
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          release_json=$(gh api "repos/${GH_REPO}/releases" -X POST \
+            -f "tag_name=${TAG}" \
+            -f "target_commitish=${SHA}" \
+            -f "name=${TAG}" \
+            -F draft=true \
+            -F generate_release_notes=true)
+          id=$(printf '%s' "$release_json" | jq -er '.id') || {
+            echo "::error::Created a draft release for $TAG but could not read its id back from GitHub's response, so the next step cannot verify it's the only release with this tag or clean it up if it isn't. Check https://github.com/${GH_REPO}/releases by hand before re-running."
+            exit 1
+          }
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "Draft release created for commit $SHA:"
+          echo "  https://github.com/${GH_REPO}/releases/tag/${TAG}"
+
+      - name: Fail if this is not the only release with this tag
         timeout-minutes: 5
         env:
           VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_ID: ${{ steps.release.outputs.id }}
         shell: bash
         run: |
           set -euo pipefail
           TAG="v${VERSION}"
 
-          # "Get a release by tag name" excludes drafts — it resolves against
-          # the git tag, which a draft does not have yet — so this lists
-          # releases instead (which does include drafts, to a push-access
-          # token) and searches by `tag_name`.
-          #
           # `--paginate` alone does NOT merge pages into one array: each page
-          # is its own top-level JSON array on its own line, and `jq -e`'s
-          # exit status reflects only the last one it evaluates — a match on
-          # an earlier page would print `true` and then be overwritten by a
-          # later page's `false`, reading as not-found. `--slurp` wraps every
-          # page into a single outer array instead, so `.[][]` here iterates
-          # every release across every page as one flat sequence.
-          if ! releases_json=$(gh api "repos/${GH_REPO}/releases" --paginate --slurp); then
-            echo "::error::Could not list releases for ${GH_REPO} to check whether $TAG already exists — refusing to guess. Re-run once the GitHub API is confirmed reachable."
+          # is its own top-level JSON array on its own line, and a filter run
+          # once over the whole output would only see the last one. `--slurp`
+          # wraps every page into a single outer array instead, so `.[][]`
+          # below iterates every release across every page as one flat
+          # sequence — including the draft this run just created.
+          releases_json=$(gh api "repos/${GH_REPO}/releases" --paginate --slurp) || {
+            echo "::error::Draft release $TAG (id $RELEASE_ID) was created, but listing releases afterward to confirm it's the only one with this tag failed. Do not assume it's fine: check https://github.com/${GH_REPO}/releases by hand, and delete this run's own draft (gh api repos/${GH_REPO}/releases/${RELEASE_ID} -X DELETE) if a duplicate turns out to exist."
+            exit 1
+          }
+
+          count=$(printf '%s' "$releases_json" | jq -er --arg t "$TAG" '[.[][] | select(.tag_name == $t)] | length') || {
+            echo "::error::Draft release $TAG (id $RELEASE_ID) was created, but GitHub's releases list could not be parsed to confirm it's the only one with this tag. Check https://github.com/${GH_REPO}/releases by hand."
+            exit 1
+          }
+
+          if [ "$count" -ne 1 ]; then
+            echo "::error::$count releases (draft or published) now share the tag $TAG, including this run's own (id $RELEASE_ID) — GitHub does not reject a duplicate tag_name on a draft, so this can happen even though nothing here was wrong at the time it ran. Deleting this run's own draft and refusing."
+            gh api "repos/${GH_REPO}/releases/${RELEASE_ID}" -X DELETE || echo "::error::Could not delete this run's own draft (id $RELEASE_ID) — delete it by hand: gh api repos/${GH_REPO}/releases/${RELEASE_ID} -X DELETE"
+            echo "::error::Release $TAG already exists (draft or published). Delete it or pick a new version."
             exit 1
           fi
-
-          # Distinguish "confirmed not found" (jq exit 1: valid JSON, no
-          # match) from any other outcome. A malformed or unexpected body
-          # must not silently read as "not found" and let a duplicate tag
-          # through.
-          match=0
-          printf '%s' "$releases_json" | jq -e --arg t "$TAG" 'any(.[][]; .tag_name == $t)' >/dev/null || match=$?
-          case "$match" in
-            0)
-              echo "::error::Release $TAG already exists (draft or published). Delete it or pick a new version."
-              exit 1
-              ;;
-            1) ;;
-            *)
-              echo "::error::Could not parse GitHub's releases list for ${GH_REPO} while checking whether $TAG exists — refusing to guess."
-              exit 1
-              ;;
-          esac
-
-      - name: Create draft release pinned to commit SHA
-        env:
-          VERSION: ${{ needs.validate.outputs.version }}
-          SHA: ${{ github.sha }}
-          REPO: ${{ github.repository }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh release create "v${VERSION}" \
-            --draft \
-            --generate-notes \
-            --title "v${VERSION}" \
-            --target "$SHA"
-          echo "Draft release created for commit $SHA:"
-          echo "  https://github.com/${REPO}/releases/tag/v${VERSION}"
