@@ -6,8 +6,12 @@
 //! or initialize `.skuld.db` at that instant; every other
 //! [`super::connect`]/[`super::open_db`] call blocks until it releases. That
 //! removes the specific create/publish and cold-start-negotiation races
-//! those two functions document, not all waiting: `busy_timeout` and
-//! SQLite's own locking still apply to work done *while* this lock is held.
+//! those two functions document, not all waiting: SQLite's own locking still
+//! applies to work done *while* this lock is held, against connections that
+//! never take this lock at all (e.g. another process's `BEGIN EXCLUSIVE`
+//! inside `coordinate`) — that residual contention is handled by
+//! `super::retry_busy`'s uncapped, error-code-gated retry, not a fixed
+//! `busy_timeout`.
 //!
 //! The lock itself is `flock` on Unix, `LockFileEx` on Windows — but the two
 //! platforms reach it through different code. Windows goes through

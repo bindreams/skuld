@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::Barrier;
 use std::time::Duration;
 
-use crate::coordination::{can_start, coordinate, is_retryable, open_db, register, SERIAL_ALL, SERIAL_NONE};
+use crate::coordination::{
+    can_start, coordinate, is_retryable, open_db, register, set_test_retry_counter, SERIAL_ALL, SERIAL_NONE,
+};
 use crate::label::Label;
 
 /// Create a temporary database for testing.
@@ -270,43 +272,132 @@ fn filtered_serial_blocks_only_matching_tests() {
     assert!(!can_start(&conn, &[docker], SERIAL_NONE).unwrap());
 }
 
+// This test, `registration_drop_deletes_past_a_concurrent_held_exclusive_lock_with_no_retry_cap`
+// and `migrate_schema_completes_past_a_foreign_held_exclusive_lock_with_no_retry_cap` below each
+// take several real seconds despite having no sleep or timeout of their own: both connections in
+// each test live in this *same process* (just different threads), and SQLite's own unix VFS
+// detects that — two `sqlite3_file`s on the same inode from the same process can't rely on POSIX
+// `fcntl` byte-range locks to conflict with each other (a second lock from the same process on an
+// overlapping range would silently replace, not block behind, the first) — so it falls back to an
+// internal, hardcoded in-process wait/retry schedule of its own before ever returning
+// `SQLITE_BUSY` to the caller, entirely inside libsqlite3, with no `sqlite3_busy_timeout()` call
+// (or removal of one) able to speed it up or slow it down. That schedule is what these three tests
+// are actually waiting out — not a sleep this test wrote, and not a cap `retry_busy` imposes: `f()`
+// itself blocks for that whole stretch on its very first call, then returns one genuine
+// `SQLITE_BUSY`, which `retry_busy` retries exactly as it would a real cross-process one. The
+// alternative (spawning genuinely separate OS processes, as `tests/lock_contention_regression.rs`
+// does via its `lock_hold_probe`/`lock_try_probe` support binaries) would avoid this cost, but
+// "threads with separate connections" is an explicitly sanctioned shape for exercising this bug.
+///
+/// Reproduces genuine `SQLITE_BUSY` contention on the very first schema
+/// creation — the only shape that write can ever actually see it (see
+/// `open_db`'s own doc): something outside Skuld's own locking discipline
+/// holds a real `BEGIN EXCLUSIVE` on the (empty, schema-less) file while
+/// `open_db` tries to create the tables for the first time.
+///
+/// Proven deterministically, the same way `lock_tests.rs`'s
+/// `lock_exclusive_retries_past_eintr_from_a_non_restarting_handler` proves
+/// a real `EINTR` was retried: spin on a counter this test's own waiter
+/// thread activates via `set_test_retry_counter` — incremented only inside
+/// `retry_busy`'s own retryable-error arm, and only on that one thread —
+/// until it moves, which is direct evidence a real `SQLITE_BUSY` was hit and
+/// retried by *this* call, not just that the call eventually returned. A
+/// process-wide counter would not do: `retry_busy` also runs inside every
+/// `TestRegistration`'s cleanup on drop, for every test in this binary, so
+/// an unrelated concurrently-running test's own contention could move it
+/// first — releasing this test's foreign holder before its own waiter ever
+/// actually retried. No sleep, no wall-clock assertion: the foreign holder
+/// is released only once this test's own evidence exists, and the loop
+/// waiting for it has no cap — it stops exactly when that evidence appears.
+///
+/// On the old, broken code (`busy_timeout(5 s)` plus a single
+/// `execute_batch` attempt): `open_db` panics once that fixed timeout
+/// elapses, regardless of whether the holder ever lets go — the cap this
+/// change removes.
 #[test]
-fn coordinate_retries_on_busy_lock() {
-    use std::sync::mpsc;
-
+fn open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap() {
     let (_dir, path) = temp_db();
 
-    // Holder grabs EXCLUSIVE and holds it longer than the waiter's
-    // busy_timeout (5 s). Empirically the busy handler can take up to
-    // ~5.5 s to surrender, so we hold for 7 s to force a SQLITE_BUSY
-    // return inside coordinate(). The waiter must survive this via the
-    // outer retry loop instead of panicking on .unwrap().
-    let holder_path = path.clone();
-    let (lock_tx, lock_rx) = mpsc::channel();
-    let holder = std::thread::spawn(move || {
-        let conn = open_db(&holder_path);
-        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        lock_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(7_000));
-        conn.execute_batch("COMMIT").unwrap();
+    // A raw connection that never goes through Skuld's init lock at all —
+    // standing in for "something outside Skuld" (see `open_db`'s doc) —
+    // creates the file and holds a real `BEGIN EXCLUSIVE` on it before the
+    // schema exists.
+    let foreign_conn = rusqlite::Connection::open(&path).unwrap();
+    foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let retries = std::sync::Arc::new(AtomicU32::new(0));
+    let retries_for_waiter = std::sync::Arc::clone(&retries);
+
+    let waiter_path = path.clone();
+    let waiter = std::thread::spawn(move || {
+        set_test_retry_counter(retries_for_waiter);
+        let conn = open_db(&waiter_path);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
+            .expect("schema must exist and be queryable once open_db returns");
+        count
     });
 
-    lock_rx.recv().unwrap();
-    // On broken code: panics at src/coordination.rs:261 after ~5.5 s.
-    // On fixed code: the next outer-loop iteration's BEGIN EXCLUSIVE
-    // succeeds once the holder commits, then register() + COMMIT succeed.
-    let waiter_started = std::time::Instant::now();
-    let _reg = coordinate(&path, "waiter", &[], SERIAL_NONE);
-    let waited = waiter_started.elapsed();
+    while retries.load(SeqCst) == 0 {
+        std::hint::spin_loop();
+    }
 
-    holder.join().unwrap();
+    foreign_conn.execute_batch("COMMIT").unwrap();
+    drop(foreign_conn);
 
-    // Guard against regression to a non-contending fast path: coordinate()
-    // must have actually exhausted busy_timeout (5 s) at least once before
-    // succeeding.
-    assert!(
-        waited >= Duration::from_secs(5),
-        "waiter returned in {waited:?}; should have hit busy_timeout (>=5s)"
+    let count = waiter
+        .join()
+        .expect("open_db must not panic under uncapped busy retry, however many retries it takes");
+    assert_eq!(count, 0);
+}
+
+/// The same uncapped-retry principle, for [`TestRegistration`]'s cleanup:
+/// its `DELETE` can genuinely contend with a concurrent, already-initialized
+/// connection mid-`BEGIN EXCLUSIVE` — the ordinary shape of a live
+/// [`coordinate`] caller — since that connection never takes the init lock
+/// [`open_db`] and cleanup both do. Same deterministic, per-thread proof as
+/// the test above; no sleep, no wall-clock assertion.
+///
+/// On the old, broken code (`busy_timeout(5 s)`, warn-and-swallow on
+/// failure): the row could be left behind with only a warning printed, no
+/// panic and no retry past the fixed timeout.
+#[test]
+fn registration_drop_deletes_past_a_concurrent_held_exclusive_lock_with_no_retry_cap() {
+    let (_dir, path) = temp_db();
+    let reg = coordinate(&path, "guarded_test_busy", &[], SERIAL_NONE);
+
+    // A concurrent, already-initialized connection — the ordinary shape of
+    // a live `coordinate` caller elsewhere in the system, which never takes
+    // the coordination DB's init lock once its own `open_db` call returns.
+    let foreign_conn = open_db(&path);
+    foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let retries = std::sync::Arc::new(AtomicU32::new(0));
+    let retries_for_dropper = std::sync::Arc::clone(&retries);
+
+    let dropper = std::thread::spawn(move || {
+        set_test_retry_counter(retries_for_dropper);
+        drop(reg);
+    });
+
+    while retries.load(SeqCst) == 0 {
+        std::hint::spin_loop();
+    }
+
+    foreign_conn.execute_batch("COMMIT").unwrap();
+    drop(foreign_conn);
+
+    dropper
+        .join()
+        .expect("TestRegistration::drop must not panic under uncapped busy retry");
+
+    let conn = open_db(&path);
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "the row must actually be deleted, not left behind after a warned-and-swallowed failure"
     );
 }
 
@@ -434,6 +525,61 @@ fn migration_skips_already_canonical_rows() {
 
     let conn = open_db(&path);
     assert_eq!(stored_serial_filter(&conn, "already_canonical"), "a");
+}
+
+/// `migrate_schema` runs on `open_db`'s connection, which carries no
+/// `busy_timeout` (see `open_db`'s doc): both its own `PRAGMA user_version`
+/// read and its `BEGIN IMMEDIATE` lock acquisition can genuinely contend
+/// with a concurrent `BEGIN EXCLUSIVE` elsewhere. Without `retry_busy`
+/// wrapping those two calls, removing `busy_timeout` would have been a
+/// regression — migration would silently skip on the very first
+/// `SQLITE_BUSY` it hit, with none of the grace period a connection-wide
+/// `busy_timeout` used to give it incidentally. Same deterministic,
+/// per-thread proof as `open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap`.
+#[test]
+fn migrate_schema_completes_past_a_foreign_held_exclusive_lock_with_no_retry_cap() {
+    let (_dir, path) = temp_db();
+    // Seed a pre-migration DB: schema exists (user_version back at 0), one
+    // legacy non-canonical row for the migration to actually rewrite.
+    let conn = open_db(&path);
+    conn.execute("PRAGMA user_version = 0", []).unwrap();
+    register(&conn, "legacy", &[], "(a) | (a)").unwrap();
+    drop(conn);
+
+    let foreign_conn = rusqlite::Connection::open(&path).unwrap();
+    foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let retries = std::sync::Arc::new(AtomicU32::new(0));
+    let retries_for_waiter = std::sync::Arc::clone(&retries);
+
+    let waiter_path = path.clone();
+    let waiter = std::thread::spawn(move || {
+        set_test_retry_counter(retries_for_waiter);
+        open_db(&waiter_path);
+    });
+
+    while retries.load(SeqCst) == 0 {
+        std::hint::spin_loop();
+    }
+
+    foreign_conn.execute_batch("COMMIT").unwrap();
+    drop(foreign_conn);
+
+    waiter
+        .join()
+        .expect("open_db (and migrate_schema within it) must not panic under uncapped busy retry");
+
+    let conn = open_db(&path);
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        version, 1,
+        "migration must have completed, not silently skipped, despite contention"
+    );
+    assert_eq!(
+        stored_serial_filter(&conn, "legacy"),
+        "a",
+        "migration must have actually run and canonicalized the legacy row"
+    );
 }
 
 #[test]
@@ -696,12 +842,12 @@ fn connect_survives_many_threads_racing_the_same_absent_path() {
                 s.spawn(|| {
                     barrier.wait();
                     // `open_db`, not a bare `connect()`, matches how every
-                    // real caller reaches `connect()`: it sets
-                    // `busy_timeout` before touching the DB, which a raw
-                    // `connect()` deliberately doesn't (that's `open_db`'s
-                    // job, not `connect`'s) — asserting through a bare
-                    // `PRAGMA` here would conflate `SQLITE_BUSY` from that
-                    // missing timeout with the lock-serialized absence race
+                    // real caller reaches `connect()`: it also runs schema
+                    // creation through `retry_busy`, which absorbs any
+                    // transient `SQLITE_BUSY` from schema-creation
+                    // contention on its own — a raw `connect()` plus a bare
+                    // `PRAGMA` here would instead surface that as an error,
+                    // conflating it with the lock-serialized absence race
                     // this test targets.
                     let _conn = open_db(&path);
                 });

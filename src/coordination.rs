@@ -224,25 +224,38 @@ fn path_is_absent(path: &std::path::Path) -> bool {
 /// access, `PRAGMA journal_mode = WAL`'s own cold-start negotiation over the
 /// (also just-being-created) `-shm` file can report `SQLITE_READONLY` to
 /// whichever connection loses that particular race — not a lock-contention
-/// error `busy_timeout` retries past, nor one a fresh connection retrying
-/// the same `PRAGMA` reliably resolves either: the negotiation resolves the
-/// *file*'s `-shm`, not any one connection's already-formed opinion of it,
-/// so a connection that lands `SQLITE_READONLY` here can stay readonly for
-/// its own lifetime regardless of retries on that connection. This race
-/// itself has no direct reproduction in this crate's own test suite — see
-/// the comment in `coordination_tests.rs` just above the Windows
-/// `is_pid_alive` tests for what was tried and why it didn't reproduce
-/// against pre-lock code. `tests/lock_contention_regression.rs` instead
-/// guards the mechanism that removes the race deterministically:
-/// [`lock::with_init_lock`]'s mutual exclusion itself, not the race's own
-/// historical symptom.
+/// error [`retry_busy`] (or the `busy_timeout` this crate no longer uses)
+/// retries past, nor one a fresh connection retrying the same `PRAGMA`
+/// reliably resolves either: the negotiation resolves the *file*'s `-shm`,
+/// not any one connection's already-formed opinion of it, so a connection
+/// that lands `SQLITE_READONLY` here can stay readonly for its own lifetime
+/// regardless of retries on that connection. This race itself has no direct
+/// reproduction in this crate's own test suite — see the comment in
+/// `coordination_tests.rs` just above the Windows `is_pid_alive` tests for
+/// what was tried and why it didn't reproduce against pre-lock code.
+/// `tests/lock_contention_regression.rs` instead guards the mechanism that
+/// removes the race deterministically: [`lock::with_init_lock`]'s mutual
+/// exclusion itself, not the race's own historical symptom.
 ///
-/// [`lock::with_init_lock`] removes the race outright instead of retrying
-/// past it: this whole function — [`connect_locked`] plus the WAL pragma,
-/// schema creation and migration below — runs while holding `path`'s init
-/// lock, so no other connection anywhere in the system can be negotiating
-/// the same cold-start `-shm` creation concurrently. With nothing left to
-/// race, one `execute_batch` attempt is enough.
+/// [`lock::with_init_lock`] removes that specific race outright: this whole
+/// function — [`connect_locked`] plus the WAL pragma, schema creation and
+/// migration below — runs while holding `path`'s init lock, so no other
+/// connection anywhere in the system can be negotiating the same cold-start
+/// `-shm` creation concurrently.
+///
+/// It does not remove ordinary `SQLITE_BUSY`/`SQLITE_LOCKED` contention from
+/// a connection that never takes this init lock at all — every real
+/// [`coordinate`] caller past its own `open_db` call is exactly that. The
+/// `execute_batch` below is normally a same-schema no-op once any process
+/// has created the tables once (SQLite doesn't need a lock to re-affirm a
+/// schema that's already there), so in ordinary all-Skuld operation this
+/// contention only bites the very first schema creation ever, racing
+/// something outside Skuld's own locking discipline that happens to hold a
+/// competing lock on the file at that instant. [`retry_busy`] handles it
+/// regardless of source: no `busy_timeout` is set on this connection, so a
+/// transient busy/locked error surfaces immediately and is retried here,
+/// uncapped, instead of SQLite's own busy handler blocking (and eventually
+/// giving up) internally.
 pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
     let init_sql = "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;
@@ -258,9 +271,7 @@ pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
          );";
     lock::with_init_lock(path, || {
         let conn = connect_locked(path);
-        conn.busy_timeout(Duration::from_secs(5))
-            .unwrap_or_else(|e| panic!("skuld: failed to set busy_timeout: {e}"));
-        conn.execute_batch(init_sql)
+        retry_busy(|| conn.execute_batch(init_sql))
             .unwrap_or_else(|e| panic!("skuld: failed to initialize coordination DB at {path:?}: {e}"));
         migrate_schema(&conn);
         conn
@@ -308,6 +319,75 @@ pub(crate) fn is_retryable(err: &rusqlite::Error) -> bool {
     )
 }
 
+/// Retry `f` for as long as it fails with a transient [`is_retryable`] error,
+/// backing off the same way [`coordinate`]'s own polling loop does (10 ms →
+/// 200 ms, doubling), uncapped: the condition being waited on — some other
+/// connection's transaction releasing the lock it holds — is real and will
+/// resolve, so nothing here treats elapsed time as proof of anything.
+/// `is_retryable`'s error-code check is the only thing that decides whether
+/// to keep going. A non-retryable `Err`, or eventual `Ok`, is returned
+/// immediately as-is.
+///
+/// Exists so callers that need a lock/write to eventually succeed under
+/// SQLite-level contention (schema creation in [`open_db`],
+/// [`TestRegistration`] cleanup) don't fall back to `busy_timeout`: a fixed
+/// `busy_timeout` is itself a capped, time-based wait — it gives up and
+/// reports `SQLITE_BUSY` once its budget elapses, which is exactly the
+/// "expiry as proof of failure" shape this crate's retry logic elsewhere
+/// (this function included) is built to avoid.
+fn retry_busy<T>(mut f: impl FnMut() -> Result<T, rusqlite::Error>) -> Result<T, rusqlite::Error> {
+    let mut backoff = Duration::from_millis(10);
+    let max_backoff = Duration::from_millis(200);
+    loop {
+        match f() {
+            Err(ref e) if is_retryable(e) => {
+                #[cfg(test)]
+                TEST_RETRY_COUNTER.with(|c| {
+                    if let Some(counter) = c.borrow().as_ref() {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(max_backoff);
+            }
+            other => return other,
+        }
+    }
+}
+
+// Test-only, *thread-scoped* retry counter for `retry_busy`: not a
+// process-wide static like `lock::EINTR_RETRIES`, because `retry_busy`
+// isn't only reachable from the one call a test deliberately drives into
+// contention — it also runs inside every `TestRegistration`'s cleanup on
+// drop, for every test in this binary, and libtest runs those concurrently
+// on their own threads by default. A process-wide counter would let an
+// unrelated, concurrently-running test's own incidental contention move
+// the counter, so a test spinning on it could stop and release its own
+// held lock before its *own* call under test ever actually retried —
+// passing without ever exercising what it claims to. A thread-local avoids
+// that: only the thread that calls `set_test_retry_counter` increments
+// the `Arc` it was given, so a test's own dedicated thread (spawned solely
+// to make the one `open_db`/`TestRegistration`-drop call under test) can
+// never observe another test's unrelated retries, no matter how many other
+// tests are running concurrently in the same process.
+#[cfg(test)]
+thread_local! {
+    static TEST_RETRY_COUNTER: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU32>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Activate `counter` as [`retry_busy`]'s retry counter for the *calling
+/// thread only* — see [`TEST_RETRY_COUNTER`]'s doc. Meant to be the first
+/// thing a freshly spawned, single-purpose test thread does, before making
+/// the one `open_db`/[`TestRegistration`]-drop call it exists to drive into
+/// contention: such a thread is always discarded (joined, never reused for
+/// anything else) once that call returns, so there is nothing to
+/// deactivate afterward.
+#[cfg(test)]
+pub(crate) fn set_test_retry_counter(counter: std::sync::Arc<std::sync::atomic::AtomicU32>) {
+    TEST_RETRY_COUNTER.with(|c| *c.borrow_mut() = Some(counter));
+}
+
 // Schema migration =====
 
 /// Run all pending schema migrations. Gated by `PRAGMA user_version` and
@@ -315,12 +395,21 @@ pub(crate) fn is_retryable(err: &rusqlite::Error) -> bool {
 /// Once a migration completes, the version pragma is bumped and subsequent
 /// connections skip the work.
 fn migrate_schema(conn: &rusqlite::Connection) {
-    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap_or(0);
+    // Both reads/writes below run on `open_db`'s connection, which carries
+    // no `busy_timeout` (see `open_db`'s doc): without `retry_busy`, a
+    // concurrent `BEGIN EXCLUSIVE` elsewhere (any live `coordinate` caller)
+    // would surface as `SQLITE_BUSY` immediately, with no grace at all —
+    // strictly worse than the busy_timeout-backed 5 s grace this connection
+    // used to get incidentally. `retry_busy` restores (uncapped, not
+    // time-capped) tolerance for exactly that transient contention; the
+    // `.unwrap_or(0)` fallback below is unchanged and only reached once a
+    // genuinely non-retryable error comes back.
+    let current: i64 = retry_busy(|| conn.query_row("PRAGMA user_version", [], |row| row.get(0))).unwrap_or(0);
     if current >= SCHEMA_VERSION {
         return;
     }
     // Take an immediate write lock so two processes don't both start scrubbing.
-    if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+    if let Err(e) = retry_busy(|| conn.execute_batch("BEGIN IMMEDIATE")) {
         eprintln!("[skuld] warning: failed to acquire migration lock: {e}");
         return;
     }
@@ -638,33 +727,42 @@ impl Drop for TestRegistration {
         // touches the `-shm` mapping, so this cleanup is itself a
         // participant in the cold-start negotiation `open_db`'s doc
         // describes, not a bystander exempt from it.
-        let cleanup = || -> Result<(), rusqlite::Error> {
+        //
+        // No `busy_timeout` here either, for the same reason as `open_db`:
+        // a fixed timeout is itself a capped, time-based wait. The DELETE
+        // below can genuinely contend with another, already-initialized
+        // process mid-`BEGIN EXCLUSIVE` inside `coordinate` — that
+        // connection never takes this init lock — so [`retry_busy`] retries
+        // past a transient busy/locked error, uncapped, and panics loudly
+        // (via `unwrap_or_else`) on anything else: a failure that's
+        // genuinely possible here is worth surfacing, not just warning
+        // about, same as `connect_locked`'s own panics below.
+        let cleanup = || {
             lock::with_init_lock(&self.db_path, || {
                 let conn = connect_locked(&self.db_path);
-                conn.busy_timeout(Duration::from_secs(5))?;
-                conn.execute_batch("PRAGMA foreign_keys = ON")?;
-                conn.execute("DELETE FROM running WHERE id = ?1", [self.id])?;
-                Ok(())
+                retry_busy(|| conn.execute_batch("PRAGMA foreign_keys = ON"))
+                    .unwrap_or_else(|e| panic!("skuld: failed to unregister test from coordination DB: {e}"));
+                retry_busy(|| conn.execute("DELETE FROM running WHERE id = ?1", [self.id]))
+                    .unwrap_or_else(|e| panic!("skuld: failed to unregister test from coordination DB: {e}"));
             })
         };
 
         // `connect_locked` can panic (a publish failure, or SQLite itself
         // rejecting the file — e.g. it's been replaced by a directory —
-        // is loud by design). Ordinarily that panic should propagate: a
-        // genuinely broken DB is worth failing loudly over. But if this
-        // drop is running because the *thread* is already unwinding
-        // from a different, unrelated panic (e.g. the test itself failed), a
-        // second uncaught panic here is a panic during a panic — Rust turns
-        // that into `std::process::abort()` (`SIGABRT`), killing the whole
-        // process rather than just this one failing test. `catch_unwind`
-        // this call so we can tell those two cases apart and only let the
-        // panic through in the case where it's safe to.
+        // is loud by design), and now so can `cleanup` itself on a
+        // non-retryable DB error. Ordinarily such a panic should propagate:
+        // a genuinely broken DB, or an unregister that genuinely fails, is
+        // worth failing loudly over. But if this drop is running because
+        // the *thread* is already unwinding from a different, unrelated
+        // panic (e.g. the test itself failed), a second uncaught panic here
+        // is a panic during a panic — Rust turns that into
+        // `std::process::abort()` (`SIGABRT`), killing the whole process
+        // rather than just this one failing test. `catch_unwind` this call
+        // so we can tell those two cases apart and only let the panic
+        // through in the case where it's safe to.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup));
         match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                eprintln!("[skuld] warning: failed to unregister test from coordination DB: {e}");
-            }
+            Ok(()) => {}
             Err(payload) => {
                 if std::thread::panicking() {
                     // Already unwinding from another panic: downgrade to a
