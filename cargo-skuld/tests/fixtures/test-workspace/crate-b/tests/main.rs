@@ -18,7 +18,18 @@ fn record_process_window(dir: &std::path::Path, name: &str) -> impl FnOnce() {
 
 #[skuld::test(serial = SHARED)]
 fn b_locks_shared_resource() {
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    if std::env::var_os("SKULD_NEXTEST_FIXTURE_HANDSHAKE").is_some() {
+        // Real synchronization, not a guessed duration — see crate-a's
+        // a_uses_shared_resource for why.
+        use std::io::{Read, Write};
+        let mut stdout = std::io::stdout();
+        stdout.write_all(b"R").expect("signal ready");
+        stdout.flush().expect("flush ready signal");
+        let mut release = [0u8; 1];
+        std::io::stdin().read_exact(&mut release).expect("wait for release signal");
+    } else {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 #[skuld::test]

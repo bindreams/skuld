@@ -23,10 +23,26 @@ fn record_process_window(dir: &std::path::Path, name: &str) -> impl FnOnce() {
 
 #[skuld::test(labels = [SHARED])]
 fn a_uses_shared_resource() {
-    // Widens this test's own process lifetime so an accidental overlap is
-    // reliably observable — not used to wait for or synchronize with the
-    // other process.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    if std::env::var_os("SKULD_NEXTEST_FIXTURE_HANDSHAKE").is_some() {
+        // Real synchronization, not a guessed duration: used only by
+        // negative_control_two_directly_spawned_processes_overlap (see its
+        // doc), which spawns this binary directly and needs a genuine
+        // guarantee that this process and its counterpart in crate-b were
+        // alive at the same instant, not a hope that a fixed sleep was
+        // long enough for two independently-scheduled spawns to line up.
+        use std::io::{Read, Write};
+        let mut stdout = std::io::stdout();
+        stdout.write_all(b"R").expect("signal ready");
+        stdout.flush().expect("flush ready signal");
+        let mut release = [0u8; 1];
+        std::io::stdin().read_exact(&mut release).expect("wait for release signal");
+    } else {
+        // Normal path (a real `nextest run`, or standalone testing, with
+        // no driver on the other end of stdin/stdout to shake hands
+        // with): just widen this test's own process lifetime so an
+        // accidental overlap would be observable.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 #[skuld::test]

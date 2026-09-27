@@ -1,8 +1,9 @@
 #[path = "../src/test_support.rs"]
 mod fixture_lock;
 use fixture_lock::lock_fixture_workspace;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_cargo-skuld")
@@ -153,6 +154,14 @@ impl KillOnDrop {
 
     fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.0.wait()
+    }
+
+    fn stdin(&mut self) -> std::process::ChildStdin {
+        self.0.stdin.take().expect("child was spawned with a piped stdin")
+    }
+
+    fn stdout(&mut self) -> std::process::ChildStdout {
+        self.0.stdout.take().expect("child was spawned with a piped stdout")
     }
 }
 
@@ -369,15 +378,36 @@ fn kill_on_drop_reaps_the_child_even_if_the_scope_panics_before_wait() {
     }
 }
 
+/// Blocks for exactly the fixture's one-byte ready signal, then keeps
+/// draining `stdout` on a background thread for the rest of the child's
+/// lifetime, discarding whatever else arrives. Skuld's own libtest-mimic
+/// runner writes its normal progress/result lines to the *same* stdout
+/// regardless of `--nocapture` (that flag only controls the test body's
+/// own captured output) — stopping at one byte and dropping the handle
+/// would close the pipe's read end while the child still had more to
+/// write, and the child would panic on the resulting broken pipe.
+fn read_ready_signal_then_drain(mut stdout: std::process::ChildStdout) {
+    let mut ready = [0u8; 1];
+    stdout.read_exact(&mut ready).expect("read ready signal");
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+    });
+}
+
 #[test]
 fn negative_control_two_directly_spawned_processes_overlap() {
     // Bypasses nextest's scheduler entirely — spawns the two conflicting
-    // tests' binaries directly, back-to-back, so overlap is guaranteed by
-    // construction (microseconds between spawns vs. each test's 200ms
-    // body), not by scheduler luck. Validates the MEASUREMENT technique
+    // tests' binaries directly. Validates the MEASUREMENT technique
     // (process-lifetime windows correctly detect two simultaneously-alive
     // processes); the positive case below validates nextest's own
     // scheduling behavior separately.
+    //
+    // Overlap is forced by a real handshake, not by timing: each fixture
+    // (under SKULD_NEXTEST_FIXTURE_HANDSHAKE, see crate-a's
+    // a_uses_shared_resource) signals readiness on its stdout and then
+    // blocks reading its stdin. This test only releases either one after
+    // confirming BOTH have signaled ready — so by the time either is
+    // released, both are provably alive at the same instant, deterministically.
     let _guard = lock_fixture_workspace();
     let timing_dir = tempfile::tempdir().expect("tempdir");
     let binaries = cargo_skuld::discovery::discover_binaries(_guard.root()).expect("discovery");
@@ -394,16 +424,29 @@ fn negative_control_two_directly_spawned_processes_overlap() {
 
     let mut child_a = KillOnDrop::spawn(
         Command::new(bin_a)
-            .args(["a_uses_shared_resource", "--exact"])
-            .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", timing_dir.path()),
+            .args(["a_uses_shared_resource", "--exact", "--nocapture"])
+            .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", timing_dir.path())
+            .env("SKULD_NEXTEST_FIXTURE_HANDSHAKE", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped()),
     )
     .expect("spawn crate-a binary directly");
     let mut child_b = KillOnDrop::spawn(
         Command::new(bin_b)
-            .args(["b_locks_shared_resource", "--exact"])
-            .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", timing_dir.path()),
+            .args(["b_locks_shared_resource", "--exact", "--nocapture"])
+            .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", timing_dir.path())
+            .env("SKULD_NEXTEST_FIXTURE_HANDSHAKE", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped()),
     )
     .expect("spawn crate-b binary directly");
+
+    read_ready_signal_then_drain(child_a.stdout());
+    read_ready_signal_then_drain(child_b.stdout());
+
+    child_a.stdin().write_all(b"G").expect("release a");
+    child_b.stdin().write_all(b"G").expect("release b");
+
     assert!(child_a.wait().expect("wait a").success());
     assert!(child_b.wait().expect("wait b").success());
 
