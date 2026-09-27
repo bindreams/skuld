@@ -100,7 +100,7 @@ done
 )
 ```
 
-`crate-state.sh` reads the crates.io JSON API rather than the sparse index, which is CDN-cached for 600s — long enough to still read `absent` right after a real upload. That is a guarantee about the index's own cache, not about the API: crates.io does not document its API as read-after-write consistent, so a read moments after what looked like a successful upload can still be stale. If a member reads `absent` right after an upload you believe went through, re-run this diagnostic once before deciding anything — do not act on that single reading. It also refuses instead of guessing on anything ambiguous, so a `refused` line means re-run the check rather than act on it.
+`crate-state.sh` reads the crates.io JSON API rather than the sparse index, which is CDN-cached for 600s — long enough to still read `absent` right after a real upload. That is a guarantee about the index's own cache, not about the API: crates.io does not document its API as read-after-write consistent, so a read here can still be stale. Nothing below depends on catching that in this diagnostic — see "Nothing published" for what actually guards against a member having published despite reading `absent` here. This script also refuses instead of guessing on anything ambiguous, so a `refused` line means re-run the check rather than act on it.
 
 **A member reads `never-published`.** Stage 1's verify job already refuses to create a draft for any member in this state, so reaching stage 2 with one should be unreachable — if it happens anyway, the tree the draft points at has changed in a way stage 1 never saw it. There is nothing to yank and nothing a re-run fixes: follow "Adding a publishable member" above first, then re-run stage 1 before touching stage 2 again.
 
@@ -110,21 +110,23 @@ done
 
 **Stage 2 itself reports a checksum mismatch for a `published` member.** Stop — do not re-run, yank, or bump yet. This means crates.io's `published` verdict for that member is real, but it did not come from this run's own build: either a different commit published it (the draft's target may not be what you think, or someone published outside this pipeline), or `crate-state.sh`/the packaging step read the wrong artifact. Confirm which commit crates.io's version actually corresponds to before deciding anything — re-running only repeats the same refusal, and both yanking and bumping assume you already know why the mismatch happened.
 
-**At least one member already `published`, and a still-`absent` one is tree-caused** (crates.io rejects its content again on every re-run, or the fix needs a commit). Deleting the draft and starting over does not apply here: the published members already occupy this version, so nothing about this version is undoable, and the fix itself requires a different tree, which lockstep versioning cannot give this version anyway. Skip straight to "Abandoning this version" below — the bump carries the still-broken member to a new version while the ones that already published keep their history at this one, exactly as that section describes.
+**At least one member already `published`, and a still-`absent` one is tree-caused** (crates.io rejects its content again on every re-run, or the fix needs a commit). Deleting the draft and starting over does not apply here: the published members already occupy this version, so nothing about this version is undoable, and the fix itself requires a different tree, which lockstep versioning cannot give this version anyway. Skip straight to "Abandoning this version" below, which yanks every publishable member — including the ones that already published cleanly — as part of the same lockstep bump; see that section for why it does not try to spare them.
 
-**Nothing published** (every member `absent`, none `yanked`). crates.io is untouched and there is nothing to undo. What to do next depends on why it stopped:
+**Nothing published** (every member `absent`, none `yanked`). What to do next depends on why it stopped:
 
 - _Environmental_ (registry outage, runner failure): re-run **stage 2** with the same version once the cause has cleared. The draft's pinned commit is still correct, so nothing else needs doing. Note that a cause you can only fix by committing is a _tree_ cause, not this one — a commit changes the tree, so it takes the path below.
-- _Tree_ (packaging, verification, the version re-check, or crates.io rejecting a member's content on upload): stage 2 checks out the draft's pinned commit, so re-running replays the identical failure. Delete the draft with `gh release delete "vX.Y.Z" --yes`, push the fix, then re-run **stage 1** and stage 2. Stage 1 refuses to create a draft while a release with that tag exists, which is why the delete comes first. This path assumes nothing has published yet — once even one member is `published`, use the case above instead.
+- _Tree_ (packaging, verification, the version re-check, or crates.io rejecting a member's content on upload): stage 2 checks out the draft's pinned commit, so re-running replays the identical failure. Delete the draft with `gh release delete "vX.Y.Z" --yes`, push the fix, then re-run **stage 1** and stage 2. Stage 1 refuses to create a draft while a release with that tag exists, which is why the delete comes first. If a member actually was published despite reading `absent` above, stage 1's own re-check of crates.io catches that and refuses rather than creating a conflicting draft. This path assumes nothing has published yet — once even one member is confirmed `published`, use the case above instead.
 
 ### Abandoning this version
 
 Needed when a member reads `yanked`, when a still-`absent` member is tree-blocked despite a partial publish, or when the release is being pulled for a content reason unrelated to publish mechanics. Otherwise use the re-run path above instead — it is strictly less work and does not spend a version slot.
 
-Yank members deliberately, not by blanket rule. If the release is being pulled outright (the `yanked` and unrelated-content-pull cases), yank every member the diagnostic above reported as `published` (skip ones already `yanked` or `absent`). If instead only a still-`absent` member is permanently tree-blocked and every `published` member is fine on its own merits, leave those published members alone — yanking them would spend their slot for nothing, and the closing paragraph below is exactly this case: a published member keeps its version, an unreached one does not.
+Yank every publishable member (`.github/scripts/publishable-members.sh` lists them), not just the ones the diagnostic above reported as `published`: that reading can be stale, and skipping a member because it read `absent` risks leaving one that actually did publish un-yanked. crates.io's own response when you try is authoritative instead — a member that was never actually published at this version returns "version does not exist", which is the only acceptable no-op here; anything else means the yank did real work.
 
 ```sh
-cargo yank <crate>@X.Y.Z
+for c in $(.github/scripts/publishable-members.sh); do
+  cargo yank "$c@X.Y.Z"
+done
 ```
 
 Capture the commit before deleting the draft. Read `SHA` from the failed run's own **"Verify draft release exists and resolve commit SHA"** step — it prints `Resolved vX.Y.Z -> <sha>` to both the log and the job summary — not from the live draft's target field: the draft can be edited after the run resolved it, and re-querying it here would tag a commit nobody actually built or uploaded.
@@ -139,7 +141,7 @@ git fetch origin &&
 
 The tag has to be created by hand because only the final GitHub-release flip creates it, and that never ran — so the newest tag is still `vX.Y.(Z-1)` and `cargo xtask version --check` would reject `X.Y.(Z+1)` as a two-step jump, blocking the bump commit both locally and in Lint.
 
-Then bump every publishable member's manifest to `X.Y.(Z+1)` (`.github/scripts/publishable-members.sh` lists them; today that is `Cargo.toml`, `macros/Cargo.toml` and `cargo-skuld/Cargo.toml`), fix the root cause if there is one, and re-run both workflows with the new version. Because the bump is lockstep, a member that published cleanly at `X.Y.Z` and was never yanked keeps that version in its history, while a yanked or never-reached one does not — a gap or a yank in one crate's version line is the accepted cost of a shared workspace version, not a problem to work around.
+Then bump every publishable member's manifest to `X.Y.(Z+1)` (`.github/scripts/publishable-members.sh` lists them; today that is `Cargo.toml`, `macros/Cargo.toml` and `cargo-skuld/Cargo.toml`), fix the root cause if there is one, and re-run both workflows with the new version. Because the bump is lockstep, every publishable member moves to `X.Y.(Z+1)` together regardless of how far `X.Y.Z` got for each one individually — a yanked or never-reached `X.Y.Z` in one crate's version line is the accepted cost of a shared workspace version, not a problem to work around.
 
 ### Useful commands during a release
 
