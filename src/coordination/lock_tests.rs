@@ -3,13 +3,13 @@
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering::SeqCst};
-use std::sync::Barrier;
 
 #[cfg(windows)]
 use super::lock::lock_path;
 #[cfg(unix)]
 use super::lock::{lock_exclusive, EINTR_RETRIES};
 use super::lock::{open_lock_target, try_lock_exclusive, with_init_lock};
+use super::rendezvous::rendezvous;
 
 #[cfg(windows)]
 #[test]
@@ -38,12 +38,12 @@ fn with_init_lock_serializes_concurrent_callers() {
         let db_path = dir.path().join(".skuld.db");
         let in_critical_section = AtomicI64::new(0);
         let max_seen = AtomicI64::new(0);
-        let barrier = Barrier::new(THREADS);
+        let (points, coordinator) = rendezvous(THREADS);
 
         std::thread::scope(|s| {
-            for _ in 0..THREADS {
+            for point in points {
                 s.spawn(|| {
-                    barrier.wait();
+                    point.wait();
                     with_init_lock(&db_path, |_token| {
                         let now = in_critical_section.fetch_add(1, SeqCst) + 1;
                         max_seen.fetch_max(now, SeqCst);
@@ -61,6 +61,10 @@ fn with_init_lock_serializes_concurrent_callers() {
                 });
             }
         });
+
+        coordinator
+            .join()
+            .expect("rendezvous coordinator thread must not itself panic");
 
         assert_eq!(
             max_seen.load(SeqCst),
@@ -96,12 +100,12 @@ fn with_init_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet()
 
     let in_critical_section = AtomicI64::new(0);
     let max_seen = AtomicI64::new(0);
-    let barrier = Barrier::new(THREADS);
+    let (points, coordinator) = rendezvous(THREADS);
 
     std::thread::scope(|s| {
-        for _ in 0..THREADS {
+        for point in points {
             s.spawn(|| {
-                barrier.wait();
+                point.wait();
                 with_init_lock(&db_path, |_token| {
                     let now = in_critical_section.fetch_add(1, SeqCst) + 1;
                     max_seen.fetch_max(now, SeqCst);
@@ -110,6 +114,10 @@ fn with_init_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet()
             });
         }
     });
+
+    coordinator
+        .join()
+        .expect("rendezvous coordinator thread must not itself panic");
 
     assert_eq!(
         max_seen.load(SeqCst),

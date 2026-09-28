@@ -48,9 +48,14 @@ impl RendezvousPoint {
 /// dropped. The coordinator releases every participant together once all
 /// `n` have called `wait`, or releases no one — leaving every waiting
 /// participant's `go_rx.recv()` to fail once this coordinator's own channel
-/// handles drop — the moment any one participant's `ready_tx` is dropped
-/// without sending (i.e. that participant's thread ended, panic or not,
-/// before `wait`).
+/// handles drop — once every earlier participant (in the fixed index order
+/// the coordinator itself waits on `ready_rx`s in) has arrived and the next
+/// one's `ready_tx` is found dropped without sending (i.e. that
+/// participant's thread ended, panic or not, before `wait`). Not "the
+/// moment any one participant dies," which would need polling or a select
+/// over all `n` receivers at once — this coordinator finds out about a
+/// dead participant only once its own sequential scan reaches that
+/// participant's index, after every index before it has already checked in.
 ///
 /// Two independent one-shot channels per participant (`ready`/`go`), not one
 /// `Sender` cloned `n` ways: a clone-based design can't tell "one specific
