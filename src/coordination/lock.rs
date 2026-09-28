@@ -10,8 +10,9 @@
 //! applies to work done *while* this lock is held, against connections that
 //! never take this lock at all (e.g. another process's `BEGIN EXCLUSIVE`
 //! inside `coordinate`) — that residual contention is handled by
-//! `super::retry_busy`'s uncapped, error-code-gated retry, not a fixed
-//! `busy_timeout`.
+//! `super::retry_busy`'s uncapped, error-code-gated retry, not rusqlite's own
+//! default 5 s `busy_timeout` (every connection [`super::connect_locked`]
+//! returns has that disabled — see its own doc).
 //!
 //! The lock itself is `flock` on Unix, `LockFileEx` on Windows — but the two
 //! platforms reach it through different code. Windows goes through

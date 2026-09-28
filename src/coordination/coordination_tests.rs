@@ -5,7 +5,7 @@ use std::sync::Barrier;
 use std::time::Duration;
 
 use crate::coordination::{
-    can_start, coordinate, is_retryable, open_db, register, set_test_retry_counter, SERIAL_ALL, SERIAL_NONE,
+    can_start, coordinate, is_retryable, open_db, register, set_test_retry_hook, SERIAL_ALL, SERIAL_NONE,
 };
 use crate::label::Label;
 
@@ -272,43 +272,33 @@ fn filtered_serial_blocks_only_matching_tests() {
     assert!(!can_start(&conn, &[docker], SERIAL_NONE).unwrap());
 }
 
-// This test, `registration_drop_deletes_past_a_concurrent_held_exclusive_lock_with_no_retry_cap`
-// and `migrate_schema_completes_past_a_foreign_held_exclusive_lock_with_no_retry_cap` below each
-// take several real seconds despite having no sleep or timeout of their own: both connections in
-// each test live in this *same process* (just different threads), and SQLite's own unix VFS
-// detects that — two `sqlite3_file`s on the same inode from the same process can't rely on POSIX
-// `fcntl` byte-range locks to conflict with each other (a second lock from the same process on an
-// overlapping range would silently replace, not block behind, the first) — so it falls back to an
-// internal, hardcoded in-process wait/retry schedule of its own before ever returning
-// `SQLITE_BUSY` to the caller, entirely inside libsqlite3, with no `sqlite3_busy_timeout()` call
-// (or removal of one) able to speed it up or slow it down. That schedule is what these three tests
-// are actually waiting out — not a sleep this test wrote, and not a cap `retry_busy` imposes: `f()`
-// itself blocks for that whole stretch on its very first call, then returns one genuine
-// `SQLITE_BUSY`, which `retry_busy` retries exactly as it would a real cross-process one. The
-// alternative (spawning genuinely separate OS processes, as `tests/lock_contention_regression.rs`
-// does via its `lock_hold_probe`/`lock_try_probe` support binaries) would avoid this cost, but
-// "threads with separate connections" is an explicitly sanctioned shape for exercising this bug.
-///
 /// Reproduces genuine `SQLITE_BUSY` contention on the very first schema
 /// creation — the only shape that write can ever actually see it (see
 /// `open_db`'s own doc): something outside Skuld's own locking discipline
 /// holds a real `BEGIN EXCLUSIVE` on the (empty, schema-less) file while
-/// `open_db` tries to create the tables for the first time.
+/// `open_db` tries to create the tables for the first time. This only
+/// reproduces at all because `connect_locked` disables rusqlite's own
+/// default 5 s `busy_timeout` on every connection it returns — with that
+/// still active, the contention below would resolve (or fail) inside
+/// SQLite's own internal busy handler before `retry_busy` ever saw an error
+/// to retry, taking whatever fraction of that 5 s the holder happened to
+/// occupy instead of the ~0.1 s this test actually takes.
 ///
 /// Proven deterministically, the same way `lock_tests.rs`'s
 /// `lock_exclusive_retries_past_eintr_from_a_non_restarting_handler` proves
-/// a real `EINTR` was retried: spin on a counter this test's own waiter
-/// thread activates via `set_test_retry_counter` — incremented only inside
-/// `retry_busy`'s own retryable-error arm, and only on that one thread —
-/// until it moves, which is direct evidence a real `SQLITE_BUSY` was hit and
-/// retried by *this* call, not just that the call eventually returned. A
-/// process-wide counter would not do: `retry_busy` also runs inside every
-/// `TestRegistration`'s cleanup on drop, for every test in this binary, so
-/// an unrelated concurrently-running test's own contention could move it
-/// first — releasing this test's foreign holder before its own waiter ever
-/// actually retried. No sleep, no wall-clock assertion: the foreign holder
-/// is released only once this test's own evidence exists, and the loop
-/// waiting for it has no cap — it stops exactly when that evidence appears.
+/// a real `EINTR` was retried: block on the receiving end of a channel this
+/// test's own waiter thread activates via `set_test_retry_hook` —
+/// `retry_busy` sends on it only from inside its own retryable-error arm,
+/// and only on that one thread — until either it fires (direct evidence a
+/// real `SQLITE_BUSY` was hit and retried by *this* call, not just that the
+/// call eventually returned) or the sender is dropped because the thread
+/// exited without ever retrying, which turns a broken retry path into a
+/// clean test failure via `recv()`'s `Err` instead of a hang. A process-wide
+/// signal would not do for the first part: `retry_busy` also runs inside
+/// every `TestRegistration`'s cleanup on drop, for every test in this
+/// binary, so an unrelated concurrently-running test's own contention could
+/// fire it first — releasing this test's foreign holder before its own
+/// waiter ever actually retried. No sleep, no wall-clock assertion.
 ///
 /// On the old, broken code (`busy_timeout(5 s)` plus a single
 /// `execute_batch` attempt): `open_db` panics once that fixed timeout
@@ -325,12 +315,10 @@ fn open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap()
     let foreign_conn = rusqlite::Connection::open(&path).unwrap();
     foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
-    let retries = std::sync::Arc::new(AtomicU32::new(0));
-    let retries_for_waiter = std::sync::Arc::clone(&retries);
-
+    let (tx, rx) = std::sync::mpsc::channel();
     let waiter_path = path.clone();
     let waiter = std::thread::spawn(move || {
-        set_test_retry_counter(retries_for_waiter);
+        set_test_retry_hook(tx);
         let conn = open_db(&waiter_path);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
@@ -338,9 +326,8 @@ fn open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap()
         count
     });
 
-    while retries.load(SeqCst) == 0 {
-        std::hint::spin_loop();
-    }
+    rx.recv()
+        .expect("waiter thread exited without ever hitting a retryable busy/locked error");
 
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
@@ -356,7 +343,8 @@ fn open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap()
 /// connection mid-`BEGIN EXCLUSIVE` — the ordinary shape of a live
 /// [`coordinate`] caller — since that connection never takes the init lock
 /// [`open_db`] and cleanup both do. Same deterministic, per-thread proof as
-/// the test above; no sleep, no wall-clock assertion.
+/// the test above (a channel `retry_busy` sends on, not a spin loop or a
+/// counter); no sleep, no wall-clock assertion.
 ///
 /// On the old, broken code (`busy_timeout(5 s)`, warn-and-swallow on
 /// failure): the row could be left behind with only a warning printed, no
@@ -372,17 +360,14 @@ fn registration_drop_deletes_past_a_concurrent_held_exclusive_lock_with_no_retry
     let foreign_conn = open_db(&path);
     foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
-    let retries = std::sync::Arc::new(AtomicU32::new(0));
-    let retries_for_dropper = std::sync::Arc::clone(&retries);
-
+    let (tx, rx) = std::sync::mpsc::channel();
     let dropper = std::thread::spawn(move || {
-        set_test_retry_counter(retries_for_dropper);
+        set_test_retry_hook(tx);
         drop(reg);
     });
 
-    while retries.load(SeqCst) == 0 {
-        std::hint::spin_loop();
-    }
+    rx.recv()
+        .expect("dropper thread exited without ever hitting a retryable busy/locked error");
 
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
@@ -399,6 +384,67 @@ fn registration_drop_deletes_past_a_concurrent_held_exclusive_lock_with_no_retry
         count, 0,
         "the row must actually be deleted, not left behind after a warned-and-swallowed failure"
     );
+}
+
+/// `connect_locked` must disable rusqlite's own default `busy_timeout` on
+/// every connection it returns, not just avoid setting one of our own:
+/// `InnerConnection::open_with_flags` (rusqlite's own connection-open path,
+/// which every real `open_db`/`TestRegistration`-cleanup connection goes
+/// through) calls `sqlite3_busy_timeout(db, 5000)` unconditionally, so
+/// simply never calling `Connection::busy_timeout` ourselves is not enough —
+/// the three tests above (and `coordinate`'s own retry test below) only
+/// reproduce genuine, fast `SQLITE_BUSY` contention because this pragma
+/// reads back `0`, not `5000`.
+#[test]
+fn open_db_disables_rusqlites_default_busy_timeout() {
+    let (_dir, path) = temp_db();
+    let conn = open_db(&path);
+    let busy_timeout_ms: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        busy_timeout_ms, 0,
+        "open_db's connection must not carry rusqlite's own default 5000 ms busy_timeout"
+    );
+}
+
+/// `coordinate`'s own retry loop — not `retry_busy` (see the comment at its
+/// call site in `coordination.rs`) — is what retries a transient busy/locked
+/// error from its `BEGIN EXCLUSIVE` attempt, uncapped, gated on the error
+/// code alone. Reproduced and proven the same deterministic way as
+/// `open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap`:
+/// a channel `coordinate`'s retry arm sends on via the same
+/// `set_test_retry_hook`/`signal_test_retry_hook` machinery `retry_busy`
+/// uses. This only reproduces quickly because `connect_locked` disables
+/// rusqlite's own default `busy_timeout`: with that still active, ordinary
+/// short-lived contention between two `coordinate` callers would often
+/// resolve inside SQLite's own internal busy handler before this arm ever
+/// saw an error to retry — see `open_db`'s doc.
+#[test]
+fn coordinate_retries_a_busy_begin_exclusive_with_no_retry_cap() {
+    let (_dir, path) = temp_db();
+    // Create the schema up front so the contention below lands on
+    // `coordinate`'s own `BEGIN EXCLUSIVE`, not on schema creation inside
+    // `open_db`.
+    drop(open_db(&path));
+
+    let foreign_conn = open_db(&path);
+    foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter_path = path.clone();
+    let waiter = std::thread::spawn(move || {
+        set_test_retry_hook(tx);
+        coordinate(&waiter_path, "busy_retry_test", &[], SERIAL_NONE)
+    });
+
+    rx.recv()
+        .expect("coordinate thread exited without ever hitting a retryable busy/locked error");
+
+    foreign_conn.execute_batch("COMMIT").unwrap();
+    drop(foreign_conn);
+
+    let _reg = waiter
+        .join()
+        .expect("coordinate must not panic under uncapped busy retry, however many retries it takes");
 }
 
 // is_retryable =====
@@ -527,15 +573,20 @@ fn migration_skips_already_canonical_rows() {
     assert_eq!(stored_serial_filter(&conn, "already_canonical"), "a");
 }
 
-/// `migrate_schema` runs on `open_db`'s connection, which carries no
-/// `busy_timeout` (see `open_db`'s doc): both its own `PRAGMA user_version`
-/// read and its `BEGIN IMMEDIATE` lock acquisition can genuinely contend
-/// with a concurrent `BEGIN EXCLUSIVE` elsewhere. Without `retry_busy`
-/// wrapping those two calls, removing `busy_timeout` would have been a
+/// `migrate_schema` runs on `open_db`'s connection, which has rusqlite's
+/// default `busy_timeout` disabled (see `open_db`'s doc). Its `BEGIN
+/// IMMEDIATE` lock acquisition genuinely contends with a concurrent `BEGIN
+/// EXCLUSIVE` elsewhere — its outer `PRAGMA user_version` read does *not*:
+/// in WAL mode a plain read doesn't conflict with another connection's write
+/// lock at all (only `SQLITE_BUSY_RECOVERY`, not reproduced here, would
+/// affect it; see `migrate_schema`'s own doc). So this test's foreign holder
+/// forces contention specifically on `BEGIN IMMEDIATE`. Without `retry_busy`
+/// wrapping that call, disabling `busy_timeout` would have been a
 /// regression — migration would silently skip on the very first
-/// `SQLITE_BUSY` it hit, with none of the grace period a connection-wide
-/// `busy_timeout` used to give it incidentally. Same deterministic,
-/// per-thread proof as `open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap`.
+/// `SQLITE_BUSY` it hit, with none of the grace period rusqlite's own
+/// default `busy_timeout` used to give it incidentally. Same deterministic,
+/// per-thread channel proof as
+/// `open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap`.
 #[test]
 fn migrate_schema_completes_past_a_foreign_held_exclusive_lock_with_no_retry_cap() {
     let (_dir, path) = temp_db();
@@ -549,18 +600,15 @@ fn migrate_schema_completes_past_a_foreign_held_exclusive_lock_with_no_retry_cap
     let foreign_conn = rusqlite::Connection::open(&path).unwrap();
     foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
-    let retries = std::sync::Arc::new(AtomicU32::new(0));
-    let retries_for_waiter = std::sync::Arc::clone(&retries);
-
+    let (tx, rx) = std::sync::mpsc::channel();
     let waiter_path = path.clone();
     let waiter = std::thread::spawn(move || {
-        set_test_retry_counter(retries_for_waiter);
+        set_test_retry_hook(tx);
         open_db(&waiter_path);
     });
 
-    while retries.load(SeqCst) == 0 {
-        std::hint::spin_loop();
-    }
+    rx.recv()
+        .expect("waiter thread exited without ever hitting a retryable busy/locked error");
 
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
