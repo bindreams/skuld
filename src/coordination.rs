@@ -511,10 +511,10 @@ impl FileIdentity {
 /// path-string re-stat is also this check's blind spot: it only ever
 /// re-resolves the literal string SQLite recorded, not `path` as this
 /// crate's own caller understands it — a symlink *ancestor* of `path`
-/// retargeted after open (`zz_probe_symlink_ancestor_retarget`-shaped: e.g.
-/// a per-run `link -> real1` swapped to `link -> real2` mid-run) changes
-/// what `path` now means without SQLite's own re-stat necessarily observing
-/// it, and the primary-code-only comparison SQLite does also never checks
+/// retargeted after open (`registration_drop_fails_loudly_when_a_parent_symlink_is_retargeted_mid_run`-shaped:
+/// e.g. a per-run `link -> real1` swapped to `link -> real2` mid-run)
+/// changes what `path` now means without SQLite's own re-stat necessarily
+/// observing it, and the primary-code-only comparison SQLite does also never checks
 /// *device* — two files on different filesystems can share an inode
 /// number, a false-negative "not moved" on setups spanning multiple
 /// devices/mounts. The second, independent check closes both: a fresh
@@ -1255,8 +1255,8 @@ impl Drop for TestRegistration {
         // hazard as one moved before `drop` was ever called; checking only
         // once outside the loop would write silently through a connection
         // that moved out from under it mid-retry
-        // (`registration_drop_fails_loudly_instead_of_corrupting_mid_retry`
-        // is the regression test). A second check right after, once
+        // (`registration_drop_fails_loudly_when_the_db_moves_mid_retry` is
+        // the regression test). A second check right after, once
         // `retry_busy` returns successfully, closes the one window neither
         // that nor the per-attempt check can: a move landing between the
         // last successful write and this function returning must still end
