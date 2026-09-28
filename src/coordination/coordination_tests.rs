@@ -55,6 +55,18 @@ pub(super) fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
+/// Test helper: run [`register`] inside a transaction, matching its own
+/// documented contract — enforced by a `debug_assert!` now, not just
+/// documented, so calling it directly on an autocommit connection (as every
+/// test below used to) panics in debug builds. Commits and returns the row
+/// id.
+fn register_in_txn(conn: &rusqlite::Connection, name: &str, labels: &[Label], serial_filter: &str) -> i64 {
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let id = register(conn, name, labels, serial_filter).unwrap();
+    conn.execute_batch("COMMIT").unwrap();
+    id
+}
+
 // can_start =====
 
 #[test]
@@ -68,7 +80,7 @@ fn non_serial_can_start_when_empty() {
 fn non_serial_blocked_by_global_serial() {
     let (_dir, path) = temp_db();
     let (conn, _identity) = open_db(&path);
-    register(&conn, "blocker", &[], SERIAL_ALL).unwrap();
+    register_in_txn(&conn, "blocker", &[], SERIAL_ALL);
     assert!(!can_start(&conn, &[], SERIAL_NONE).unwrap());
 }
 
@@ -78,7 +90,7 @@ fn non_serial_blocked_by_matching_filter() {
     let (conn, _identity) = open_db(&path);
     let docker = Label::__new("docker");
     // A serial test filtering on "docker" is running
-    register(&conn, "serial_docker", &[], "docker").unwrap();
+    register_in_txn(&conn, "serial_docker", &[], "docker");
     // A test WITH label docker is blocked
     assert!(!can_start(&conn, &[docker], SERIAL_NONE).unwrap());
     // A test WITHOUT label docker is NOT blocked
@@ -89,7 +101,7 @@ fn non_serial_blocked_by_matching_filter() {
 fn global_serial_blocked_when_anything_running() {
     let (_dir, path) = temp_db();
     let (conn, _identity) = open_db(&path);
-    register(&conn, "some_test", &[], SERIAL_NONE).unwrap();
+    register_in_txn(&conn, "some_test", &[], SERIAL_NONE);
     assert!(!can_start(&conn, &[], SERIAL_ALL).unwrap());
 }
 
@@ -106,7 +118,7 @@ fn filtered_serial_blocked_by_matching_running_test() {
     let (conn, _identity) = open_db(&path);
     let docker = Label::__new("docker");
     // A non-serial test with label "docker" is running
-    register(&conn, "docker_test", &[docker], SERIAL_NONE).unwrap();
+    register_in_txn(&conn, "docker_test", &[docker], SERIAL_NONE);
     // A serial test filtering on "docker" is blocked
     assert!(!can_start(&conn, &[], "docker").unwrap());
 }
@@ -117,7 +129,7 @@ fn filtered_serial_not_blocked_by_non_matching() {
     let (conn, _identity) = open_db(&path);
     let network = Label::__new("network");
     // A test with label "network" is running
-    register(&conn, "network_test", &[network], SERIAL_NONE).unwrap();
+    register_in_txn(&conn, "network_test", &[network], SERIAL_NONE);
     // A serial test filtering on "docker" is NOT blocked
     assert!(can_start(&conn, &[], "docker").unwrap());
 }
@@ -130,12 +142,12 @@ fn filtered_serial_and_semantics() {
     let b = Label::__new("b");
 
     // Test with only [a] is running
-    register(&conn, "test_a", &[a], SERIAL_NONE).unwrap();
+    register_in_txn(&conn, "test_a", &[a], SERIAL_NONE);
     // serial = "a & b" should NOT be blocked (running test doesn't have both a and b)
     assert!(can_start(&conn, &[], "a & b").unwrap());
 
     // Now add a test with [a, b]
-    register(&conn, "test_ab", &[a, b], SERIAL_NONE).unwrap();
+    register_in_txn(&conn, "test_ab", &[a, b], SERIAL_NONE);
     // serial = "a & b" IS now blocked
     assert!(!can_start(&conn, &[], "a & b").unwrap());
 }
@@ -148,12 +160,12 @@ fn filtered_serial_not_semantics() {
     let b = Label::__new("b");
 
     // Test with label [a] is running
-    register(&conn, "test_a", &[a], SERIAL_NONE).unwrap();
+    register_in_txn(&conn, "test_a", &[a], SERIAL_NONE);
     // serial = "!a" should NOT be blocked (running test HAS label a)
     assert!(can_start(&conn, &[], "!a").unwrap());
 
     // Test with label [b] is running (no label a)
-    register(&conn, "test_b", &[b], SERIAL_NONE).unwrap();
+    register_in_txn(&conn, "test_b", &[b], SERIAL_NONE);
     // serial = "!a" IS now blocked (test_b doesn't have a, so !a matches)
     assert!(!can_start(&conn, &[], "!a").unwrap());
 }
@@ -165,7 +177,7 @@ fn register_and_delete() {
     let (_dir, path) = temp_db();
     let (conn, _identity) = open_db(&path);
     let docker = Label::__new("docker");
-    let id = register(&conn, "my_test", &[docker], SERIAL_NONE).unwrap();
+    let id = register_in_txn(&conn, "my_test", &[docker], SERIAL_NONE);
 
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
@@ -186,7 +198,7 @@ fn delete_cascades_labels() {
     let (conn, _identity) = open_db(&path);
     let a = Label::__new("a");
     let b = Label::__new("b");
-    let id = register(&conn, "test", &[a, b], SERIAL_NONE).unwrap();
+    let id = register_in_txn(&conn, "test", &[a, b], SERIAL_NONE);
 
     let label_count: i64 = conn.query_row("SELECT COUNT(*) FROM labels", [], |r| r.get(0)).unwrap();
     assert_eq!(label_count, 2);
@@ -1129,24 +1141,24 @@ fn non_serial_allows_concurrent_execution() {
 /// for the same underlying regression ("non-serial tests wrongly
 /// serialized") but immune to the hang that test's own comment now admits
 /// it can't rule out: no threads at all here, just `can_start`'s own policy
-/// logic, checked directly against `THREADS - 1` already-registered
+/// logic, checked directly against `REGISTRATIONS` already-registered
 /// non-serial rows. If a regression made non-serial registrations block
 /// each other, this fails immediately — it cannot hang, since nothing here
 /// ever waits on anything.
 #[test]
 fn non_serial_registrations_do_not_block_can_start_for_another_non_serial_test() {
-    const THREADS: usize = 8;
+    const REGISTRATIONS: usize = 7;
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
 
-    for i in 0..THREADS - 1 {
-        register(&conn, &format!("parallel_test_{i}"), &[], SERIAL_NONE).unwrap();
+    for i in 0..REGISTRATIONS {
+        register_in_txn(&conn, &format!("parallel_test_{i}"), &[], SERIAL_NONE);
     }
 
     assert!(
         can_start(&conn, &[], SERIAL_NONE).unwrap(),
-        "{} live non-serial registrations must not block another non-serial test from starting",
-        THREADS - 1
+        "{REGISTRATIONS} live non-serial registrations must not block another non-serial test \
+         from starting"
     );
 }
 
@@ -1413,7 +1425,7 @@ fn migration_rewrites_legacy_non_canonical_rows() {
     let (conn, _identity) = open_db(&path);
     // Reset version so the migration runs again on the next open.
     conn.execute("PRAGMA user_version = 0", []).unwrap();
-    register(&conn, "legacy", &[], "(a) | (a)").unwrap();
+    register_in_txn(&conn, "legacy", &[], "(a) | (a)");
     drop(conn);
 
     // Re-open. open_db should run migrate_schema and rewrite the legacy row
@@ -1431,7 +1443,7 @@ fn migration_skips_already_canonical_rows() {
     let (_dir, path) = temp_db();
     let (conn, _identity) = open_db(&path);
     conn.execute("PRAGMA user_version = 0", []).unwrap();
-    register(&conn, "already_canonical", &[], "a").unwrap();
+    register_in_txn(&conn, "already_canonical", &[], "a");
     drop(conn);
 
     let (conn, _identity) = open_db(&path);
@@ -1449,7 +1461,7 @@ fn migrate_schema_completes_past_a_foreign_held_exclusive_lock_with_no_retry_cap
     // legacy non-canonical row for the migration to actually rewrite.
     let (conn, _identity) = open_db(&path);
     conn.execute("PRAGMA user_version = 0", []).unwrap();
-    register(&conn, "legacy", &[], "(a) | (a)").unwrap();
+    register_in_txn(&conn, "legacy", &[], "(a) | (a)");
     drop(conn);
 
     let foreign_conn = rusqlite::Connection::open(&path).unwrap();
