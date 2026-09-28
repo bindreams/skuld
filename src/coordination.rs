@@ -397,47 +397,72 @@ pub(crate) fn probe_try_init_lock(path: &std::path::Path) -> Result<(), std::fs:
 // Moved-database detection =====
 
 /// True once `conn`'s underlying main database file has been deleted,
-/// renamed, or replaced since `conn` opened it — `SQLITE_FCNTL_HAS_MOVED`,
-/// which SQLite's own unix and Windows VFSes both implement by comparing
-/// the file's current identity (inode on Unix, file id on Windows) against
-/// the one recorded at open time. This is what makes it safe for
-/// [`coordinate`] and [`TestRegistration`]'s cleanup to keep using one
-/// connection for their whole lifetime instead of reconnecting per
-/// operation (see their own docs for why reconnecting is itself a
-/// correctness bug, not just inefficient): every write first checks this,
-/// and refuses — loudly, via [`panic_on_moved_db`] — rather than risk
-/// writing through a connection whose own file has been swapped out from
-/// under it, which `registration_drop_corrupts_the_recreated_db_when_only_the_main_file_is_deleted_mid_run`
+/// renamed, or replaced since `conn` opened it.
+///
+/// On Unix, this is `SQLITE_FCNTL_HAS_MOVED`, which compares the file's
+/// current identity (inode) against the one recorded at open time. This is
+/// what makes it safe for [`coordinate`] and [`TestRegistration`]'s cleanup
+/// to keep using one connection for their whole lifetime instead of
+/// reconnecting per operation (see their own docs for why reconnecting is
+/// itself a correctness bug, not just inefficient): every write first
+/// checks this, and refuses — loudly, via [`panic_on_moved_db`] — rather
+/// than risk writing through a connection whose own file has been swapped
+/// out from under it, which
+/// `registration_drop_fails_loudly_instead_of_corrupting_when_only_the_main_file_is_deleted_mid_run`
 /// demonstrates can otherwise corrupt whatever now exists at that path.
 ///
-/// A single, fast, synchronous file-control call — no I/O beyond what the
-/// OS already cached identifying the open file, no blocking, so checking
-/// this before every write costs nothing worth avoiding it for.
+/// On Windows, SQLite's VFS (`winFileControl`) has no case for
+/// `SQLITE_FCNTL_HAS_MOVED` at all and always answers `SQLITE_NOTFOUND` —
+/// confirmed against the `bundled` `sqlite3.c` this crate compiles, and
+/// empirically by CI (windows/arm64 failed every coordination test with
+/// that exact code once this check started running unconditionally). So on
+/// Windows this function skips the file-control call and answers `false`
+/// outright. That's sound, not merely "assume the best": `winOpen` opens
+/// the main database file with `dwShareMode = FILE_SHARE_READ |
+/// FILE_SHARE_WRITE` — no `FILE_SHARE_DELETE` — so for as long as any
+/// connection (ours) holds the file open, no other handle on Windows can
+/// delete or rename it out from under us; the file this connection is
+/// writing to is therefore provably the same file it opened.
+/// `windows_open_db_file_blocks_delete_and_rename_while_held` exercises
+/// this invariant directly; if a future SQLite/rusqlite ever changes the
+/// share mode, that test — not a corrupted database — is what catches it.
+///
+/// A single, fast, synchronous file-control call on Unix — no I/O beyond
+/// what the OS already cached identifying the open file, no blocking, so
+/// checking this before every write costs nothing worth avoiding it for.
 fn db_has_moved(conn: &rusqlite::Connection) -> bool {
-    let mut has_moved: std::os::raw::c_int = 0;
-    let main = c"main";
-    // Safety: `conn.handle()` is a valid, currently-open `sqlite3*` for as
-    // long as `conn` is borrowed, which outlives this call; `main` is a
-    // NUL-terminated C string naming the (only) attached database Skuld
-    // ever uses; `&mut has_moved` is a valid `*mut c_int` for SQLite to
-    // write its 0-or-1 answer into, matching what `SQLITE_FCNTL_HAS_MOVED`
-    // documents it expects.
-    let rc = unsafe {
-        rusqlite::ffi::sqlite3_file_control(
-            conn.handle(),
-            main.as_ptr(),
-            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
-            (&raw mut has_moved).cast(),
-        )
-    };
-    assert_eq!(
-        rc,
-        rusqlite::ffi::SQLITE_OK,
-        "skuld: SQLITE_FCNTL_HAS_MOVED file-control failed with code {rc} — this platform's \
-         SQLite VFS may not implement it, which means Skuld can no longer tell a moved \
-         database apart from a live one and must not be trusted to keep writing"
-    );
-    has_moved != 0
+    #[cfg(unix)]
+    {
+        let mut has_moved: std::os::raw::c_int = 0;
+        let main = c"main";
+        // Safety: `conn.handle()` is a valid, currently-open `sqlite3*` for
+        // as long as `conn` is borrowed, which outlives this call; `main`
+        // is a NUL-terminated C string naming the (only) attached database
+        // Skuld ever uses; `&mut has_moved` is a valid `*mut c_int` for
+        // SQLite to write its 0-or-1 answer into, matching what
+        // `SQLITE_FCNTL_HAS_MOVED` documents it expects.
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                conn.handle(),
+                main.as_ptr(),
+                rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+                (&raw mut has_moved).cast(),
+            )
+        };
+        assert_eq!(
+            rc,
+            rusqlite::ffi::SQLITE_OK,
+            "skuld: SQLITE_FCNTL_HAS_MOVED file-control failed with code {rc} — this unix \
+             SQLite VFS was expected to implement it, which means Skuld can no longer tell a \
+             moved database apart from a live one and must not be trusted to keep writing"
+        );
+        has_moved != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = conn;
+        false
+    }
 }
 
 /// Panic loudly, naming `path`, if `conn`'s database has moved (see

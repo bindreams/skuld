@@ -329,6 +329,38 @@ fn registration_drop_fails_loudly_instead_of_corrupting_when_only_the_main_file_
     );
 }
 
+/// `db_has_moved` skips the `SQLITE_FCNTL_HAS_MOVED` file-control on
+/// Windows entirely (SQLite's `winFileControl` has no case for it — it
+/// always answers `SQLITE_NOTFOUND`, confirmed against the `bundled`
+/// `sqlite3.c` this crate compiles) and instead relies on an invariant:
+/// `winOpen` opens the main database file without `FILE_SHARE_DELETE`, so
+/// while any connection holds it open, nothing else on the system can
+/// delete or rename it. This test exercises that invariant directly,
+/// independent of `db_has_moved`'s own logic — if a future SQLite/rusqlite
+/// upgrade ever changes the share mode, this test starts failing instead of
+/// a moved database silently going unnoticed.
+#[cfg(windows)]
+#[test]
+fn windows_open_db_file_blocks_delete_and_rename_while_held() {
+    let (_dir, path) = temp_db();
+    let a = coordinate(&path, "a", &[], SERIAL_NONE);
+
+    assert!(
+        std::fs::remove_file(&path).is_err(),
+        "a registration's connection is still open on this file; Windows must refuse to delete \
+         it out from under that connection"
+    );
+
+    let renamed = path.with_file_name("renamed.skuld.db");
+    assert!(
+        std::fs::rename(&path, &renamed).is_err(),
+        "a registration's connection is still open on this file; Windows must refuse to rename \
+         it out from under that connection"
+    );
+
+    drop(a);
+}
+
 // Concurrent coordination =====
 
 #[test]
