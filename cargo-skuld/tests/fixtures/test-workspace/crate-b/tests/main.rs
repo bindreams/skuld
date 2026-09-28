@@ -3,13 +3,9 @@ pub const SHARED: skuld::Label;
 #[skuld::label]
 pub const WEIRDRES: skuld::Label;
 
-/// Appends one line to the timing dir's shared order log. Both crate-a's and
-/// crate-b's processes append to the SAME file, so its byte order is a real
-/// happens-before relation between the two processes — no synchronized or
-/// monotonic clock required. This relies on a single `write_all` per line
-/// under `O_APPEND`: POSIX guarantees a write at or under `PIPE_BUF` is
-/// atomic, so two processes' lines can never interleave into a corrupt line,
-/// and each process's own lines always keep their relative order.
+/// Appends one line to the timing dir's shared order log — see crate-a's
+/// copy of this function for the `O_APPEND`/`FILE_APPEND_DATA`,
+/// single-`write()`-call contract this relies on.
 fn append_order_log(dir: &std::path::Path, line: &str) {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
@@ -17,7 +13,15 @@ fn append_order_log(dir: &std::path::Path, line: &str) {
         .append(true)
         .open(dir.join("order.log"))
         .expect("open shared order log");
-    file.write_all(line.as_bytes()).expect("append order log line");
+    let bytes = line.as_bytes();
+    let written = file.write(bytes).expect("append order log line");
+    assert_eq!(
+        written,
+        bytes.len(),
+        "short write to the shared order log ({written} of {} bytes) breaks the one-write()-per-line \
+         atomicity this file's ordering guarantee depends on",
+        bytes.len()
+    );
 }
 
 /// Appends this process's start line now; returns a closure the caller runs
@@ -34,10 +38,7 @@ fn record_process_window(dir: &std::path::Path, name: &str) -> impl FnOnce() {
 
 #[skuld::test(serial = SHARED)]
 fn b_locks_shared_resource() {
-    // Widen this test's own process lifetime so an accidental overlap would
-    // be observable — see crate-a's a_uses_shared_resource for why the
-    // deterministic handshake lives in main() instead of here.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // No sleep — see crate-a's a_uses_shared_resource for why.
 }
 
 #[skuld::test]
@@ -55,8 +56,9 @@ fn main() {
     });
 
     if handshake {
-        // See crate-a's main() for why this brackets run_tests() rather
-        // than living inside b_locks_shared_resource's body.
+        // Signals readiness only, does not block — see crate-a's main()
+        // for why this brackets run_tests() rather than living inside
+        // b_locks_shared_resource's body, and what actually makes it safe.
         use std::io::Write;
         let mut stdout = std::io::stdout();
         stdout.write_all(b"R").expect("signal ready");
@@ -73,6 +75,8 @@ fn main() {
     let conclusion = runner.run_tests();
 
     if handshake {
+        // See crate-a's main() for why coming after run_tests() is what
+        // actually makes this safe.
         use std::io::Read;
         let mut release = [0u8; 1];
         std::io::stdin().read_exact(&mut release).expect("wait for release signal");

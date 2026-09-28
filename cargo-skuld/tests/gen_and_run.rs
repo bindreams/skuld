@@ -401,7 +401,7 @@ fn kill_on_drop_reaps_the_child_even_if_the_scope_panics_before_wait() {
 /// body's own captured output). Stopping at one byte and dropping the
 /// handle would close the pipe's read end while the child still had more
 /// to write, and the child would panic on the resulting broken pipe.
-fn read_ready_signal_then_drain(mut stdout: std::process::ChildStdout) {
+fn read_ready_signal_then_drain(mut stdout: std::process::ChildStdout) -> std::thread::JoinHandle<()> {
     let mut ready = [0u8; 1];
     stdout.read_exact(&mut ready).expect("read ready signal");
     assert_eq!(
@@ -411,7 +411,7 @@ fn read_ready_signal_then_drain(mut stdout: std::process::ChildStdout) {
     );
     std::thread::spawn(move || {
         let _ = std::io::copy(&mut stdout, &mut std::io::sink());
-    });
+    })
 }
 
 #[test]
@@ -452,7 +452,7 @@ fn negative_control_two_directly_spawned_processes_overlap() {
 
     let mut child_a = KillOnDrop::spawn(
         Command::new(bin_a)
-            .args(["a_uses_shared_resource", "--exact", "--nocapture"])
+            .args(["a_uses_shared_resource", "--exact"])
             .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", timing_dir.path())
             .env("SKULD_NEXTEST_FIXTURE_HANDSHAKE", "1")
             .stdin(Stdio::piped())
@@ -461,7 +461,7 @@ fn negative_control_two_directly_spawned_processes_overlap() {
     .expect("spawn crate-a binary directly");
     let mut child_b = KillOnDrop::spawn(
         Command::new(bin_b)
-            .args(["b_locks_shared_resource", "--exact", "--nocapture"])
+            .args(["b_locks_shared_resource", "--exact"])
             .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", timing_dir.path())
             .env("SKULD_NEXTEST_FIXTURE_HANDSHAKE", "1")
             .stdin(Stdio::piped())
@@ -469,14 +469,20 @@ fn negative_control_two_directly_spawned_processes_overlap() {
     )
     .expect("spawn crate-b binary directly");
 
-    read_ready_signal_then_drain(child_a.stdout());
-    read_ready_signal_then_drain(child_b.stdout());
+    let drain_a = read_ready_signal_then_drain(child_a.stdout());
+    let drain_b = read_ready_signal_then_drain(child_b.stdout());
 
     child_a.stdin().write_all(b"G").expect("release a");
     child_b.stdin().write_all(b"G").expect("release b");
 
     assert!(child_a.wait().expect("wait a").success());
     assert!(child_b.wait().expect("wait b").success());
+    // Each child has exited, so its stdout is at EOF and io::copy above
+    // returns — join rather than leaving these detached, so a panic in
+    // either drain thread (e.g. a real I/O error, not EOF) surfaces here
+    // instead of being silently dropped.
+    drain_a.join().expect("drain thread for crate-a must not panic");
+    drain_b.join().expect("drain thread for crate-b must not panic");
 
     let a = read_window(timing_dir.path(), "a_uses_shared_resource");
     let b = read_window(timing_dir.path(), "b_locks_shared_resource");
@@ -487,24 +493,117 @@ fn negative_control_two_directly_spawned_processes_overlap() {
     );
 }
 
+/// The fixture workspace's total test count, via nextest's own
+/// machine-readable `--message-format json` output. NOT group membership
+/// itself — nextest has no JSON output for that; see
+/// `assert_shared_resource_tests_share_a_serial_group`'s doc. Used to size
+/// `--test-threads` so a *missing* tool-config-file can't make
+/// `run_serializes_the_cross_binary_conflict_via_generated_tool_config`
+/// accidentally pass by nextest naturally serializing everything anyway on
+/// a low-core-count runner, regardless of whether the config is honored.
+fn fixture_test_count(root: &Path) -> usize {
+    let output = Command::new("cargo")
+        .current_dir(root)
+        .args(["nextest", "list", "--message-format", "json"])
+        .output()
+        .expect("spawn cargo nextest list");
+    assert!(
+        output.status.success(),
+        "cargo nextest list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cargo nextest list must emit valid JSON");
+    parsed["test-count"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no test-count field in `cargo nextest list` JSON: {parsed}")) as usize
+}
+
+/// Parses a generated tool-config-file and asserts `a_uses_shared_resource`
+/// and `b_locks_shared_resource` resolve into the SAME `max-threads = 1`
+/// test group — the structural guarantee the whole generated config exists
+/// to provide, checked at the config level rather than by observing
+/// process timing.
+///
+/// This checks our own generated TOML, not nextest's own resolution of it:
+/// `cargo nextest show-config test-groups` is the only nextest command
+/// that reports which tests actually land in which group at runtime, and
+/// it has no machine-readable output mode (checked directly against
+/// nextest 0.9.137's own `--help`: text only, no `--message-format`/`-T`
+/// flag on that subcommand) — parsing that output was deliberately not
+/// done here rather than scraping its human-readable text.
+/// `run_correctly_selects_tests_with_special_characters_in_their_names`
+/// below separately proves real nextest filter parsing accepts this same
+/// generator's escaped names, which is the part of "does nextest actually
+/// honor this" most likely to break silently.
+fn assert_shared_resource_tests_share_a_serial_group(tool_config_path: &Path) {
+    let rendered = std::fs::read_to_string(tool_config_path).expect("read generated tool-config-file");
+    let value: toml::Value = rendered.parse().expect("generated tool-config-file must be valid TOML");
+    let groups = value["test-groups"].as_table().expect("test-groups table");
+    let overrides = value["profile"]["default"]["overrides"]
+        .as_array()
+        .expect("overrides array");
+
+    let shared_override = overrides
+        .iter()
+        .find(|o| {
+            let filter = o["filter"].as_str().unwrap_or_default();
+            filter.contains("a_uses_shared_resource") && filter.contains("b_locks_shared_resource")
+        })
+        .unwrap_or_else(|| panic!("no override filter covers both conflicting tests: {rendered}"));
+
+    let group_name = shared_override["test-group"]
+        .as_str()
+        .unwrap_or_else(|| panic!("override has no test-group: {shared_override}"));
+    let group = groups
+        .get(group_name)
+        .unwrap_or_else(|| panic!("override references undefined test-group {group_name:?}: {rendered}"));
+    assert_eq!(
+        group["max-threads"].as_integer(),
+        Some(1),
+        "the shared group both conflicting tests resolve to must be max-threads = 1, got {group}"
+    );
+}
+
 #[test]
 fn run_serializes_the_cross_binary_conflict_via_generated_tool_config() {
     // Positive case: with the generated tool-config, nextest must not
     // launch the second process until the first has fully exited.
+    //
+    // Primary check: assert_shared_resource_tests_share_a_serial_group,
+    // below — a structural, config-level guarantee instead of a
+    // timing-based one.
+    //
+    // Secondary check: the shared order log (see crate-a's
+    // append_order_log) must not show the two processes' windows
+    // overlapping. This is what would actually observe nextest failing to
+    // honor a correct config at runtime, but it's a backstop now, not the
+    // primary signal — unlike before, the fixture tests no longer widen
+    // their own process lifetime with a sleep to make this observable.
+    //
+    // --test-threads is set to at least the fixture's own test count so a
+    // *missing* tool-config can't pass by nextest naturally serializing
+    // everything anyway on a low-core-count runner.
     let _guard = lock_fixture_workspace();
     let real_dir = tempfile::tempdir().expect("tempdir");
     let output_dir = tempfile::tempdir().expect("tempdir");
+    let tool_config_path = output_dir.path().join("skuld-nextest.toml");
+    let test_threads = fixture_test_count(_guard.root());
     let status = Command::new(bin())
         .current_dir(_guard.root())
         .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", real_dir.path())
         .args(["nextest", "run", "--output"])
-        .arg(output_dir.path().join("skuld-nextest.toml"))
+        .arg(&tool_config_path)
+        .args(["--test-threads", &test_threads.to_string()])
         .status()
         .expect("spawn cargo-skuld run");
     assert!(
         status.success(),
         "cargo-skuld run must succeed against the fixture workspace"
     );
+
+    assert_shared_resource_tests_share_a_serial_group(&tool_config_path);
+
     let real_a = read_window(real_dir.path(), "a_uses_shared_resource");
     let real_b = read_window(real_dir.path(), "b_locks_shared_resource");
     assert!(

@@ -4,10 +4,22 @@ pub const SHARED: skuld::Label;
 /// Appends one line to the timing dir's shared order log. Both crate-a's and
 /// crate-b's processes append to the SAME file, so its byte order is a real
 /// happens-before relation between the two processes — no synchronized or
-/// monotonic clock required. This relies on a single `write_all` per line
-/// under `O_APPEND`: POSIX guarantees a write at or under `PIPE_BUF` is
-/// atomic, so two processes' lines can never interleave into a corrupt line,
-/// and each process's own lines always keep their relative order.
+/// monotonic clock required. The guarantee this relies on is `O_APPEND`
+/// (Unix) / `FILE_APPEND_DATA` (Windows — what `OpenOptions::append(true)`
+/// opens the file with): each individual `write()` call gets its
+/// end-of-file seek and its write treated as one atomic kernel operation,
+/// so concurrent writers' calls land at distinct, correctly-ordered offsets
+/// and one call's bytes can never land in the middle of another's.
+/// `PIPE_BUF` (the write()-atomicity size limit for *pipes*) does not apply
+/// to regular files and is not what's relied on here.
+///
+/// That guarantee is per `write()` *call*, not per logical line — which is
+/// exactly why this uses a single raw `write()` and asserts the full
+/// length was written, instead of `write_all` (which would silently retry
+/// with more `write()` calls on a short write, and a second process's line
+/// could then land in the gap between them). A short write here is a
+/// contract violation, not a recoverable condition: panicking is the only
+/// way to know, from a test, that the ordering guarantee itself broke down.
 fn append_order_log(dir: &std::path::Path, line: &str) {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
@@ -15,7 +27,15 @@ fn append_order_log(dir: &std::path::Path, line: &str) {
         .append(true)
         .open(dir.join("order.log"))
         .expect("open shared order log");
-    file.write_all(line.as_bytes()).expect("append order log line");
+    let bytes = line.as_bytes();
+    let written = file.write(bytes).expect("append order log line");
+    assert_eq!(
+        written,
+        bytes.len(),
+        "short write to the shared order log ({written} of {} bytes) breaks the one-write()-per-line \
+         atomicity this file's ordering guarantee depends on",
+        bytes.len()
+    );
 }
 
 /// Appends this process's start line now; returns a closure the caller runs
@@ -36,15 +56,16 @@ fn record_process_window(dir: &std::path::Path, name: &str) -> impl FnOnce() {
 
 #[skuld::test(labels = [SHARED])]
 fn a_uses_shared_resource() {
-    // Widen this test's own process lifetime so an accidental overlap would
-    // be observable. The deterministic path used by
-    // negative_control_two_directly_spawned_processes_overlap is a
-    // stdin/stdout handshake in main(), bracketing run_tests() — not here:
-    // a handshake in the test body itself would need both processes alive
-    // *inside* the body simultaneously, which is exactly what skuld's own
-    // SHARED/serial coordination between this test and crate-b's
-    // b_locks_shared_resource is designed to prevent.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // No sleep: the negative control's determinism comes entirely from the
+    // stdin/stdout handshake in main() (bracketing run_tests(), not this
+    // body — a handshake in the body itself would need both processes
+    // alive *inside* the body simultaneously, which is exactly what
+    // skuld's own SHARED/serial coordination between this test and
+    // crate-b's b_locks_shared_resource is designed to prevent). The
+    // positive case's correctness no longer depends on this process's
+    // lifetime being artificially widened either — see
+    // run_serializes_the_cross_binary_conflict_via_generated_tool_config's
+    // doc for why.
 }
 
 #[skuld::test]
@@ -62,15 +83,11 @@ fn main() {
     });
 
     if handshake {
-        // Real synchronization, not a guessed duration: used only by
-        // negative_control_two_directly_spawned_processes_overlap (see its
-        // doc), which spawns this binary directly and needs a genuine
-        // guarantee that this process and its counterpart in crate-b were
-        // alive at the same instant. Bracketing run_tests() (rather than
-        // putting this inside a_uses_shared_resource's body) means the
-        // driver's confirmation that both processes are ready happens
-        // before either process starts running actual tests at all, so it
-        // can never race skuld's own cross-process test coordination.
+        // Signals readiness only — does not itself block anything.
+        // run_tests() below starts immediately after this write, without
+        // waiting for the driver to acknowledge it. What actually makes
+        // this safe is the *other* half of the handshake, after
+        // run_tests() below: see its comment.
         use std::io::Write;
         let mut stdout = std::io::stdout();
         stdout.write_all(b"R").expect("signal ready");
@@ -95,6 +112,16 @@ fn main() {
     let conclusion = runner.run_tests();
 
     if handshake {
+        // This is what makes the handshake safe, by coming *after*
+        // run_tests(): the end marker below can only be recorded once this
+        // read unblocks, and it only unblocks once the driver has written
+        // the release byte — which the driver only does after observing
+        // the ready signal from BOTH this process and crate-b's. Since the
+        // start marker is always recorded before the ready signal is even
+        // sent (see record_process_window's call site above), both
+        // processes' start markers are therefore guaranteed to already be
+        // in the shared order log before either process's end marker can
+        // be — regardless of how fast or slow run_tests() itself is.
         use std::io::Read;
         let mut release = [0u8; 1];
         std::io::stdin().read_exact(&mut release).expect("wait for release signal");
