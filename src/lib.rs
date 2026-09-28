@@ -199,7 +199,7 @@ pub mod __private {
     /// that reason.
     #[cfg(unix)]
     pub fn probe_coordination_connect(path: &std::path::Path) -> rusqlite::Connection {
-        crate::coordination::open_db(path)
+        crate::coordination::open_db(path).0
     }
 
     /// Probe hook for Skuld's own test suite (`tests/lock_contention_regression.rs`,
@@ -248,7 +248,7 @@ pub mod __private {
     /// statement — exactly what its cleanup's `DELETE` does.
     pub fn probe_drop_panic_during_unwind(path: &std::path::Path) {
         let _registration = crate::coordination::coordinate(path, "probe", &[], "");
-        let saboteur = crate::coordination::open_db(path);
+        let (saboteur, _identity) = crate::coordination::open_db(path);
         saboteur
             .execute_batch("DROP TABLE running")
             .unwrap_or_else(|e| panic!("probe: could not drop the running table to corrupt it: {e}"));
@@ -287,12 +287,12 @@ pub mod __private {
 
         // Two of Skuld's own connections to the same coordination DB,
         // opened exactly as any two real Skuld processes/threads would.
-        let holder = crate::coordination::open_db(path);
+        let (holder, _identity) = crate::coordination::open_db(path);
         holder
             .execute_batch("BEGIN EXCLUSIVE")
             .unwrap_or_else(|e| panic!("probe: holder's BEGIN EXCLUSIVE failed: {e}"));
 
-        let waiter = crate::coordination::open_db(path);
+        let (waiter, _identity) = crate::coordination::open_db(path);
         let result = waiter.execute_batch("BEGIN IMMEDIATE");
         let err = match result {
             Ok(()) => panic!("probe: waiter's BEGIN IMMEDIATE must fail while holder holds BEGIN EXCLUSIVE"),

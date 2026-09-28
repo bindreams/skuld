@@ -9,6 +9,38 @@ use crate::coordination::{
 };
 use crate::label::Label;
 
+/// Hard-link `path` and its `-wal`/`-shm` companions to `<path's
+/// dir>/<name>.db`(`-wal`/`-shm`), returning the new main-file path — a
+/// *witness* onto the exact committed state at the moment of the call,
+/// reachable independent of anything that later happens to `path` itself
+/// (an `unlink`, e.g.). All three are hard-linked, not just the main file:
+/// under WAL mode a commit lands in `-wal`, not the main file, until
+/// checkpointed, so a witness missing its own `-wal`/`-shm` companions
+/// would see a stale, pre-commit view instead of the state this function's
+/// caller actually observed.
+#[cfg(unix)]
+fn hard_link_db_and_companions(path: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let witness = path.with_file_name(format!("{name}.db"));
+    std::fs::hard_link(path, &witness).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        let from = companion_path(path, suffix);
+        if from.exists() {
+            std::fs::hard_link(&from, companion_path(&witness, suffix)).unwrap();
+        }
+    }
+    witness
+}
+
+/// `path` with `suffix` appended verbatim to the filename — mirrors
+/// `super::companion_path` (private to `coordination.rs`) for test-side use
+/// naming `-wal`/`-shm` companions.
+#[cfg(unix)]
+fn companion_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
 /// Create a temporary database for testing.
 fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -21,14 +53,14 @@ fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
 #[test]
 fn non_serial_can_start_when_empty() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     assert!(can_start(&conn, &[], SERIAL_NONE).unwrap());
 }
 
 #[test]
 fn non_serial_blocked_by_global_serial() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     register(&conn, "blocker", &[], SERIAL_ALL).unwrap();
     assert!(!can_start(&conn, &[], SERIAL_NONE).unwrap());
 }
@@ -36,7 +68,7 @@ fn non_serial_blocked_by_global_serial() {
 #[test]
 fn non_serial_blocked_by_matching_filter() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let docker = Label::__new("docker");
     // A serial test filtering on "docker" is running
     register(&conn, "serial_docker", &[], "docker").unwrap();
@@ -49,7 +81,7 @@ fn non_serial_blocked_by_matching_filter() {
 #[test]
 fn global_serial_blocked_when_anything_running() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     register(&conn, "some_test", &[], SERIAL_NONE).unwrap();
     assert!(!can_start(&conn, &[], SERIAL_ALL).unwrap());
 }
@@ -57,14 +89,14 @@ fn global_serial_blocked_when_anything_running() {
 #[test]
 fn global_serial_can_start_when_empty() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     assert!(can_start(&conn, &[], SERIAL_ALL).unwrap());
 }
 
 #[test]
 fn filtered_serial_blocked_by_matching_running_test() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let docker = Label::__new("docker");
     // A non-serial test with label "docker" is running
     register(&conn, "docker_test", &[docker], SERIAL_NONE).unwrap();
@@ -75,7 +107,7 @@ fn filtered_serial_blocked_by_matching_running_test() {
 #[test]
 fn filtered_serial_not_blocked_by_non_matching() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let network = Label::__new("network");
     // A test with label "network" is running
     register(&conn, "network_test", &[network], SERIAL_NONE).unwrap();
@@ -86,7 +118,7 @@ fn filtered_serial_not_blocked_by_non_matching() {
 #[test]
 fn filtered_serial_and_semantics() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let a = Label::__new("a");
     let b = Label::__new("b");
 
@@ -104,7 +136,7 @@ fn filtered_serial_and_semantics() {
 #[test]
 fn filtered_serial_not_semantics() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let a = Label::__new("a");
     let b = Label::__new("b");
 
@@ -124,7 +156,7 @@ fn filtered_serial_not_semantics() {
 #[test]
 fn register_and_delete() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let docker = Label::__new("docker");
     let id = register(&conn, "my_test", &[docker], SERIAL_NONE).unwrap();
 
@@ -144,7 +176,7 @@ fn register_and_delete() {
 #[test]
 fn delete_cascades_labels() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let a = Label::__new("a");
     let b = Label::__new("b");
     let id = register(&conn, "test", &[a, b], SERIAL_NONE).unwrap();
@@ -164,14 +196,14 @@ fn registration_guard_cleans_up_on_drop() {
     let (_dir, path) = temp_db();
     {
         let _reg = coordinate(&path, "guarded_test", &[], SERIAL_NONE);
-        let conn = open_db(&path);
+        let (conn, _identity) = open_db(&path);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
     }
     // After drop, the entry should be gone
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
         .unwrap();
@@ -185,7 +217,7 @@ fn registration_guard_cleans_up_on_panic() {
         let _reg = coordinate(&path, "panicking_test", &[], SERIAL_NONE);
         panic!("intentional panic");
     });
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
         .unwrap();
@@ -256,7 +288,7 @@ fn registration_drop_fails_loudly_instead_of_deleting_a_different_registration_t
          deleted/replaced mid-run, not silently succeed"
     );
 
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     assert!(
         !can_start(&conn, &[], SERIAL_NONE).unwrap(),
         "dropping a must not have deleted b's still-live global-serial row just because they \
@@ -319,13 +351,66 @@ fn registration_drop_fails_loudly_instead_of_corrupting_when_only_the_main_file_
          deleted out from under a, so nothing about a's mishap should affect b"
     );
 
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
         .expect("b's DB must still be queryable, not corrupted, after this whole sequence");
     assert_eq!(
         count, 0,
         "b's row must have been cleanly deleted by its own successful drop"
+    );
+}
+
+/// Finding 2 (round-6 review): deleting only `-wal` — the main file's own
+/// identity untouched — used to go completely undetected: the reviewer's
+/// cross-process probe showed a fresh connection registering `SERIAL_ALL`
+/// beside a live `SERIAL_ALL` row whose owning connection's `-wal` had been
+/// deleted, and that row's own `drop` then succeeding silently. Losing the
+/// WAL replaces the database's *live* state (anything not yet checkpointed
+/// into the main file) out from under every connection still holding it
+/// open, which is exactly the "deleted or replaced mid-run" hazard the
+/// owner's fail-loudly decision covers — not a narrower case exempt from
+/// it.
+///
+/// **RED, before this fix:** `drop(a)` below succeeded silently even
+/// though its `-wal` companion was deleted. **GREEN, now:**
+/// `db_or_companions_have_moved`'s independent `-wal`/`-shm` identity
+/// check catches it.
+#[cfg(unix)]
+#[test]
+fn registration_drop_fails_loudly_when_only_the_wal_companion_is_deleted_mid_run() {
+    let (_dir, path) = temp_db();
+    let a = coordinate(&path, "a", &[], SERIAL_NONE);
+
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    std::fs::remove_file(std::path::PathBuf::from(&wal)).unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(a)));
+    assert!(
+        result.is_err(),
+        "drop(a) must panic once it discovers its -wal companion is gone, even though the main \
+         file's own identity is untouched"
+    );
+}
+
+/// The `-shm` counterpart of the test above — same hazard, the other
+/// companion.
+#[cfg(unix)]
+#[test]
+fn registration_drop_fails_loudly_when_only_the_shm_companion_is_deleted_mid_run() {
+    let (_dir, path) = temp_db();
+    let a = coordinate(&path, "a", &[], SERIAL_NONE);
+
+    let mut shm = path.as_os_str().to_owned();
+    shm.push("-shm");
+    std::fs::remove_file(std::path::PathBuf::from(&shm)).unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(a)));
+    assert!(
+        result.is_err(),
+        "drop(a) must panic once it discovers its -shm companion is gone, even though the main \
+         file's own identity is untouched"
     );
 }
 
@@ -341,15 +426,29 @@ fn registration_drop_fails_loudly_instead_of_corrupting_when_only_the_main_file_
 /// foreign `BEGIN EXCLUSIVE`. **GREEN, now:** the check runs inside the
 /// retried closure, before every attempt, so it catches the move the very
 /// next time `retry_busy` calls back into it.
+///
+/// Verified through a *witness*, not just "did something eventually
+/// panic": a hard link to the pre-move inode (kept alive independent of
+/// the later `unlink`, same technique for `-wal`/`-shm` so the witness sees
+/// the same committed state a fresh reader of the original name would),
+/// checked *after* the whole sequence for whether `a`'s row is still
+/// there. A check placed only *after* an already-completed write — which
+/// is what removing just the in-loop check, but keeping the one after
+/// `retry_busy` returns, would leave — still eventually panics here too
+/// (the after-check catches it on the very next line), so "it panicked"
+/// alone can't tell the two apart; "the DELETE never actually ran against
+/// the orphaned file" can.
 #[cfg(unix)]
 #[test]
 fn registration_drop_fails_loudly_when_the_db_moves_mid_retry() {
     let (_dir, path) = temp_db();
     let a = coordinate(&path, "a", &[], SERIAL_NONE);
 
+    let witness = hard_link_db_and_companions(&path, "witness");
+
     // Force `drop(a)`'s DELETE into `retry_busy`'s loop: hold an exclusive
     // transaction open on a second, foreign connection first.
-    let foreign_conn = open_db(&path);
+    let (foreign_conn, _identity) = open_db(&path);
     foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -375,6 +474,17 @@ fn registration_drop_fails_loudly_when_the_db_moves_mid_retry() {
         "drop(a) must panic once its retried DELETE discovers the DB moved mid-retry, not \
          succeed silently because the check only ran once before the retry loop started"
     );
+
+    let witness_conn = rusqlite::Connection::open(&witness).unwrap();
+    let count: i64 = witness_conn
+        .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "the retried DELETE must never have executed against the orphaned original file — a's \
+         row must still be there, proving the moved-DB check caught the move before attempting \
+         the write, not merely panicked sometime after an unguarded write already ran"
+    );
 }
 
 /// Finding 2 (round-5 review): `open_db`'s own schema-init write
@@ -388,6 +498,14 @@ fn registration_drop_fails_loudly_when_the_db_moves_mid_retry() {
 /// though `.skuld.db` was deleted while its schema-init write was
 /// mid-retry. **GREEN, now:** the check inside `retry_busy`'s closure
 /// catches it on the next attempt.
+///
+/// Verified through a witness (see the sibling `TestRegistration` version
+/// of this test for why "it panicked" alone doesn't distinguish an
+/// in-loop check from one placed only after `retry_busy` returns): a hard
+/// link, taken before the schema exists, to the pre-move inode. If
+/// `INIT_SQL` ever actually ran against the orphaned original file before
+/// the panic, the witness would show the `running` table created; it must
+/// not.
 #[cfg(unix)]
 #[test]
 fn open_db_schema_init_fails_loudly_when_the_db_moves_mid_retry() {
@@ -400,6 +518,8 @@ fn open_db_schema_init_fails_loudly_when_the_db_moves_mid_retry() {
     foreign_conn
         .execute_batch("PRAGMA journal_mode=WAL; BEGIN EXCLUSIVE")
         .unwrap();
+
+    let witness = hard_link_db_and_companions(&path, "witness");
 
     let (tx, rx) = std::sync::mpsc::channel();
     let path2 = path.clone();
@@ -419,6 +539,21 @@ fn open_db_schema_init_fails_loudly_when_the_db_moves_mid_retry() {
         result.is_err(),
         "open_db's schema-init write must panic once it discovers the DB moved mid-retry, not \
          return a connection that silently wrote INIT_SQL through a stale file identity"
+    );
+
+    let witness_conn = rusqlite::Connection::open(&witness).unwrap();
+    let table_count: i64 = witness_conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='running'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        table_count, 0,
+        "INIT_SQL must never have executed against the orphaned original file — the moved-DB \
+         check must catch this before the write, not merely panic sometime after an unguarded \
+         write already ran"
     );
 }
 
@@ -477,6 +612,86 @@ fn open_db_fails_loudly_when_the_profile_directory_is_replaced_wholesale_mid_ret
     );
 }
 
+/// Finding 4 (round-6 review): the end-to-end test above can't distinguish
+/// "`panic_on_split_lock`'s in-loop call is present" from "it's missing but
+/// `panic_on_moved_db`'s co-located in-loop call still catches the same
+/// event" — a wholesale directory replacement necessarily also changes
+/// what `path` resolves to, so the DB-file identity check independently
+/// catches every reachable end-to-end scenario that splits the lock,
+/// making a mutation of `panic_on_split_lock`'s call site alone
+/// unobservable there by construction, not by a gap in that test. This
+/// tests `target_has_split` itself directly instead, the same way
+/// `db_has_moved_detects_a_fresh_file_renamed_over_the_path_while_a_connection_is_open`
+/// tests `db_has_moved` directly for the same reason.
+#[cfg(unix)]
+#[test]
+fn init_lock_target_has_split_detects_a_wholesale_directory_replacement() {
+    let outer = tempfile::tempdir().unwrap();
+    let profile = outer.path().join("profile");
+    std::fs::create_dir(&profile).unwrap();
+    let path = profile.join("test-coordination.db");
+
+    let mut split_detected = false;
+    super::lock::with_init_lock(&path, |token| {
+        let aside = outer.path().join("profile-aside");
+        std::fs::rename(&profile, &aside).unwrap();
+        std::fs::create_dir(&profile).unwrap();
+        split_detected = token.target_has_split();
+    });
+    assert!(
+        split_detected,
+        "InitLockHeld::target_has_split must detect a wholesale directory replacement while the \
+         lock is held"
+    );
+}
+
+/// Finding 5 (round-6 review): `coordinate`'s own loop must catch a move
+/// landing mid-retry too, the same way `open_db`'s and `TestRegistration`'s
+/// do — checked (via `panic_on_moved_db_full`) at the top of every
+/// iteration, before the transaction closure runs, not just once before
+/// the loop started.
+#[cfg(unix)]
+#[test]
+fn coordinate_fails_loudly_when_the_db_moves_mid_retry() {
+    let (_dir, path) = temp_db();
+
+    let (foreign_conn, _identity) = open_db(&path);
+    foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let witness = hard_link_db_and_companions(&path, "witness");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path2 = path.clone();
+    let waiter = std::thread::spawn(move || {
+        set_test_retry_hook(tx);
+        coordinate(&path2, "waiter", &[], SERIAL_NONE)
+    });
+    rx.recv()
+        .expect("coordinate never retried — test setup is broken, not the fix");
+
+    std::fs::remove_file(&path).unwrap();
+    foreign_conn.execute_batch("COMMIT").unwrap();
+    drop(foreign_conn);
+
+    let result = waiter.join();
+    assert!(
+        result.is_err(),
+        "coordinate must panic once its per-iteration check discovers the DB moved mid-retry, \
+         not silently register through a stale connection"
+    );
+
+    let witness_conn = rusqlite::Connection::open(&witness).unwrap();
+    let count: i64 = witness_conn
+        .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "the retried transaction must never have executed against the orphaned original file \
+         — no row for 'waiter' must have been inserted there, proving the moved-DB check \
+         caught the move before attempting the write"
+    );
+}
+
 /// Finding 4a (round-5 review): `SQLITE_FCNTL_HAS_MOVED` alone doesn't
 /// reliably catch a symlink *ancestor* of `path` being retargeted mid-run —
 /// see `db_has_moved`'s doc for why. `FileIdentity`'s own independent
@@ -525,21 +740,19 @@ fn registration_drop_fails_loudly_when_a_parent_symlink_is_retargeted_mid_run() 
     drop(b);
 }
 
-/// Finding 4b (round-5 review): a write against a connection whose
-/// `-wal`/`-shm` companion vanished out from under it (main file identity
-/// untouched, so `db_has_moved` has nothing to catch) tends to surface as
-/// SQLite's broad, opaque `SQLITE_IOERR` family rather than anything
-/// naming "moved" — `moved_db_message_for` remaps that specific shape to
-/// the same clear message. Exercised directly against a synthetic error
-/// rather than a live filesystem race: forcing a real `-wal` deletion to
-/// actually produce `SQLITE_IOERR` (rather than SQLite silently
-/// recreating a fresh WAL, which is what several filesystems do) is
-/// inherently filesystem- and timing-dependent, exactly the kind of
-/// non-determinism a regression test must not carry — the classification
-/// itself is what this crate controls and is what's worth testing
-/// directly.
+/// Finding 3 (round-6 review): `moved_db_message_for` must not assume
+/// "I/O-error shape" means "moved" — it must re-check, at the moment of
+/// the call, whether the DB has actually moved, and only say so if that
+/// check confirms it. Against a connection that has *not* moved, a
+/// synthetic I/O-class error gets the detailed I/O message (naming the
+/// path, the extended code, and the system errno) — not the "deleted or
+/// replaced" one, which would mislabel a genuine I/O error (`ENOSPC` on a
+/// full filesystem, e.g. — the reviewer's own reproduction) as a move that
+/// never happened.
 #[test]
-fn moved_db_message_maps_a_system_io_failure_to_the_clear_moved_message() {
+fn moved_db_message_reports_a_system_io_failure_as_is_when_the_db_has_not_moved() {
+    let (_dir, path) = temp_db();
+    let (conn, identity) = open_db(&path);
     let io_err = rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error {
             code: rusqlite::ErrorCode::SystemIoFailure,
@@ -547,18 +760,46 @@ fn moved_db_message_maps_a_system_io_failure_to_the_clear_moved_message() {
         },
         Some("disk I/O error".to_string()),
     );
-    let msg = super::moved_db_message_for(&io_err, std::path::Path::new("/tmp/.skuld.db"));
+    let msg = super::moved_db_message_for(&conn, &io_err, &path, identity.main);
     assert!(
-        msg.is_some_and(|m| m.contains("deleted or replaced mid-run") && m.contains(".skuld.db")),
-        "an I/O-failure-class error must map to the same clear moved-DB message, naming the path"
+        msg.as_ref().is_some_and(|m| !m.contains("deleted or replaced mid-run")
+            && m.contains("I/O error")
+            && m.contains("extended code")
+            && m.contains("system errno")),
+        "an unconfirmed I/O-failure-class error must be reported as-is, not mislabelled as \
+         'moved': got {msg:?}"
     );
 }
 
-/// The flip side of the test above: `moved_db_message_for` must stay
-/// narrow — only the I/O-failure shape, not a blanket reinterpretation of
-/// every SQLite error as "moved."
+/// The flip side: once the DB genuinely has moved, the same shape of
+/// I/O-class error *does* get the clear "moved" message.
+#[cfg(unix)]
+#[test]
+fn moved_db_message_reports_the_clear_moved_message_when_the_db_has_actually_moved() {
+    let (_dir, path) = temp_db();
+    let (conn, identity) = open_db(&path);
+    std::fs::remove_file(&path).unwrap();
+    let io_err = rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::SystemIoFailure,
+            extended_code: rusqlite::ffi::SQLITE_IOERR_SHORT_READ,
+        },
+        Some("disk I/O error".to_string()),
+    );
+    let msg = super::moved_db_message_for(&conn, &io_err, &path, identity.main);
+    assert!(
+        msg.as_ref().is_some_and(|m| m.contains("deleted or replaced mid-run")),
+        "once the DB has actually moved, an I/O-failure-class error must get the clear moved \
+         message: got {msg:?}"
+    );
+}
+
+/// `moved_db_message_for` must stay narrow — only the I/O-failure shape,
+/// not a blanket reinterpretation of every SQLite error as "moved."
 #[test]
 fn moved_db_message_does_not_reclassify_unrelated_errors() {
+    let (_dir, path) = temp_db();
+    let (conn, identity) = open_db(&path);
     let busy_err = rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error {
             code: rusqlite::ErrorCode::DatabaseBusy,
@@ -567,8 +808,32 @@ fn moved_db_message_does_not_reclassify_unrelated_errors() {
         None,
     );
     assert!(
-        super::moved_db_message_for(&busy_err, std::path::Path::new("/tmp/.skuld.db")).is_none(),
+        super::moved_db_message_for(&conn, &busy_err, &path, identity.main).is_none(),
         "moved_db_message_for must be narrow — only the I/O-failure shape, not every SQLite error"
+    );
+}
+
+/// Finding 4 (round-6 review): a direct unit test of `db_has_moved` itself,
+/// against a fresh file renamed atomically over `path` while `conn` stays
+/// open — not going through `coordinate`/`Drop`, so a mutation that only
+/// breaks one of `db_has_moved`'s two independent checks can't hide behind
+/// the other one catching the same higher-level scenario for an unrelated
+/// reason.
+#[cfg(unix)]
+#[test]
+fn db_has_moved_detects_a_fresh_file_renamed_over_the_path_while_a_connection_is_open() {
+    let (_dir, path) = temp_db();
+    let (conn, identity) = open_db(&path);
+
+    // A completely different file, renamed atomically over `path` — an
+    // ordinary `rename(2)`, not skuld's own delete/republish machinery.
+    let other_path = path.with_file_name("other.db");
+    std::fs::write(&other_path, b"not a real sqlite db").unwrap();
+    std::fs::rename(&other_path, &path).unwrap();
+
+    assert!(
+        super::db_has_moved(&conn, &path, identity.main),
+        "db_has_moved must detect a fresh file renamed over path while conn is still open"
     );
 }
 
@@ -692,7 +957,7 @@ fn filtered_serial_blocks_only_matching_tests() {
 
     // A test with label "docker" (matching filter) should be blocked.
     // Test this by checking can_start, since coordinate would block.
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     assert!(!can_start(&conn, &[docker], SERIAL_NONE).unwrap());
 }
 
@@ -743,7 +1008,7 @@ fn open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap()
     let waiter_path = path.clone();
     let waiter = std::thread::spawn(move || {
         set_test_retry_hook(tx);
-        let conn = open_db(&waiter_path);
+        let (conn, _identity) = open_db(&waiter_path);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
             .expect("schema must exist and be queryable once open_db returns");
@@ -784,7 +1049,7 @@ fn registration_drop_deletes_past_a_concurrent_held_exclusive_lock_with_no_retry
     // A concurrent, already-initialized connection — the ordinary shape of
     // a live `coordinate` caller elsewhere in the system, which never takes
     // the coordination DB's init lock once its own `open_db` call returns.
-    let foreign_conn = open_db(&path);
+    let (foreign_conn, _identity) = open_db(&path);
     foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -803,7 +1068,7 @@ fn registration_drop_deletes_past_a_concurrent_held_exclusive_lock_with_no_retry
         .join()
         .expect("TestRegistration::drop must not panic under uncapped busy retry");
 
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
         .unwrap();
@@ -825,7 +1090,7 @@ fn registration_drop_deletes_past_a_concurrent_held_exclusive_lock_with_no_retry
 #[test]
 fn open_db_disables_rusqlites_default_busy_timeout() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let busy_timeout_ms: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0)).unwrap();
     assert_eq!(
         busy_timeout_ms, 0,
@@ -853,7 +1118,7 @@ fn coordinate_retries_a_busy_begin_exclusive_with_no_retry_cap() {
     // `open_db`.
     drop(open_db(&path));
 
-    let foreign_conn = open_db(&path);
+    let (foreign_conn, _identity) = open_db(&path);
     foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -931,7 +1196,7 @@ fn stored_serial_filter(conn: &rusqlite::Connection, name: &str) -> String {
 fn coordinate_stores_canonical_form_for_redundant_filter() {
     let (_dir, path) = temp_db();
     let _reg = coordinate(&path, "redundant", &[], "(a) | (a)");
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     assert_eq!(stored_serial_filter(&conn, "redundant"), "a");
 }
 
@@ -939,7 +1204,7 @@ fn coordinate_stores_canonical_form_for_redundant_filter() {
 fn coordinate_collapses_tautology_to_global_serial_sentinel() {
     let (_dir, path) = temp_db();
     let _reg = coordinate(&path, "taut", &[], "a | !a");
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     assert_eq!(stored_serial_filter(&conn, "taut"), SERIAL_ALL);
 }
 
@@ -947,7 +1212,7 @@ fn coordinate_collapses_tautology_to_global_serial_sentinel() {
 fn coordinate_collapses_contradiction_to_non_serial_sentinel() {
     let (_dir, path) = temp_db();
     let _reg = coordinate(&path, "contra", &[], "a & !a");
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     assert_eq!(stored_serial_filter(&conn, "contra"), SERIAL_NONE);
 }
 
@@ -955,7 +1220,7 @@ fn coordinate_collapses_contradiction_to_non_serial_sentinel() {
 fn coordinate_preserves_serial_none_sentinel() {
     let (_dir, path) = temp_db();
     let _reg = coordinate(&path, "none", &[], SERIAL_NONE);
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     assert_eq!(stored_serial_filter(&conn, "none"), SERIAL_NONE);
 }
 
@@ -964,7 +1229,7 @@ fn coordinate_preserves_serial_all_sentinel() {
     // Use a fresh DB so SERIAL_ALL isn't blocked by the SERIAL_NONE row above.
     let (_dir, path) = temp_db();
     let _reg = coordinate(&path, "all", &[], SERIAL_ALL);
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     assert_eq!(stored_serial_filter(&conn, "all"), SERIAL_ALL);
 }
 
@@ -976,7 +1241,7 @@ fn migration_rewrites_legacy_non_canonical_rows() {
     // Open and seed the DB with the OLD schema (user_version still 0) plus
     // a row containing a legacy non-canonical serial_filter that happens to
     // simplify to the canonical "a".
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     // Reset version so the migration runs again on the next open.
     conn.execute("PRAGMA user_version = 0", []).unwrap();
     register(&conn, "legacy", &[], "(a) | (a)").unwrap();
@@ -985,7 +1250,7 @@ fn migration_rewrites_legacy_non_canonical_rows() {
     // Re-open. open_db should run migrate_schema and rewrite the legacy row
     // in place. After the migration, user_version is 1 and the row's filter
     // is the canonical Display form.
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let stored: String = stored_serial_filter(&conn, "legacy");
     assert_eq!(stored, "a", "legacy row should be canonicalized");
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
@@ -995,12 +1260,12 @@ fn migration_rewrites_legacy_non_canonical_rows() {
 #[test]
 fn migration_skips_already_canonical_rows() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     conn.execute("PRAGMA user_version = 0", []).unwrap();
     register(&conn, "already_canonical", &[], "a").unwrap();
     drop(conn);
 
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     assert_eq!(stored_serial_filter(&conn, "already_canonical"), "a");
 }
 
@@ -1023,7 +1288,7 @@ fn migrate_schema_completes_past_a_foreign_held_exclusive_lock_with_no_retry_cap
     let (_dir, path) = temp_db();
     // Seed a pre-migration DB: schema exists (user_version back at 0), one
     // legacy non-canonical row for the migration to actually rewrite.
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     conn.execute("PRAGMA user_version = 0", []).unwrap();
     register(&conn, "legacy", &[], "(a) | (a)").unwrap();
     drop(conn);
@@ -1048,7 +1313,7 @@ fn migrate_schema_completes_past_a_foreign_held_exclusive_lock_with_no_retry_cap
         .join()
         .expect("open_db (and migrate_schema within it) must not panic under uncapped busy retry");
 
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
     assert_eq!(
         version, 1,
@@ -1064,7 +1329,7 @@ fn migrate_schema_completes_past_a_foreign_held_exclusive_lock_with_no_retry_cap
 #[test]
 fn migration_leaves_unparseable_live_rows_alone() {
     let (_dir, path) = temp_db();
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     conn.execute("PRAGMA user_version = 0", []).unwrap();
     // Insert a row with garbage that won't parse, owned by THIS process
     // (i.e. an alive instance) — the migration must not delete it.
@@ -1076,7 +1341,7 @@ fn migration_leaves_unparseable_live_rows_alone() {
     .unwrap();
     drop(conn);
 
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     let kept: String = conn
         .query_row("SELECT serial_filter FROM running WHERE name = 'garbage'", [], |row| {
             row.get(0)
@@ -1185,7 +1450,7 @@ fn drop_panics_loudly_on_a_corrupt_db_when_nothing_else_is_unwinding() {
     // Corrupt the schema out from under `reg`'s own connection after
     // registration, via a second connection, so the DELETE inside `reg`'s
     // drop, below, fails.
-    let saboteur = open_db(&path);
+    let (saboteur, _identity) = open_db(&path);
     saboteur.execute_batch("DROP TABLE running").unwrap();
     drop(saboteur);
 
@@ -1215,7 +1480,7 @@ fn open_db_succeeds_and_ignores_a_leftover_lock_file_with_no_owner_write_bit() {
     std::fs::write(&leftover_lock_path, b"").unwrap();
     std::fs::set_permissions(&leftover_lock_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
-    let conn = open_db(&path);
+    let (conn, _identity) = open_db(&path);
     conn.execute_batch("PRAGMA journal_mode = WAL;")
         .expect("open_db must return a usable connection regardless of a leftover lock file's permissions");
 
@@ -1337,7 +1602,7 @@ fn connect_survives_many_threads_racing_the_same_absent_path() {
                     // `PRAGMA` here would instead surface that as an error,
                     // conflating it with the lock-serialized absence race
                     // this test targets.
-                    let _conn = open_db(&path);
+                    let (_conn, _identity) = open_db(&path);
                 });
             }
         });
@@ -1428,39 +1693,46 @@ fn win32_open_process_error_means_dead_only_for_invalid_parameter() {
     );
 }
 
-// THROWAWAY PROBE (round-6 review item 6) — not meant to be merged.
+/// Windows counterpart of `registration_drop_fails_loudly_when_a_parent_symlink_is_retargeted_mid_run`:
+/// `FileIdentity` used to be a ZST on Windows (nothing to check, since
+/// `FILE_SHARE_DELETE` being withheld already rules out the main file
+/// *itself* being deleted or renamed out from under a held-open
+/// connection). That reasoning has a real gap a throwaway CI probe
+/// confirmed before this fix landed: an ancestor *symlink* retarget
+/// changes what the path resolves to without touching the file itself at
+/// all, which `FILE_SHARE_DELETE` says nothing about. `FileIdentity` now
+/// has a real Windows implementation (`GetFileInformationByHandle`'s
+/// volume serial + file index, on a fresh open — following the reparse
+/// point fresh each time, not the connection's own already-open handle,
+/// which wouldn't observe a later retarget at all).
 #[cfg(windows)]
 #[test]
-fn zz_probe_windows_symlink_ancestor_retarget() {
+fn registration_drop_fails_loudly_when_a_parent_symlink_is_retargeted_mid_run_windows() {
     let dir = tempfile::tempdir().unwrap();
     let real1 = dir.path().join("real1");
     let real2 = dir.path().join("real2");
     std::fs::create_dir(&real1).unwrap();
     std::fs::create_dir(&real2).unwrap();
     let link = dir.path().join("link");
-    let symlink_result = std::os::windows::fs::symlink_dir(&real1, &link);
-    if let Err(e) = &symlink_result {
-        panic!("PROBE: symlink_dir failed (privilege issue?): {e}");
-    }
+    std::os::windows::fs::symlink_dir(&real1, &link)
+        .expect("creating a directory symlink must succeed in this CI environment");
     let path = link.join(".skuld.db");
 
     let a = coordinate(&path, "a", &[], SERIAL_ALL);
 
     // Retarget: remove the symlink reparse point itself (not real1's
-    // contents — remove_dir on a symlink-to-a-directory removes only the
-    // link on Windows), then point a fresh one at real2.
+    // contents), then point a fresh one at real2.
     std::fs::remove_dir(&link).unwrap();
     std::os::windows::fs::symlink_dir(&real2, &link).unwrap();
 
-    let b_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| coordinate(&path, "b", &[], SERIAL_ALL)));
-    let b_ok = b_result.is_ok();
+    let b = coordinate(&path, "b", &[], SERIAL_ALL);
 
-    let a_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(a)));
-    let a_panicked = a_result.is_err();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(a)));
+    assert!(
+        result.is_err(),
+        "drop(a) must panic: its connection's file is reachable only through the OLD symlink \
+         target, which `path` no longer names now that the symlink was retargeted"
+    );
 
-    if let Ok(b) = b_result {
-        drop(b);
-    }
-
-    panic!("PROBE windows symlink retarget: b registered ok={b_ok} drop(a) panicked={a_panicked}");
+    drop(b);
 }
