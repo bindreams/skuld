@@ -1,6 +1,6 @@
 //! Test-only coordination for the fixture workspace's target directory,
-//! shared by `metadata::metadata_tests`, `discovery::discovery_tests`, and
-//! the `tests/gen_and_run.rs` integration test binary.
+//! shared by `metadata::metadata_tests` and the `tests/gen_and_run.rs`
+//! integration test binary.
 //!
 //! Lives under `src/`, not `tests/support/`: this package's own
 //! `exclude = ["tests/**"]` drops `tests/**` from what's published, so a
@@ -17,36 +17,30 @@
 //! # Why a lock at all
 //!
 //! Serializes every `cargo-skuld` test that builds, lists, or runs against
-//! `cargo-skuld/tests/fixtures/test-workspace` (`metadata_tests`,
-//! `discovery_tests`, and `gen_and_run.rs` — `cargo nextest run`, unlike
-//! plain `cargo test`, runs every test binary in one concurrent pool, so
-//! all three need it, not just two). Two independent races make this
-//! necessary:
+//! `cargo-skuld/tests/fixtures/test-workspace` (`metadata_tests` and
+//! `gen_and_run.rs` — `cargo nextest run`, unlike plain `cargo test`, runs
+//! every test binary in one concurrent pool, so both need it).
 //!
-//! - On macOS, `cargo` deletes and re-creates every flat
-//!   `target/debug/<bin>` convenience path on *every* invocation that
-//!   touches a workspace, even a no-op `cargo nextest list`. A concurrent
-//!   invocation spawning that same flat path (a discovered binary, a
-//!   `CARGO_BIN_EXE_*` path baked in by `env!`) can observe it mid-delete:
-//!   `failed to spawn ".../target/debug/<bin>": No such file or directory
-//!   (os error 2)`. Robustly demonstrated for the outer `skuld`/
-//!   `cargo-skuld` workspace's own `target/`: `discovery_tests` used to
-//!   list the repo root, racing `skuld`'s own `tests/*_cli.rs`; pointing it
-//!   at the fixture instead (see `discovery_tests.rs`) took a stress run
-//!   from 2/40 failing to 40/40 passing.
-//! - For the fixture's own `target/` specifically — mutual exclusion
-//!   between `metadata_tests`/`discovery_tests` and `gen_and_run.rs`'s
-//!   builds — the evidence is weaker and worth stating honestly: a
-//!   lockless mutant didn't fail in one round of testing (~200 runs), but
-//!   did fail in another, independent round, within roughly 60 runs of
-//!   `cargo test -p cargo-skuld --lib` under 8-way parallelism (a spawned
-//!   fixture binary exited with no status code at all — killed by a
-//!   signal, consistent with being overwritten mid-exec by a concurrent
-//!   build of the same package). Real, but narrower and less reliably hit
-//!   than the outer-`target/` race above; no specific run count is claimed
-//!   as reproducing it on demand. `test_support_tests.rs`'s
-//!   `lock_fixture_workspace_really_locks_something_a_second_handle_is_
-//!   excluded_from` guards the mechanism directly instead, deterministically.
+//! On macOS, `cargo` deletes and re-creates every flat
+//! `target/debug/<bin>` convenience path on *every* invocation that
+//! touches a workspace, even a no-op `cargo nextest list`. A concurrent
+//! invocation spawning that same flat path (a discovered binary, a
+//! `CARGO_BIN_EXE_*` path baked in by `env!`) can observe it mid-delete:
+//! `failed to spawn ".../target/debug/<bin>": No such file or directory
+//! (os error 2)`.
+//!
+//! For the fixture's own `target/` specifically — mutual exclusion between
+//! `metadata_tests` and `gen_and_run.rs`'s builds — the evidence is weaker
+//! and worth stating honestly: a lockless mutant didn't fail in one round
+//! of testing (~200 runs), but did fail in another, independent round,
+//! within roughly 60 runs of `cargo test -p cargo-skuld --lib` under 8-way
+//! parallelism (a spawned fixture binary exited with no status code at all
+//! — killed by a signal, consistent with being overwritten mid-exec by a
+//! concurrent build of the same package). Real, but narrower and less
+//! reliably hit than the delete-and-recreate race above; no specific run
+//! count is claimed as reproducing it on demand. `test_support_tests.rs`'s
+//! `lock_fixture_workspace_really_locks_something_a_second_handle_is_
+//! excluded_from` guards the mechanism directly instead, deterministically.
 //!
 //! An in-process `Mutex` isn't enough for either race, since both
 //! reproduce across separate OS processes, not just threads. Locking beats
@@ -199,15 +193,17 @@ pub(crate) fn try_lock_exclusive(file: &File) -> Result<(), std::fs::TryLockErro
 }
 
 /// A held exclusive lock on the fixture workspace's target directory, plus
-/// the two paths that were resolved to acquire it. This is the *only* way
-/// any caller can get at the fixture's root or target directory: there is
-/// deliberately no free-standing accessor for either, so a test that needs
-/// one has no way to get it without going through an already-acquired
-/// guard first. A prior version exposed `fixture_root()` as a free
-/// function, and every one of its four call sites (`metadata_tests.rs`,
-/// `discovery_tests.rs`, `gen_and_run.rs`, and this file) could read the
-/// fixture's path without ever acquiring the lock — "forgot to lock" was a
-/// silent, latent race instead of a compile error.
+/// the two paths that were resolved to acquire it. This module deliberately
+/// exposes no free-standing `fixture_root()`/`fixture_target_dir()`
+/// accessor, so `metadata_tests.rs` and `gen_and_run.rs` have no way to
+/// reach the fixture's path *through this module* without going through an
+/// already-acquired guard first. That closes only the convenience-helper
+/// shaped hole, not every possible one: `discover_binaries` takes a plain
+/// `&Path`, so a caller could still hard-code the fixture's path (or
+/// recompute it independently of this module, e.g. via `env!` directly)
+/// and call it without ever touching this file at all — this is a guard
+/// against the accidental, "reached for the obvious helper and forgot to
+/// lock" case, not a type-system guarantee that misuse is impossible.
 ///
 /// Releases the lock on drop, via `_lock`'s own `Drop` — `flock`/
 /// `LockFileEx` are released when the last handle to the file closes, so
@@ -234,7 +230,7 @@ impl FixtureGuard {
 /// Blocks until exclusive access to the shared fixture workspace's target
 /// directory is acquired, then returns a guard that releases it on drop —
 /// see `FixtureGuard`'s own doc for why that guard is the only way to
-/// reach the fixture's root or target directory at all.
+/// reach the fixture's root or target directory *through this module*.
 #[must_use]
 pub(crate) fn lock_fixture_workspace() -> FixtureGuard {
     let root = fixture_root();

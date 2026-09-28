@@ -20,20 +20,17 @@ fn link_directory(target: &std::path::Path, link: &std::path::Path) {
     assert!(status.success(), "mklink /J failed");
 }
 
-/// The concrete regression this guards: an earlier version hashed
-/// `target_dir`'s path as given, so a symlinked `CARGO_TARGET_DIR` and its
-/// real path — two different strings for the same physical directory —
-/// hashed to two different lock files that didn't exclude each other at
-/// all. The current design (locking a file *inside* the target
-/// directory) doesn't compute a name from the path at all, so it doesn't
-/// need canonicalizing or even comparing the two paths as strings —
-/// opening `<target>/.skuld-fixture.lock` through a symlink/junction and
-/// through the real path resolves to the same underlying file, and
-/// `flock`/`LockFileEx` contend on that, not on the path string used to
-/// reach it. Verified behaviorally: lock via the real path, then a
+/// The lock file lives inside the target directory and computes no name
+/// from the target directory's own path (opening
+/// `<target>/.skuld-fixture.lock` directly), so it needs no canonicalizing
+/// and no comparing the two paths as strings — a symlinked or junctioned
+/// `CARGO_TARGET_DIR` and its real path resolve to the same underlying
+/// file when opened this way, and `flock`/`LockFileEx` contend on that
+/// file's identity, not on the path string used to reach it. Verified
+/// behaviorally, not just asserted: lock via the real path, then a
 /// second, independent handle opened through the symlink/junction must
-/// observe `WouldBlock` — not just compare equal as strings, which
-/// doesn't actually prove the two exclude each other.
+/// observe `WouldBlock` — comparing the two paths as equal strings
+/// wouldn't actually prove they exclude each other.
 #[test]
 fn symlinked_target_dir_locks_the_same_underlying_file_as_its_real_path() {
     let base = tempfile::tempdir().expect("tempdir");
@@ -120,15 +117,26 @@ fn ensure_target_dir_marks_a_fresh_directory_exactly_the_way_cargo_would() {
 
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("tmutil")
-            .arg("isexcluded")
-            .arg(&target_dir)
-            .output()
-            .expect("spawn tmutil isexcluded");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Not `tmutil isexcluded`: it reports every path under macOS's own
+        // ephemeral tmp hierarchy (which is exactly where `tempfile::tempdir`
+        // creates `base` above) as `[Excluded]` regardless of whether this
+        // directory itself carries the exclusion xattr — measured directly,
+        // an otherwise-untouched directory under the same tmp hierarchy
+        // reports `[Excluded]` too. Reading the xattr `cargo_util` actually
+        // sets is the only way to observe whether *this* call did anything.
+        let excluded_from_backup = xattr::get(&target_dir, "com.apple.metadata:com_apple_backup_excludeItem")
+            .expect("read backup-exclusion xattr");
         assert!(
-            stdout.contains("[Excluded]"),
-            "target dir must be excluded from Time Machine backups; tmutil said: {stdout}"
+            excluded_from_backup.is_some(),
+            "target dir must carry the com.apple.metadata:com_apple_backup_excludeItem xattr"
+        );
+        // The iCloud-sync-exclusion half of the same call, surfaced as this
+        // xattr on disk (verified directly against a real target dir).
+        let excluded_from_icloud_sync =
+            xattr::get(&target_dir, "com.apple.fileprovider.ignore#P").expect("read iCloud-sync-exclusion xattr");
+        assert!(
+            excluded_from_icloud_sync.is_some(),
+            "target dir must carry the com.apple.fileprovider.ignore#P xattr"
         );
     }
 

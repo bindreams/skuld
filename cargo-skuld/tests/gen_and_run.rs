@@ -163,6 +163,94 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Guards `KillOnDrop` itself: that a panic between spawning a child and
+/// explicitly `wait`ing on it still gets the child killed *and reaped*, not
+/// just killed. Re-invokes this same test binary, filtered to just this
+/// test under a magic env var, as the long-lived child — a small,
+/// self-contained loop instead of an external `sleep`/`timeout` binary,
+/// which would need one implementation on Unix and a different one on
+/// Windows.
+#[test]
+fn kill_on_drop_reaps_the_child_even_if_the_scope_panics_before_wait() {
+    if let Ok(heartbeat_path) = std::env::var("GEN_AND_RUN_KILL_ON_DROP_HEARTBEAT") {
+        // Child mode: prove liveness by writing a fresh timestamp every
+        // 20ms until killed, for up to 60s (never reached in a passing run).
+        for _ in 0..3000 {
+            std::fs::write(&heartbeat_path, format!("{:?}", std::time::Instant::now())).expect("write heartbeat");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        return;
+    }
+
+    let _guard = lock_fixture_workspace();
+    let heartbeat_dir = tempfile::tempdir().expect("tempdir");
+    let heartbeat_path = heartbeat_dir.path().join("heartbeat");
+
+    let pid = {
+        let child = KillOnDrop::spawn(
+            Command::new(std::env::current_exe().expect("current_exe"))
+                .args([
+                    "kill_on_drop_reaps_the_child_even_if_the_scope_panics_before_wait",
+                    "--exact",
+                ])
+                .env("GEN_AND_RUN_KILL_ON_DROP_HEARTBEAT", &heartbeat_path),
+        )
+        .expect("spawn long-lived child");
+        let pid = child.0.id();
+
+        // Wait for the child to prove it's actually alive and writing,
+        // rather than assuming a fixed startup delay is long enough.
+        while !heartbeat_path.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Simulate a panic between spawn() and an explicit wait() (e.g. a
+        // failed assert!) — the exact scenario KillOnDrop exists for.
+        // `child` must still be in scope (and therefore still get dropped,
+        // and therefore killed) when the stack unwinds past this point.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _keep_alive = &child;
+            panic!("simulated failure between spawn() and wait()");
+        }));
+        assert!(unwound.is_err(), "the simulated panic must have actually panicked");
+        drop(child); // KillOnDrop's Drop must kill and reap here.
+        pid
+    };
+
+    // Killed: the heartbeat must have stopped advancing.
+    let last_heartbeat = std::fs::read_to_string(&heartbeat_path).expect("read heartbeat");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let heartbeat_after_drop = std::fs::read_to_string(&heartbeat_path).expect("read heartbeat");
+    assert_eq!(
+        last_heartbeat, heartbeat_after_drop,
+        "child must have stopped running once KillOnDrop's guard was dropped"
+    );
+
+    // Reaped, not left as a zombie: `kill(pid, 0)` succeeds against a
+    // zombie (it still occupies a process-table entry until waited on) and
+    // only fails with ESRCH once the exit status has actually been
+    // collected. This is what distinguishes "killed" from "killed AND
+    // reaped" — the mutant this test is meant to catch is a `Drop` that
+    // kills but never calls `wait`, which passes the heartbeat check above
+    // but leaves a zombie a naive kill-only fix wouldn't reveal.
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        let errno = std::io::Error::last_os_error();
+        assert_eq!(
+            rc, -1,
+            "pid {pid} must no longer be signalable at all once reaped, but kill(pid, 0) succeeded"
+        );
+        assert_eq!(
+            errno.raw_os_error(),
+            Some(libc::ESRCH),
+            "expected ESRCH (no such process) for a reaped pid, got {errno:?}"
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
 #[test]
 fn negative_control_two_directly_spawned_processes_overlap() {
     // Bypasses nextest's scheduler entirely — spawns the two conflicting

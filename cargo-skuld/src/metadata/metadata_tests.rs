@@ -7,11 +7,10 @@ use std::path::{Path, PathBuf};
 /// path, parsed from `--message-format=json`'s `compiler-artifact`
 /// events rather than assumed at `<root>/target/debug/<name>` — a
 /// global cargo config or an inherited `CARGO_TARGET_DIR` can redirect
-/// build output elsewhere, and a hard-coded path silently breaks in
-/// that case (review round 3 fix: correctness finding 9ba16e98). Takes
-/// the fixture root from an already-held `FixtureGuard` rather than
-/// resolving it itself — see `test_support::FixtureGuard`'s doc for why
-/// there is no free-standing accessor to do that instead.
+/// build output elsewhere, and a hard-coded path silently breaks in that
+/// case. Takes the fixture root from an already-held `FixtureGuard`
+/// rather than resolving it itself — see `test_support::FixtureGuard`'s
+/// doc for why there is no free-standing accessor to do that instead.
 fn build_and_locate_broken_binary(root: &Path, name: &str) -> PathBuf {
     let output = Command::new("cargo")
         .current_dir(root)
@@ -159,8 +158,7 @@ fn test_with_unparsable_serial_filter_is_excluded_but_siblings_survive() {
 /// the whole run") is only actually exercised by a call that also
 /// contains a *healthy* binary — a single-broken-binary call can't
 /// distinguish "skip this one" from "abandon the whole run", since both
-/// produce the same empty result (review round 3 fix: failure finding
-/// 9a0d90b6).
+/// produce the same empty result.
 #[test]
 fn broken_binary_does_not_affect_collection_of_other_binaries_in_the_same_call() {
     let _guard = lock_fixture_workspace();

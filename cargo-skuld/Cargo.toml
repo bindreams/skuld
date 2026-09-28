@@ -45,3 +45,15 @@ cargo-util = "0.2"
 # promotes it to a direct dependency. Test-only for the same reason as
 # cargo-util above.
 rustix = { version = "1", features = ["fs"] }
+# gen_and_run.rs's KillOnDrop regression test: kill(pid, 0) distinguishes
+# a killed-and-reaped child (ESRCH) from a killed-but-zombie one (still
+# signalable), which std alone has no portable way to observe.
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# test_support_tests.rs reads the Time Machine exclusion xattr directly
+# (rather than parsing `tmutil isexcluded`'s text output, which reports
+# every path under macOS's own ephemeral tmp hierarchy as excluded
+# regardless of whether cargo-util's own exclusion code ran — measured
+# directly) to prove ensure_target_dir's marking actually happened.
+xattr = "1"
