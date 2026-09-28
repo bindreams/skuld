@@ -69,16 +69,18 @@ const SCHEMA_VERSION: i64 = 1;
 /// `SQLITE_CANTOPEN` *and* nothing is at `path` (`symlink_metadata` reports
 /// `NotFound`). [`connect_locked`] — this function's body, and the same
 /// ask-forgiveness retry described below — is what every real caller
-/// actually uses: [`open_db`] calls it directly under its own longer-lived
-/// lock acquisition, and so does [`TestRegistration::drop`]'s cleanup, for
-/// the same reason: composing a second, nested [`lock::with_init_lock`] call
-/// (which this function itself does) inside a closure that already holds
-/// the lock would self-deadlock, since `flock`/`LockFileEx` locks are scoped
-/// to the open file description, not the process — a second open on the
-/// same path blocks even from the very thread already holding the first.
-/// This standalone wrapper exists only for tests that want [`connect_locked`]'s
-/// exact contract — including the lock acquisition — without also paying for
-/// [`open_db`]'s schema initialization.
+/// actually uses: [`open_db`] is the only one, calling it directly under its
+/// own longer-lived lock acquisition (composing a second, nested
+/// [`lock::with_init_lock`] call — which this function itself does — inside
+/// a closure that already holds the lock would self-deadlock, since
+/// `flock`/`LockFileEx` locks are scoped to the open file description, not
+/// the process — a second open on the same path blocks even from the very
+/// thread already holding the first). [`TestRegistration`] connects exactly
+/// once too, but indirectly, through [`coordinate`]'s own `open_db` call —
+/// it never reconnects on drop; see its own doc for why that's load-bearing,
+/// not incidental. This standalone wrapper exists only for tests that want
+/// [`connect_locked`]'s exact contract — including the lock acquisition —
+/// without also paying for [`open_db`]'s schema initialization.
 ///
 /// Holding the init lock for the whole sequence removes any *Skuld* process
 /// as a source of that `CANTOPEN`+absence: while it's held, this call is the
@@ -101,11 +103,16 @@ const SCHEMA_VERSION: i64 = 1;
 /// gets a new inode; any process that still holds a connection open to the
 /// deleted file's old inode (POSIX doesn't invalidate an open fd on unlink)
 /// keeps operating on that old inode, coordinating separately from
-/// processes that connect afterward and see the new one. That split is
-/// accepted under this module's minimal-publish design (see the module
-/// doc): there's no verification of what's actually at `path` beyond
-/// "something is," so nothing here would notice the swap to tell the two
-/// groups apart, let alone reconcile them.
+/// processes that connect afterward and see the new one — a split this
+/// module's minimal-publish design doesn't try to detect or reconcile
+/// (there's no verification of what's actually at `path` beyond "something
+/// is," so nothing here would notice the swap to tell the two groups
+/// apart). [`TestRegistration`] relies on exactly this split, deliberately:
+/// it keeps registering and deleting through its own original connection
+/// for its entire lifetime rather than ever reconnecting, specifically so
+/// its cleanup stays scoped to the one incarnation of the file its row
+/// actually lives in — see its own doc for why reconnecting there would be
+/// a correctness bug, not just an unnecessary one.
 ///
 /// Windows is unchanged: no Windows lane mixes uids, so there's nothing for
 /// the publish step to protect against there, and the open keeps its
@@ -121,30 +128,34 @@ const SCHEMA_VERSION: i64 = 1;
 /// build this would be dead code even under `cfg(test)`.
 #[cfg(all(test, unix))]
 pub(crate) fn connect(path: &std::path::Path) -> rusqlite::Connection {
-    lock::with_init_lock(path, || connect_locked(path))
+    lock::with_init_lock(path, |token| connect_locked(path, token))
 }
 
 /// [`connect`]'s body, run by both [`connect`] and [`open_db`] while each
-/// already holds `path`'s init lock — a shared inner helper so [`open_db`]
-/// can keep its own connect-then-initialize sequence under one lock
-/// acquisition instead of two, which would otherwise leave the gap between
-/// them unprotected again.
-fn connect_locked(path: &std::path::Path) -> rusqlite::Connection {
+/// already holds `path`'s init lock (the [`lock::InitLockHeld`] token proves
+/// it at compile time — a caller with no lock has no token to pass) — a
+/// shared inner helper so [`open_db`] can keep its own connect-then-initialize
+/// sequence under one lock acquisition instead of two, which would
+/// otherwise leave the gap between them unprotected again.
+fn connect_locked(path: &std::path::Path, _init_lock: &lock::InitLockHeld) -> rusqlite::Connection {
     #[cfg(unix)]
     let conn = connect_with(path, publish::ensure_published);
 
     #[cfg(not(unix))]
-    let conn = rusqlite::Connection::open(path)
-        .unwrap_or_else(|e| panic!("skuld: failed to open coordination DB at {path:?}: {e}"));
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+    )
+    .unwrap_or_else(|e| panic!("skuld: failed to open coordination DB at {path:?}: {e}"));
 
     // rusqlite's own `InnerConnection::open_with_flags` calls
     // `sqlite3_busy_timeout(db, 5000)` unconditionally on every connection it
     // opens (`inner_connection.rs`) — a fixed, capped, time-based wait this
     // crate does not want on *any* connection: every real caller retries
-    // `SQLITE_BUSY`/`SQLITE_LOCKED` itself, uncapped and gated on the error
-    // code alone ([`retry_busy`], [`coordinate`]'s own loop), so SQLite's own
-    // internal busy handler blocking underneath that — silently, for up to
-    // 5 s, before either loop ever sees the error to retry — is exactly the
+    // `SQLITE_BUSY` itself, uncapped and gated on the error code alone
+    // ([`retry_busy`], [`coordinate`]'s own loop), so SQLite's own internal
+    // busy handler blocking underneath that — silently, for up to 5 s,
+    // before either loop ever sees the error to retry — is exactly the
     // "expiry as proof of failure" shape this crate's retry logic is built
     // to avoid, whether or not anything here calls `Connection::busy_timeout`
     // explicitly. Disabling it here, once, for every connection this
@@ -188,9 +199,22 @@ fn connect_with_hooks(
     mut before_recheck: impl FnMut(&std::path::Path),
     mut ensure_published: impl FnMut(&std::path::Path),
 ) -> rusqlite::Connection {
+    // `SQLITE_OPEN_PRIVATE_CACHE`: shared-cache mode is a *process-global*
+    // toggle (`sqlite3_enable_shared_cache`, deprecated but not removed) —
+    // once anything in the process turns it on, it applies to every
+    // connection that doesn't explicitly opt out, and this process also
+    // runs arbitrary user test code Skuld doesn't control. `is_retryable`'s
+    // doc explains why that matters: `SQLITE_LOCKED` is only ever a
+    // same-connection self-conflict here *because* no connection this crate
+    // opens uses shared-cache mode — without this flag, user code enabling
+    // it process-wide would make that no longer true, and a `SQLITE_LOCKED`
+    // this crate then silently ignores as non-retryable could actually be a
+    // legitimate shared-cache lock from another connection, resolvable by
+    // retrying, not a bug.
     let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
         | rusqlite::OpenFlags::SQLITE_OPEN_URI
-        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | rusqlite::OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
     loop {
         match rusqlite::Connection::open_with_flags(path, flags) {
             Ok(conn) => return conn,
@@ -258,8 +282,8 @@ fn path_is_absent(path: &std::path::Path) -> bool {
 /// connection anywhere in the system can be negotiating the same cold-start
 /// `-shm` creation concurrently.
 ///
-/// It does not remove ordinary `SQLITE_BUSY`/`SQLITE_LOCKED` contention from
-/// a connection that never takes this init lock at all — every real
+/// It does not remove ordinary `SQLITE_BUSY` contention from a connection
+/// that never takes this init lock at all — every real
 /// [`coordinate`] caller past its own `open_db` call is exactly that. The
 /// `execute_batch` below is normally a same-schema no-op once any process
 /// has created the tables once (SQLite doesn't need a lock to re-affirm a
@@ -272,9 +296,9 @@ fn path_is_absent(path: &std::path::Path) -> bool {
 /// surfaces immediately instead of first blocking inside that internal,
 /// capped handler, and is retried here, uncapped, on the error code alone.
 pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
-    lock::with_init_lock(path, || {
-        let conn = connect_locked(path);
-        ensure_schema_locked(&conn);
+    lock::with_init_lock(path, |token| {
+        let conn = connect_locked(path, token);
+        ensure_schema_locked(&conn, token);
         conn
     })
 }
@@ -295,25 +319,20 @@ const INIT_SQL: &str = "PRAGMA journal_mode = WAL;
      );";
 
 /// Ensure `conn`'s schema exists and is migrated to [`SCHEMA_VERSION`].
-/// **Assumes the caller already holds `conn`'s path's init lock** — this
-/// does not acquire it itself, so it's safe to call from inside a closure
-/// [`lock::with_init_lock`] is already running (unlike composing a second,
-/// nested `with_init_lock` call, which would self-deadlock — see
-/// [`connect`]'s doc).
+/// **Requires proof the caller already holds `conn`'s path's init lock** —
+/// the [`lock::InitLockHeld`] token, obtainable only from inside
+/// [`lock::with_init_lock`]'s own closure — since this does not acquire the
+/// lock itself: composing a second, nested `with_init_lock` call inside a
+/// closure that already holds it would self-deadlock (see [`connect`]'s
+/// doc). [`open_db`] is this function's only caller: every real connection
+/// this crate hands out goes through `open_db` once, up front, and keeps
+/// using that same connection afterward (see [`TestRegistration`]'s own
+/// doc for why it never reconnects), so this only ever runs once per
+/// connection's lifetime, not on every operation against it.
 ///
-/// Idempotent, and meant to be called unconditionally rather than only on
-/// first connect: `CREATE TABLE IF NOT EXISTS` is a same-schema no-op once
-/// any process has run this once (see [`open_db`]'s doc), so every caller
-/// after the first pays only the cost of confirming that — which matters
-/// because [`TestRegistration::drop`]'s cleanup calls this too, not just
-/// [`open_db`]. That's not redundant: `connect_locked` tolerates `.skuld.db`
-/// having been deleted mid-run by recreating it fresh and empty (see
-/// [`connect`]'s doc), and a fresh, schema-less DB is exactly what a bare
-/// `DELETE FROM running` would otherwise fail against with "no such table"
-/// — a non-retryable error `retry_busy` can't and shouldn't paper over by
-/// matching its text. Running this first closes that gap the same way
-/// `open_db` always has, rather than special-casing the error.
-fn ensure_schema_locked(conn: &rusqlite::Connection) {
+/// Idempotent regardless: `CREATE TABLE IF NOT EXISTS` is a same-schema
+/// no-op once any process has run this once (see [`open_db`]'s doc).
+fn ensure_schema_locked(conn: &rusqlite::Connection, _init_lock: &lock::InitLockHeld) {
     retry_busy(conn, || conn.execute_batch(INIT_SQL)).unwrap_or_else(|e| {
         panic!(
             "skuld: failed to initialize coordination DB at {:?}: {e}",
@@ -332,7 +351,7 @@ fn ensure_schema_locked(conn: &rusqlite::Connection) {
 /// a second process's `try_lock` on the same lock file reports `WouldBlock`
 /// while this one is running, then succeeds once it returns.
 pub(crate) fn probe_hold_init_lock(path: &std::path::Path, while_held: impl FnOnce()) {
-    lock::with_init_lock(path, while_held)
+    lock::with_init_lock(path, |_token| while_held())
 }
 
 /// Probe hook for Skuld's own test suite (`tests/lock_contention_regression.rs`,
@@ -496,9 +515,16 @@ fn signal_test_retry_hook() {
 // unwinding panic (to convert it into the `Err` a `JoinHandle::join()`
 // reports) before the thread actually exits, and thread-local destructors —
 // this `Sender` included — run as part of that exit, strictly after the
-// catch, not "during" the unwind itself. Either way the thread is gone and
-// `tx` with it, so a retry path that's broken (never retries, or panics
-// before it would) fails the test outright instead of spinning forever.
+// catch, not "during" the unwind itself.
+//
+// That only covers the worker *exiting* without ever retrying: `recv()`
+// fails outright if the worker exits without retrying, but a worker that's
+// merely blocked — stuck retrying forever against a condition that never
+// resolves, or hung on something unrelated, without ever exiting — holds
+// `tx` open the whole time, and `recv()` waits right along with it. A test
+// hung that way has no bound from this mechanism; the CI job's own runner
+// timeout is the only backstop left, same as it always was for a thread
+// that simply never finishes.
 #[cfg(test)]
 thread_local! {
     static TEST_RETRY_HOOK: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -862,65 +888,63 @@ fn register(
 
 // RAII guard =====
 
-/// RAII guard that unregisters the test from the coordination database on drop.
-/// Ensures cleanup even on panic (during stack unwinding).
+/// RAII guard that unregisters the test from the coordination database on
+/// drop. Ensures cleanup even on panic (during stack unwinding).
+///
+/// Keeps the very same [`rusqlite::Connection`] [`coordinate`] registered
+/// `id` on — not just `id` and a path to reconnect with — and deletes
+/// through that connection on drop, never a fresh one. That matters beyond
+/// tolerating `.skuld.db` being deleted mid-run (see [`connect`]'s doc):
+/// reconnecting can delete a *different* test's row outright. `id` comes
+/// from `running`'s `AUTOINCREMENT` column, and `AUTOINCREMENT`'s
+/// no-reuse guarantee is scoped to one schema's lifetime, tracked in
+/// `sqlite_sequence` — a `.skuld.db` deleted and recreated mid-run starts
+/// that sequence over from 1. Two tests registered against two different
+/// incarnations of the file can end up with the same numeric `id`, and a
+/// reconnect-then-`DELETE FROM running WHERE id = ?` keyed on that id alone
+/// has no way to tell which incarnation it's actually deleting from — it
+/// deletes whatever currently has that id, correct target or not. Holding
+/// the original connection sidesteps the ambiguity instead of trying to
+/// detect it: this connection's open file descriptor still points at the
+/// exact inode `id` was minted against (POSIX doesn't invalidate an open fd
+/// on unlink), so every operation through it — including this cleanup — is
+/// unambiguously scoped to that one incarnation, whatever anyone else has
+/// since done to the path.
 pub(crate) struct TestRegistration {
+    conn: rusqlite::Connection,
     id: i64,
-    db_path: PathBuf,
 }
 
 impl Drop for TestRegistration {
     fn drop(&mut self) {
-        // Runs the connect *and* the first statement on it under `db_path`'s
-        // init lock (like `open_db` does), not just a raw `connect()`: a
-        // fresh connection's first write against a WAL database still
-        // touches the `-shm` mapping, so this cleanup is itself a
-        // participant in the cold-start negotiation `open_db`'s doc
-        // describes, not a bystander exempt from it.
+        // No reconnect, no init lock: `self.conn` is the exact connection
+        // `coordinate` registered `id` on (see this struct's own doc for why
+        // that's load-bearing, not just an optimization), so this cleanup
+        // needs nothing beyond retrying past transient contention on it.
+        // `PRAGMA foreign_keys = ON` isn't re-set here either — `ensure_schema_locked`
+        // already set it on this exact connection when `coordinate` first
+        // opened it, and that's a per-connection setting, not something a
+        // fresh statement needs to re-assert.
         //
-        // `connect_locked` disables rusqlite's own default `busy_timeout`
-        // here too, for the same reason as `open_db`: a fixed timeout is
-        // itself a capped, time-based wait. The DELETE below can genuinely
-        // contend with another, already-initialized process mid-`BEGIN
-        // EXCLUSIVE` inside `coordinate` — that connection never takes this
-        // init lock — so [`retry_busy`] retries past a transient busy
+        // The DELETE can still genuinely contend with another,
+        // already-initialized process mid-`BEGIN EXCLUSIVE` inside
+        // `coordinate` — so [`retry_busy`] retries past a transient busy
         // error, uncapped, and panics loudly (via `unwrap_or_else`) on
         // anything else: a failure that's genuinely possible here is worth
-        // surfacing, not just warning about, same as `connect_locked`'s own
-        // panics below.
-        //
-        // `ensure_schema_locked` first, unconditionally, not just
-        // `connect_locked`: `connect_locked` alone tolerates `.skuld.db`
-        // having been deleted mid-run (see `connect`'s doc) by recreating it
-        // fresh and *empty*, but a fresh DB has no `running` table yet — the
-        // DELETE below would fail with "no such table", a non-retryable
-        // error, if nothing re-created the schema first. Matching that
-        // error's text to special-case it would violate this crate's own
-        // rule against parsing human-readable errors; running
-        // `ensure_schema_locked` unconditionally sidesteps needing to
-        // classify the error at all, at the cost of a cheap, idempotent
-        // `PRAGMA user_version` check on the overwhelmingly common path
-        // where the schema was never actually gone.
+        // surfacing, not just warning about.
         let cleanup = || {
-            lock::with_init_lock(&self.db_path, || {
-                let conn = connect_locked(&self.db_path);
-                ensure_schema_locked(&conn);
-                retry_busy(&conn, || conn.execute_batch("PRAGMA foreign_keys = ON"))
-                    .unwrap_or_else(|e| panic!("skuld: failed to unregister test from coordination DB: {e}"));
-                retry_busy(&conn, || conn.execute("DELETE FROM running WHERE id = ?1", [self.id]))
-                    .unwrap_or_else(|e| panic!("skuld: failed to unregister test from coordination DB: {e}"));
+            retry_busy(&self.conn, || {
+                self.conn.execute("DELETE FROM running WHERE id = ?1", [self.id])
             })
+            .unwrap_or_else(|e| panic!("skuld: failed to unregister test from coordination DB: {e}"));
         };
 
-        // `connect_locked` can panic (a publish failure, or SQLite itself
-        // rejecting the file — e.g. it's been replaced by a directory —
-        // is loud by design), and now so can `cleanup` itself on a
-        // non-retryable DB error. Ordinarily such a panic should propagate:
-        // a genuinely broken DB, or an unregister that genuinely fails, is
-        // worth failing loudly over. But if this drop is running because
-        // the *thread* is already unwinding from a different, unrelated
-        // panic (e.g. the test itself failed), a second uncaught panic here
-        // is a panic during a panic — Rust turns that into
+        // `cleanup` can panic on a non-retryable DB error. Ordinarily that
+        // should propagate: an unregister that genuinely fails is worth
+        // failing loudly over. But if this drop is running because the
+        // *thread* is already unwinding from a different, unrelated panic
+        // (e.g. the test itself failed), a second uncaught panic here is a
+        // panic during a panic — Rust turns that into
         // `std::process::abort()` (`SIGABRT`), killing the whole process
         // rather than just this one failing test. `catch_unwind` this call
         // so we can tell those two cases apart and only let the panic
@@ -982,9 +1006,9 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
 /// Coordinate test execution: block until the test can start, register it,
 /// and return a guard that unregisters it on drop.
 ///
-/// Under lock contention (`SQLITE_BUSY` / `SQLITE_LOCKED`), retries via the
-/// outer exponential backoff loop (10 ms → 200 ms cap). Emits a debug warning
-/// after 60 s of continuous contention.
+/// Under lock contention (`SQLITE_BUSY`), retries via the outer exponential
+/// backoff loop (10 ms → 200 ms cap). Emits a debug warning after 60 s of
+/// continuous contention.
 ///
 /// This is the main entry point called by the test runner for every test.
 pub(crate) fn coordinate(
@@ -1021,10 +1045,7 @@ pub(crate) fn coordinate(
 
         match txn() {
             Ok(Some(id)) => {
-                return TestRegistration {
-                    id,
-                    db_path: db_path.to_path_buf(),
-                };
+                return TestRegistration { conn, id };
             }
             Ok(None) => {
                 if !logged_first_wait {

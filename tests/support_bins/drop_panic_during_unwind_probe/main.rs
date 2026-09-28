@@ -2,19 +2,19 @@
 //! Not a real product binary.
 //!
 //! Reproduces a panic-during-unwind hazard in `TestRegistration::drop`
-//! (which itself calls `connect()`, and `connect()` can panic when it can't
-//! open the coordination DB). A second, uncaught panic while the thread is
-//! already unwinding from a first one aborts the whole process (`SIGABRT`),
-//! not just the one failing test — this must run as a genuine subprocess so
-//! that abort, if it happens, doesn't take the driver test binary down
-//! with it.
+//! (whose cleanup can itself panic on a genuine, non-retryable DB error). A
+//! second, uncaught panic while the thread is already unwinding from a
+//! first one aborts the whole process (`SIGABRT`), not just the one failing
+//! test — this must run as a genuine subprocess so that abort, if it
+//! happens, doesn't take the driver test binary down with it.
 //!
-//! Portable: `probe_drop_panic_during_unwind` corrupts the DB by replacing
-//! it with a directory, which fails `connect()` on both platforms for the
-//! reasons documented on that function in `src/lib.rs`. The hazard this
-//! probe reproduces lives in `Drop`'s `catch_unwind`/`thread::panicking()`
-//! logic, which is not platform-gated, so this probe runs on every CI lane
-//! rather than only Unix.
+//! Portable: `probe_drop_panic_during_unwind` corrupts the DB by dropping
+//! its `running` table via a second connection, which fails the
+//! registration's own `DELETE` on both platforms for the reasons documented
+//! on that function in `src/lib.rs`. The hazard this probe reproduces lives
+//! in `Drop`'s `catch_unwind`/`thread::panicking()` logic, which is not
+//! platform-gated, so this probe runs on every CI lane rather than only
+//! Unix.
 //!
 //! Reads `SKULD_DROP_PANIC_PROBE_DB` (required: an isolated coordination DB
 //! path — never the real shared workspace `.skuld.db`). Exits via a single

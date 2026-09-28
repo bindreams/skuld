@@ -193,24 +193,33 @@ fn registration_guard_cleans_up_on_panic() {
 }
 
 /// `connect`'s own doc promises a `.skuld.db` deleted mid-run is tolerated —
-/// recreated fresh, same as the very first connection of the run — and that
-/// promise has to hold through `TestRegistration::drop`'s cleanup too, not
-/// just through the bare `connect_locked` call inside it. `connect_locked`
-/// alone already tolerates the deletion (it opens a fresh, schema-less DB),
-/// but the DELETE that follows doesn't unless something re-creates the
-/// schema first: against a table-less DB it fails with "no such table:
-/// running", a non-retryable `rusqlite::Error` `retry_busy` doesn't retry —
-/// and, since `retry_busy`'s callers panic loudly on a non-retryable error
-/// (see `TestRegistration::drop`'s own doc), that used to mean a hard panic
-/// on a case `main` tolerated with nothing worse than a warning.
+/// recreated fresh, same as the very first connection of the run. But
+/// recreation also resets `running`'s `AUTOINCREMENT` sequence back to 1
+/// (it's tracked in `sqlite_sequence`, part of the schema that goes with the
+/// deleted file), so a test (`b`) registered against the fresh incarnation
+/// can end up with the exact same numeric `id` an earlier test (`a`),
+/// registered against the deleted one, already had. Dropping `a` must not
+/// then delete `b`'s row just because the ids collide: `a` deletes through
+/// its own original connection — which still points at the original,
+/// now-unlinked-but-still-open inode (POSIX doesn't invalidate an open fd
+/// on unlink), not the fresh one `b` registered against — so the DELETE
+/// lands on `a`'s own (invisible-to-everyone-else) incarnation regardless of
+/// what `b`'s id happens to be.
+///
+/// This is the shape a real review probe found live on `main`: an old
+/// design that reconnected fresh in `Drop` (instead of keeping the original
+/// connection) has no way to tell the two incarnations apart by id alone,
+/// and silently deletes whichever row currently has that id — `b`'s, not
+/// `a`'s, once the file's been recreated.
 #[test]
-fn registration_drop_tolerates_the_db_being_deleted_mid_run() {
+fn registration_drop_does_not_delete_a_different_registration_that_reused_its_id() {
     let (_dir, path) = temp_db();
-    let reg = coordinate(&path, "deleted_mid_run", &[], SERIAL_NONE);
+
+    let a = coordinate(&path, "a", &[], SERIAL_NONE);
 
     // Delete the main file and its WAL companions — the exact shape
-    // `connect`'s doc describes as tolerated, just landing during cleanup
-    // instead of during the next connect.
+    // `connect`'s doc describes as tolerated. Resets AUTOINCREMENT for
+    // whatever registers against the recreated file next.
     std::fs::remove_file(&path).unwrap();
     let mut wal = path.as_os_str().to_owned();
     wal.push("-wal");
@@ -219,12 +228,25 @@ fn registration_drop_tolerates_the_db_being_deleted_mid_run() {
     shm.push("-shm");
     let _ = std::fs::remove_file(std::path::PathBuf::from(shm));
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(reg)));
+    // b registers against the freshly recreated DB, global-serial so its
+    // continued presence is directly checkable via can_start below.
+    let b = coordinate(&path, "b", &[], SERIAL_ALL);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(a)));
     assert!(
         result.is_ok(),
         "TestRegistration::drop must tolerate the DB having been deleted mid-run, not panic, \
          same as connect's own doc promises for the general case"
     );
+
+    let conn = open_db(&path);
+    assert!(
+        !can_start(&conn, &[], SERIAL_NONE).unwrap(),
+        "dropping a must not have deleted b's still-live global-serial row just because they \
+         reused the same numeric id across two incarnations of the DB file"
+    );
+
+    drop(b);
 }
 
 // Concurrent coordination =====
@@ -771,22 +793,31 @@ fn downgraded_warning_message_carries_the_real_panic_message_through_the_box() {
 /// `std::thread::panicking()`: it must fire *only* while the thread is
 /// already unwinding from another panic. A normal drop (nothing else
 /// unwinding) with a DB that's gone unusable between registration and drop
-/// must still panic loudly — that's the whole point of `connect()` calling
-/// `unwrap_or_else(|e| panic!(...))` on the underlying SQLite open, and
-/// downgrading unconditionally would silently swallow every one of them.
+/// must still panic loudly — that's the whole point of `retry_busy`'s
+/// callers using `unwrap_or_else(|e| panic!(...))` on a non-retryable
+/// error, and downgrading unconditionally would silently swallow every one
+/// of them.
 ///
-/// Corrupts by replacing the DB file with a directory rather than
-/// `chmod`ing it narrow, so this runs on every platform, for the reasons
-/// documented on `probe_drop_panic_during_unwind` in `src/lib.rs`.
+/// Corrupts via a *second* connection dropping the `running` table, not by
+/// replacing the DB file itself: `reg` keeps its own original connection
+/// for its entire lifetime rather than ever reconnecting (see
+/// `TestRegistration`'s own doc for why), so corrupting the path alone
+/// wouldn't reach its cleanup at all — its connection's open file
+/// descriptor still points at the original, valid inode regardless. A
+/// second connection dropping the table is a schema change every
+/// connection to that same file sees on its next statement, `reg`'s
+/// included.
 #[test]
 fn drop_panics_loudly_on_a_corrupt_db_when_nothing_else_is_unwinding() {
     let (_dir, path) = temp_db();
     let reg = coordinate(&path, "normal_drop_corrupt_db", &[], SERIAL_NONE);
 
-    // Corrupt the DB after registration so the connect() call inside
-    // `reg`'s drop, below, fails.
-    std::fs::remove_file(&path).unwrap();
-    std::fs::create_dir(&path).unwrap();
+    // Corrupt the schema out from under `reg`'s own connection after
+    // registration, via a second connection, so the DELETE inside `reg`'s
+    // drop, below, fails.
+    let saboteur = open_db(&path);
+    saboteur.execute_batch("DROP TABLE running").unwrap();
+    drop(saboteur);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(reg)));
     assert!(

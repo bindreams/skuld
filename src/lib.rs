@@ -225,38 +225,85 @@ pub mod __private {
     }
 
     /// Probe hook for Skuld's own test suite: register in the coordination
-    /// DB at `path`, corrupt it so a later connection attempt fails, then
-    /// panic — while the registration guard is still alive, so unwinding
-    /// drops it. `TestRegistration::drop`'s own cleanup opens a connection
-    /// too, so this reproduces a panic occurring *during* an active unwind
-    /// (inside a `Drop` the unwind
-    /// itself triggers). Without a `catch_unwind` guard in `Drop`, an
-    /// uncaught panic there is a panic during a panic, which Rust turns into
+    /// DB at `path`, corrupt its schema so `_registration`'s own cleanup
+    /// fails later, then panic — while the registration guard is still
+    /// alive, so unwinding drops it. Without a `catch_unwind` guard in
+    /// `Drop`, an uncaught panic during that drop is a panic during a panic
+    /// (this probe's own, already unwinding), which Rust turns into
     /// `abort()` (`SIGABRT`) — killing the whole process, not just this one
     /// failing test. Needs a genuine subprocess: aborting the calling
     /// process is the whole point of the probe.
     ///
-    /// Corruption method: replace the DB file with a directory of the same
-    /// name, rather than `chmod`ing it narrow, so this hook is meaningful on
-    /// both platforms it runs on. On Unix, `connect_with`'s open (no
-    /// `SQLITE_OPEN_CREATE`) fails `SQLITE_CANTOPEN` against the directory,
-    /// and `symlink_metadata` reports the directory as present, not absent —
-    /// so `connect_with` panics right there, without ever calling
-    /// `ensure_published`. Windows never runs that Unix-only publish step
-    /// either way: SQLite rejects a directory as a database
-    /// (`SQLITE_CANTOPEN`) on both platforms — confirmed on macOS, and
-    /// Skuld's CI Windows lane is what confirms the Windows half. Either
-    /// way, `chmod` has no Windows analogue and would have left this hook,
-    /// and the `Drop` fix it exercises, untested on Windows CI even though
-    /// the fix itself is platform-agnostic.
+    /// Corruption method: a *second*, independent connection drops the
+    /// `running` table out from under `_registration`'s own connection.
+    /// `TestRegistration` never reconnects (see its own doc for why doing
+    /// so would be a correctness bug, not just redundant), so corrupting the
+    /// file at `path` itself — this probe's previous method, replacing it
+    /// with a directory — no longer reaches `_registration`'s cleanup at
+    /// all: its connection's open file descriptor still points at the
+    /// original, valid inode regardless of what a directory-replacement
+    /// does to the path. Dropping the table instead is a schema change
+    /// SQLite propagates to every connection still open against that same
+    /// file, `_registration`'s included, the next time it prepares a
+    /// statement — exactly what its cleanup's `DELETE` does.
     pub fn probe_drop_panic_during_unwind(path: &std::path::Path) {
         let _registration = crate::coordination::coordinate(path, "probe", &[], "");
-        std::fs::remove_file(path).unwrap_or_else(|e| panic!("probe: could not remove {path:?} to corrupt it: {e}"));
-        std::fs::create_dir(path).unwrap_or_else(|e| panic!("probe: could not create a directory at {path:?}: {e}"));
+        let saboteur = crate::coordination::open_db(path);
+        saboteur
+            .execute_batch("DROP TABLE running")
+            .unwrap_or_else(|e| panic!("probe: could not drop the running table to corrupt it: {e}"));
+        drop(saboteur);
 
         panic!(
             "probe: artificial panic to trigger unwind; TestRegistration::drop's own cleanup \
              must not be allowed to abort the process"
+        );
+    }
+
+    /// Probe hook for Skuld's own test suite: prove that `SQLITE_OPEN_PRIVATE_CACHE`
+    /// (set on every connection Skuld opens — see its own comment at the
+    /// Unix `connect_with_hooks` flags) keeps ordinary contention between
+    /// two of Skuld's own connections reporting as `SQLITE_BUSY`, even when
+    /// something else in the process has turned SQLite's shared-cache mode
+    /// on globally first. `sqlite3_enable_shared_cache` is process-global
+    /// and this process also runs arbitrary user test code Skuld doesn't
+    /// control, so this isn't a hypothetical: without the flag, this exact
+    /// scenario reports `SQLITE_LOCKED` instead (confirmed by hand before
+    /// writing this probe — the `debug_assert!` in `retry_busy` that treats
+    /// `SQLITE_LOCKED` as always a same-connection self-conflict would then
+    /// be wrong, and would fire). Needs a genuine subprocess:
+    /// `sqlite3_enable_shared_cache` has no un-set, so this can't share a
+    /// process with any other test.
+    pub fn probe_shared_cache_still_reports_busy(path: &std::path::Path) {
+        // Safety: `sqlite3_enable_shared_cache` has no documented safety
+        // precondition beyond "call it before opening the connections you
+        // want it to apply to", which this probe does.
+        let rc = unsafe { rusqlite::ffi::sqlite3_enable_shared_cache(1) };
+        assert_eq!(
+            rc,
+            rusqlite::ffi::SQLITE_OK,
+            "probe: sqlite3_enable_shared_cache(1) failed: {rc}"
+        );
+
+        // Two of Skuld's own connections to the same coordination DB,
+        // opened exactly as any two real Skuld processes/threads would.
+        let holder = crate::coordination::open_db(path);
+        holder
+            .execute_batch("BEGIN EXCLUSIVE")
+            .unwrap_or_else(|e| panic!("probe: holder's BEGIN EXCLUSIVE failed: {e}"));
+
+        let waiter = crate::coordination::open_db(path);
+        let result = waiter.execute_batch("BEGIN IMMEDIATE");
+        let err = match result {
+            Ok(()) => panic!("probe: waiter's BEGIN IMMEDIATE must fail while holder holds BEGIN EXCLUSIVE"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy),
+            "probe: contention between two of Skuld's own connections must still report \
+             SQLITE_BUSY, not SQLITE_LOCKED, even with shared-cache mode enabled process-wide \
+             by something else: {err:?}"
         );
     }
 }

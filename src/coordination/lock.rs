@@ -98,6 +98,21 @@ pub(super) fn lock_path(db_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Zero-cost proof that the calling stack frame currently holds `db_path`'s
+/// init lock, obtained only from inside [`with_init_lock`]'s own closure.
+/// Exists so functions that must only ever run while that lock is held
+/// (`super::connect_locked`, `super::ensure_schema_locked`) can require one
+/// as a parameter instead of relying on a doc comment and callers
+/// remembering to nest correctly: a caller that doesn't hold the lock has no
+/// `&InitLockHeld` to pass, so a violation is a compile error, not a
+/// doc-comment promise nothing enforces. Not constructible outside this
+/// module, and carries no data — it's a marker, not a capability that could
+/// itself be smuggled out and reused after the lock releases (there's
+/// nothing about holding a `&InitLockHeld` past `with_init_lock`'s call that
+/// the borrow checker doesn't already rule out, since the reference can't
+/// outlive the closure it was handed into).
+pub(super) struct InitLockHeld(());
+
 /// Run `f` while holding a blocking, exclusive advisory lock on `db_path`'s
 /// lock target (see the module doc). Blocks with no timeout on the
 /// `flock`/`LockFileEx` call itself.
@@ -109,11 +124,11 @@ pub(super) fn lock_path(db_path: &Path) -> PathBuf {
 /// `LockFileEx` release their lock unconditionally when the last handle to
 /// it closes. A panic inside `f` (a genuinely broken DB path, for example)
 /// therefore can never leave the lock held.
-pub(super) fn with_init_lock<T>(db_path: &Path, f: impl FnOnce() -> T) -> T {
+pub(super) fn with_init_lock<T>(db_path: &Path, f: impl FnOnce(&InitLockHeld) -> T) -> T {
     let target = open_lock_target(db_path);
     lock_exclusive(&target)
         .unwrap_or_else(|e| panic!("skuld: failed to acquire coordination DB init lock for {db_path:?}: {e}"));
-    f()
+    f(&InitLockHeld(()))
 }
 
 /// Open `db_path`'s lock target, ready to be locked or try-locked (via

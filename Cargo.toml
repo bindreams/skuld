@@ -254,3 +254,10 @@ name = "lock_emfile_probe"
 path = "tests/support_bins/lock_emfile_probe/main.rs"
 test = false
 doc = false
+
+# See tests/support_bins/shared_cache_probe/main.rs's module doc.
+[[bin]]
+name = "shared_cache_probe"
+path = "tests/support_bins/shared_cache_probe/main.rs"
+test = false
+doc = false
