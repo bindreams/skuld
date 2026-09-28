@@ -245,6 +245,11 @@ fn registration_drop_does_not_delete_a_different_registration_that_reused_its_id
     // b registers against the freshly recreated DB, global-serial so its
     // continued presence is directly checkable via can_start below.
     let b = coordinate(&path, "b", &[], SERIAL_ALL);
+    assert_eq!(
+        a.id, b.id,
+        "test precondition: a and b must have collided on the same numeric id (AUTOINCREMENT \
+         restarting after the recreated file) for this test to actually exercise anything"
+    );
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(a)));
     assert!(
@@ -261,6 +266,54 @@ fn registration_drop_does_not_delete_a_different_registration_that_reused_its_id
     );
 
     drop(b);
+}
+
+/// **Known defect, held for the owner's decision — do not fix by changing
+/// `TestRegistration`'s design without it.** Deleting *only* `.skuld.db`
+/// mid-run (not its `-wal`/`-shm` companions, unlike the sibling test above)
+/// corrupts the DB from a's connection's perspective: `-wal`/`-shm` are
+/// identified by *path*, shared with whatever `b` recreates at the same
+/// path, while a's connection keeps writing through its own still-open
+/// handle to the (now-detached) main file. The two halves — a's old main
+/// file, b's fresh `-wal`/`-shm` — stop agreeing on the database's actual
+/// size and content, and SQLite detects it. Reproduces `SQLITE_IOERR_SHORT_READ`
+/// (extended code 522) on `drop(b)`, confirmed by running this exact
+/// sequence: `a.id`/`b.id` collide as in the sibling test, `drop(a)`
+/// succeeds (it doesn't touch `-wal`/`-shm` on the path `b` now owns), and
+/// `drop(b)` panics.
+///
+/// This assertion documents *today's* behavior, not the desired one — it
+/// will need to change once the owner decides how `-wal`/`-shm` should be
+/// handled (delete them too on recreation? tie `a`'s connection to
+/// `-wal`/`-shm` state some other way? something else?). Don't treat a
+/// green run of this test as "fixed."
+#[cfg(unix)]
+#[test]
+fn registration_drop_corrupts_the_recreated_db_when_only_the_main_file_is_deleted_mid_run() {
+    let (_dir, path) = temp_db();
+
+    let a = coordinate(&path, "a", &[], SERIAL_NONE);
+
+    // Unlike the sibling test above: only the main file, not -wal/-shm.
+    std::fs::remove_file(&path).unwrap();
+
+    let b = coordinate(&path, "b", &[], SERIAL_ALL);
+    assert_eq!(
+        a.id, b.id,
+        "test precondition: a and b must have collided on the same numeric id for this probe \
+         to mean anything"
+    );
+
+    drop(a);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(b)));
+    assert!(
+        result.is_err(),
+        "KNOWN DEFECT (held for the owner): dropping b currently panics with SQLITE_IOERR_SHORT_READ \
+         because deleting only .skuld.db (not -wal/-shm) mid-run corrupts the DB from a's \
+         connection's perspective. This assertion documents today's behavior, not the desired \
+         one — see this test's own doc comment"
+    );
 }
 
 // Concurrent coordination =====
@@ -412,8 +465,11 @@ fn open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap()
 /// The same uncapped-retry principle, for [`TestRegistration`]'s cleanup:
 /// its `DELETE` can genuinely contend with a concurrent, already-initialized
 /// connection mid-`BEGIN EXCLUSIVE` — the ordinary shape of a live
-/// [`coordinate`] caller — since that connection never takes the init lock
-/// [`open_db`] and cleanup both do. Same deterministic, per-thread proof as
+/// [`coordinate`] caller, since that other connection never takes any init
+/// lock either, once its own `open_db` call has returned. (Cleanup itself
+/// doesn't take the init lock at all any more — it deletes through the same
+/// connection `coordinate` registered on, never reconnecting; see
+/// `TestRegistration`'s own doc.) Same deterministic, per-thread proof as
 /// the test above (a channel `retry_busy` sends on, not a spin loop or a
 /// counter); no sleep, no wall-clock assertion.
 ///

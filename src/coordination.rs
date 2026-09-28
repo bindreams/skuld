@@ -132,12 +132,19 @@ pub(crate) fn connect(path: &std::path::Path) -> rusqlite::Connection {
 }
 
 /// [`connect`]'s body, run by both [`connect`] and [`open_db`] while each
-/// already holds `path`'s init lock (the [`lock::InitLockHeld`] token proves
-/// it at compile time — a caller with no lock has no token to pass) — a
-/// shared inner helper so [`open_db`] can keep its own connect-then-initialize
-/// sequence under one lock acquisition instead of two, which would
-/// otherwise leave the gap between them unprotected again.
-fn connect_locked(path: &std::path::Path, _init_lock: &lock::InitLockHeld) -> rusqlite::Connection {
+/// already holds `path`'s init lock — the [`lock::InitLockHeld`] token
+/// proves at compile time that *some* init lock is held (a caller with none
+/// at all has no token to pass), and the `debug_assert_eq!` below checks
+/// it's actually *this* `path`'s, not silently accepting a token for a
+/// different one. A shared inner helper so [`open_db`] can keep its own
+/// connect-then-initialize sequence under one lock acquisition instead of
+/// two, which would otherwise leave the gap between them unprotected again.
+fn connect_locked(path: &std::path::Path, init_lock: &lock::InitLockHeld<'_>) -> rusqlite::Connection {
+    debug_assert_eq!(
+        init_lock.path(),
+        path,
+        "connect_locked: called with a path different from the one whose init lock is held"
+    );
     #[cfg(unix)]
     let conn = connect_with(path, publish::ensure_published);
 
@@ -298,7 +305,7 @@ fn path_is_absent(path: &std::path::Path) -> bool {
 pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
     lock::with_init_lock(path, |token| {
         let conn = connect_locked(path, token);
-        ensure_schema_locked(&conn, token);
+        ensure_schema_locked(path, &conn, token);
         conn
     })
 }
@@ -319,20 +326,33 @@ const INIT_SQL: &str = "PRAGMA journal_mode = WAL;
      );";
 
 /// Ensure `conn`'s schema exists and is migrated to [`SCHEMA_VERSION`].
-/// **Requires proof the caller already holds `conn`'s path's init lock** —
-/// the [`lock::InitLockHeld`] token, obtainable only from inside
+/// **Requires proof the caller already holds `path`'s init lock** — the
+/// [`lock::InitLockHeld`] token, obtainable only from inside
 /// [`lock::with_init_lock`]'s own closure — since this does not acquire the
 /// lock itself: composing a second, nested `with_init_lock` call inside a
 /// closure that already holds it would self-deadlock (see [`connect`]'s
-/// doc). [`open_db`] is this function's only caller: every real connection
-/// this crate hands out goes through `open_db` once, up front, and keeps
-/// using that same connection afterward (see [`TestRegistration`]'s own
-/// doc for why it never reconnects), so this only ever runs once per
-/// connection's lifetime, not on every operation against it.
+/// doc). The token only proves *some* lock is held at compile time; the
+/// `debug_assert_eq!` below is what actually checks it's the lock for
+/// `path`, not merely a token for a different one passed by mistake — `path`
+/// itself, not `conn.path()`, since `Connection::path()` returns SQLite's
+/// own canonicalized filename (resolving `.`, `..`, and symlinks — e.g.
+/// macOS's `/tmp` → `/private/tmp`), which can legitimately differ from the
+/// exact string a caller passed in even when both name the same file, and a
+/// caller's own `path` is what `init_lock.path()` was actually built from.
+/// [`open_db`] is this function's only caller: every real connection this
+/// crate hands out goes through `open_db` once, up front, and keeps using
+/// that same connection afterward (see [`TestRegistration`]'s own doc for
+/// why it never reconnects), so this only ever runs once per connection's
+/// lifetime, not on every operation against it.
 ///
 /// Idempotent regardless: `CREATE TABLE IF NOT EXISTS` is a same-schema
 /// no-op once any process has run this once (see [`open_db`]'s doc).
-fn ensure_schema_locked(conn: &rusqlite::Connection, _init_lock: &lock::InitLockHeld) {
+fn ensure_schema_locked(path: &std::path::Path, conn: &rusqlite::Connection, init_lock: &lock::InitLockHeld<'_>) {
+    debug_assert_eq!(
+        init_lock.path(),
+        path,
+        "ensure_schema_locked: called with a path different from the one whose init lock is held"
+    );
     retry_busy(conn, || conn.execute_batch(INIT_SQL)).unwrap_or_else(|e| {
         panic!(
             "skuld: failed to initialize coordination DB at {:?}: {e}",

@@ -21,10 +21,10 @@
 //! `std::fs::File` API: std only implements `lock`/`try_lock` on a subset of
 //! the Unix targets it otherwise treats as `flock`-capable, and Android is
 //! missing from that subset — calling `std`'s version there panics
-//! `"lock() not supported"` on every `open_db`/`TestRegistration::drop`
-//! instead of ever acquiring anything. `rustix::fs::flock` calls the same
-//! underlying syscall directly on every Unix this crate supports, Android
-//! included.
+//! `"lock() not supported"` on every `open_db` call instead of ever
+//! acquiring anything (`TestRegistration::drop` no longer takes this lock
+//! at all — see its own doc). `rustix::fs::flock` calls the same underlying
+//! syscall directly on every Unix this crate supports, Android included.
 //!
 //! **The lock target can't be deleted or replaced by anything short of
 //! recreating the directory (Unix) or the file (Windows) it lives at.** That
@@ -98,20 +98,35 @@ pub(super) fn lock_path(db_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Zero-cost proof that the calling stack frame currently holds `db_path`'s
-/// init lock, obtained only from inside [`with_init_lock`]'s own closure.
-/// Exists so functions that must only ever run while that lock is held
-/// (`super::connect_locked`, `super::ensure_schema_locked`) can require one
-/// as a parameter instead of relying on a doc comment and callers
-/// remembering to nest correctly: a caller that doesn't hold the lock has no
-/// `&InitLockHeld` to pass, so a violation is a compile error, not a
-/// doc-comment promise nothing enforces. Not constructible outside this
-/// module, and carries no data — it's a marker, not a capability that could
-/// itself be smuggled out and reused after the lock releases (there's
-/// nothing about holding a `&InitLockHeld` past `with_init_lock`'s call that
-/// the borrow checker doesn't already rule out, since the reference can't
-/// outlive the closure it was handed into).
-pub(super) struct InitLockHeld(());
+/// Compile-time proof that the calling stack frame currently holds *some*
+/// init lock, obtained only from inside [`with_init_lock`]'s own closure —
+/// carrying the [`Path`] that lock was acquired for, so callers can check
+/// (via [`InitLockHeld::path`]) that it's actually *their* path's lock, not
+/// merely a token proving some unspecified lock is held. That check is a
+/// `debug_assert_eq!` at each real call site (`super::connect_locked`,
+/// `super::ensure_schema_locked`), not something this type enforces by
+/// construction: nothing here stops a caller from holding path A's lock and
+/// passing its token alongside path B — the type system only proves *a*
+/// lock is held, never *which* one matches the path in hand. Exists so
+/// functions that must only ever run while the right lock is held don't
+/// rely purely on a doc comment and callers remembering to nest correctly:
+/// a caller with no lock at all has no `&InitLockHeld` to pass, which is a
+/// compile error; a caller holding the *wrong* path's lock still compiles,
+/// but fails loudly in debug builds instead of silently. Not constructible
+/// outside this module, and carries no data beyond the path — it's a
+/// marker, not a capability that could itself be smuggled out and reused
+/// after the lock releases (there's nothing about holding a `&InitLockHeld`
+/// past `with_init_lock`'s call that the borrow checker doesn't already
+/// rule out, since the reference can't outlive the closure it was handed
+/// into).
+pub(super) struct InitLockHeld<'a>(&'a Path);
+
+impl<'a> InitLockHeld<'a> {
+    /// The path [`with_init_lock`] acquired this token's lock for.
+    pub(super) fn path(&self) -> &Path {
+        self.0
+    }
+}
 
 /// Run `f` while holding a blocking, exclusive advisory lock on `db_path`'s
 /// lock target (see the module doc). Blocks with no timeout on the
@@ -124,11 +139,11 @@ pub(super) struct InitLockHeld(());
 /// `LockFileEx` release their lock unconditionally when the last handle to
 /// it closes. A panic inside `f` (a genuinely broken DB path, for example)
 /// therefore can never leave the lock held.
-pub(super) fn with_init_lock<T>(db_path: &Path, f: impl FnOnce(&InitLockHeld) -> T) -> T {
+pub(super) fn with_init_lock<T>(db_path: &Path, f: impl FnOnce(&InitLockHeld<'_>) -> T) -> T {
     let target = open_lock_target(db_path);
     lock_exclusive(&target)
         .unwrap_or_else(|e| panic!("skuld: failed to acquire coordination DB init lock for {db_path:?}: {e}"));
-    f(&InitLockHeld(()))
+    f(&InitLockHeld(db_path))
 }
 
 /// Open `db_path`'s lock target, ready to be locked or try-locked (via
