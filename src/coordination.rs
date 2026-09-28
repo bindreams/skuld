@@ -268,29 +268,59 @@ fn path_is_absent(path: &std::path::Path) -> bool {
 /// something outside Skuld's own locking discipline that happens to hold a
 /// competing lock on the file at that instant. [`retry_busy`] handles it
 /// regardless of source: [`connect_locked`] disables rusqlite's own default
-/// 5 s `busy_timeout` on this connection, so a transient busy/locked error
+/// 5 s `busy_timeout` on this connection, so a transient busy error
 /// surfaces immediately instead of first blocking inside that internal,
 /// capped handler, and is retried here, uncapped, on the error code alone.
 pub(crate) fn open_db(path: &std::path::Path) -> rusqlite::Connection {
-    let init_sql = "PRAGMA journal_mode = WAL;
-         PRAGMA foreign_keys = ON;
-         CREATE TABLE IF NOT EXISTS running (
-             id            INTEGER PRIMARY KEY AUTOINCREMENT,
-             instance_id   TEXT    NOT NULL,
-             name          TEXT    NOT NULL,
-             serial_filter TEXT    NOT NULL DEFAULT ''
-         );
-         CREATE TABLE IF NOT EXISTS labels (
-             running_id INTEGER NOT NULL REFERENCES running(id) ON DELETE CASCADE,
-             label      TEXT    NOT NULL
-         );";
     lock::with_init_lock(path, || {
         let conn = connect_locked(path);
-        retry_busy(&conn, || conn.execute_batch(init_sql))
-            .unwrap_or_else(|e| panic!("skuld: failed to initialize coordination DB at {path:?}: {e}"));
-        migrate_schema(&conn);
+        ensure_schema_locked(&conn);
         conn
     })
+}
+
+/// The schema-creation SQL [`ensure_schema_locked`] runs. A `const`, not a
+/// local inside it, so its shape is visible without inlining the function.
+const INIT_SQL: &str = "PRAGMA journal_mode = WAL;
+     PRAGMA foreign_keys = ON;
+     CREATE TABLE IF NOT EXISTS running (
+         id            INTEGER PRIMARY KEY AUTOINCREMENT,
+         instance_id   TEXT    NOT NULL,
+         name          TEXT    NOT NULL,
+         serial_filter TEXT    NOT NULL DEFAULT ''
+     );
+     CREATE TABLE IF NOT EXISTS labels (
+         running_id INTEGER NOT NULL REFERENCES running(id) ON DELETE CASCADE,
+         label      TEXT    NOT NULL
+     );";
+
+/// Ensure `conn`'s schema exists and is migrated to [`SCHEMA_VERSION`].
+/// **Assumes the caller already holds `conn`'s path's init lock** — this
+/// does not acquire it itself, so it's safe to call from inside a closure
+/// [`lock::with_init_lock`] is already running (unlike composing a second,
+/// nested `with_init_lock` call, which would self-deadlock — see
+/// [`connect`]'s doc).
+///
+/// Idempotent, and meant to be called unconditionally rather than only on
+/// first connect: `CREATE TABLE IF NOT EXISTS` is a same-schema no-op once
+/// any process has run this once (see [`open_db`]'s doc), so every caller
+/// after the first pays only the cost of confirming that — which matters
+/// because [`TestRegistration::drop`]'s cleanup calls this too, not just
+/// [`open_db`]. That's not redundant: `connect_locked` tolerates `.skuld.db`
+/// having been deleted mid-run by recreating it fresh and empty (see
+/// [`connect`]'s doc), and a fresh, schema-less DB is exactly what a bare
+/// `DELETE FROM running` would otherwise fail against with "no such table"
+/// — a non-retryable error `retry_busy` can't and shouldn't paper over by
+/// matching its text. Running this first closes that gap the same way
+/// `open_db` always has, rather than special-casing the error.
+fn ensure_schema_locked(conn: &rusqlite::Connection) {
+    retry_busy(conn, || conn.execute_batch(INIT_SQL)).unwrap_or_else(|e| {
+        panic!(
+            "skuld: failed to initialize coordination DB at {:?}: {e}",
+            conn.path().unwrap_or("<unknown>")
+        )
+    });
+    migrate_schema(conn);
 }
 
 // Test probe hooks =====
@@ -320,18 +350,26 @@ pub(crate) fn probe_try_init_lock(path: &std::path::Path) -> Result<(), std::fs:
 
 // Transient error classification =====
 
-/// Returns true for transient SQLite errors that callers should retry.
+/// Returns true for the one SQLite error retrying can actually resolve:
+/// `SQLITE_BUSY` (primary code 5) — another connection holds a lock that
+/// prevents progress, and will eventually release it. rusqlite collapses
+/// extended codes (`SQLITE_BUSY_SNAPSHOT`, `SQLITE_BUSY_RECOVERY`, etc.) onto
+/// this primary variant, so a primary-code match covers every shape of it.
 ///
-/// `SQLITE_BUSY` (code 5) means another connection holds a lock that prevents
-/// progress; `SQLITE_LOCKED` (code 6) means a shared-cache / table-level lock
-/// blocks progress. rusqlite collapses extended codes (`SQLITE_BUSY_SNAPSHOT`,
-/// `SQLITE_LOCKED_SHAREDCACHE`, etc.) onto these primary variants, so a
-/// primary-code match covers all transient lock-contention errors.
+/// `SQLITE_LOCKED` (code 6) is deliberately *not* included, even though it's
+/// also nominally a lock-contention code: it means a shared-cache-mode
+/// table-level lock held by a *different* connection sharing that cache, or
+/// — the only way it can arise here — a conflict with a statement still
+/// pending on the *same* connection (e.g. a prepared statement that hasn't
+/// been fully stepped or reset, still holding a cursor open). No connection
+/// this crate ever opens enables shared-cache mode, so every `SQLITE_LOCKED`
+/// reachable here is the same-connection case: permanent for as long as that
+/// pending statement stays open, and retrying the same failing call cannot
+/// make it go away — only finishing or resetting that other statement can.
+/// Treating it as retryable would spin uselessly against a bug in this
+/// crate's own code, not wait out a real external condition.
 pub(crate) fn is_retryable(err: &rusqlite::Error) -> bool {
-    matches!(
-        err.sqlite_error_code(),
-        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
-    )
+    matches!(err.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy))
 }
 
 /// Retry `f` for as long as it fails with a transient [`is_retryable`] error,
@@ -355,17 +393,14 @@ pub(crate) fn is_retryable(err: &rusqlite::Error) -> bool {
 ///
 /// **Precondition:** `conn` must be in autocommit mode (no transaction of
 /// its own already open) whenever this is called, checked on entry and
-/// before every retry. Two of the errors [`is_retryable`] treats as
-/// transient are not, in that state: `SQLITE_BUSY_SNAPSHOT` — reported when
-/// a WAL read transaction's snapshot can't be promoted to a write past
-/// concurrent writes elsewhere — is a property of the snapshot the
-/// transaction already started with, which retrying the same statement
-/// cannot change without ending that transaction first; and `SQLITE_LOCKED`
-/// from *this same connection* (e.g. a pending statement still holding a
-/// cursor open) reflects a self-conflict retrying can't resolve either,
-/// only ending the other statement can. Every real call site here always
-/// calls this outside any transaction it holds open itself, so the
-/// precondition costs nothing to keep.
+/// before every retry. `SQLITE_BUSY_SNAPSHOT` — the one `is_retryable` case
+/// this matters for — is reported when a WAL read transaction's snapshot
+/// can't be promoted to a write past concurrent writes elsewhere; that's a
+/// property of the snapshot the transaction already started with, which
+/// retrying the same statement cannot change without ending that
+/// transaction first. Every real call site here always calls this outside
+/// any transaction it holds open itself, so the precondition costs nothing
+/// to keep.
 fn retry_busy<T>(
     conn: &rusqlite::Connection,
     mut f: impl FnMut() -> Result<T, rusqlite::Error>,
@@ -373,7 +408,7 @@ fn retry_busy<T>(
     debug_assert!(
         conn.is_autocommit(),
         "retry_busy: conn must be in autocommit mode — see this function's doc for why \
-         SQLITE_BUSY_SNAPSHOT/same-connection SQLITE_LOCKED are permanent inside an open transaction"
+         SQLITE_BUSY_SNAPSHOT is permanent inside an open transaction"
     );
     let mut backoff = Duration::from_millis(10);
     let max_backoff = Duration::from_millis(200);
@@ -391,21 +426,31 @@ fn retry_busy<T>(
                 // loop's — collapsing them here would mean carrying state
                 // whose only purpose is to decide what NOT to say, which is
                 // itself a small piece of policy this function has no
-                // business owning. Time appears here only as a
-                // human-readable "how long has this been going on" data
-                // point in the message text, never as a decision: nothing
-                // about the retry loop itself changes based on how many
-                // times this has already printed.
+                // business owning. Nothing about the retry loop itself
+                // changes based on how many times this has already printed.
                 skuld_debug_eprintln!(
-                    "coordination: retrying a transient busy/locked error against {:?} — uncapped, \
-                     so if this never resolves, something is holding a lock on that database \
+                    "coordination: retrying a transient busy error against {:?} — uncapped, so if \
+                     this never resolves, something is holding a lock on that database \
                      indefinitely",
                     conn.path().unwrap_or("<unknown>")
                 );
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(max_backoff);
             }
-            other => return other,
+            other => {
+                if let Err(ref e) = other {
+                    debug_assert!(
+                        e.sqlite_error_code() != Some(rusqlite::ErrorCode::DatabaseLocked),
+                        "retry_busy: got SQLITE_LOCKED against {:?}, which this crate never treats \
+                         as retryable — see is_retryable's doc for why: no connection here enables \
+                         shared-cache mode, so this can only be a same-connection self-conflict \
+                         (a bug in this crate's own code), not an external condition worth waiting \
+                         out: {e}",
+                        conn.path().unwrap_or("<unknown>")
+                    );
+                }
+                return other;
+            }
         }
     }
 }
@@ -446,11 +491,14 @@ fn signal_test_retry_hook() {
 // becomes the failure signal, not just the success one: it returns `Err`
 // the moment every `Sender` (here, the one moved whole into the worker
 // thread's closure via `set_test_retry_hook`, never cloned) is dropped
-// without ever sending, which happens automatically when that thread exits —
-// on a panic during unwind included, since thread-locals are torn down as
-// part of that unwind — so a retry path that's broken (never retries, or
-// panics before it would) fails the test outright instead of spinning
-// forever.
+// without ever sending. That happens on ordinary return from the closure,
+// and on a panic too: `std::thread::spawn`'s own wrapper catches the
+// unwinding panic (to convert it into the `Err` a `JoinHandle::join()`
+// reports) before the thread actually exits, and thread-local destructors —
+// this `Sender` included — run as part of that exit, strictly after the
+// catch, not "during" the unwind itself. Either way the thread is gone and
+// `tx` with it, so a retry path that's broken (never retries, or panics
+// before it would) fails the test outright instead of spinning forever.
 #[cfg(test)]
 thread_local! {
     static TEST_RETRY_HOOK: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -462,10 +510,21 @@ thread_local! {
 /// making the one call it exists to drive into contention: such a thread is
 /// always discarded (joined, never reused for anything else) once that call
 /// returns, so there is nothing to deactivate afterward — the thread exiting
-/// drops `tx` on its own.
+/// drops `tx` on its own. Panics (via `debug_assert!`) if called twice on the
+/// same thread without an intervening thread exit: every real test spawns a
+/// fresh, single-purpose thread for this, so a non-empty slot here means a
+/// test is reusing a thread or activating two hooks at once — a test bug
+/// this exists to catch, not a scenario to silently overwrite.
 #[cfg(test)]
 pub(crate) fn set_test_retry_hook(tx: std::sync::mpsc::Sender<()>) {
-    TEST_RETRY_HOOK.with(|c| *c.borrow_mut() = Some(tx));
+    TEST_RETRY_HOOK.with(|c| {
+        let mut slot = c.borrow_mut();
+        debug_assert!(
+            slot.is_none(),
+            "set_test_retry_hook: called twice on the same thread without an intervening exit"
+        );
+        *slot = Some(tx);
+    });
 }
 
 // Schema migration =====
@@ -479,14 +538,16 @@ fn migrate_schema(conn: &rusqlite::Connection) {
     // `BEGIN EXCLUSIVE` elsewhere would block it — in WAL mode a plain read
     // like this one doesn't contend with another connection's write lock at
     // all, exclusive or not — but because `SQLITE_BUSY_RECOVERY` can still
-    // surface here: it's reported when this connection is the one that
-    // notices a WAL file left over from another connection's unclean exit
-    // and needs to recover it, and any query issued in that state can hit
-    // it. `.unwrap_or(0)` is unchanged and only reached once a genuinely
-    // non-retryable error comes back. (Nothing in this crate's own test
-    // suite reproduces `SQLITE_BUSY_RECOVERY` — it needs a genuinely killed
-    // process leaving a hot WAL, not a live contending connection — so this
-    // path relies on code review rather than a regression test.)
+    // surface here: it's reported to a connection that has to *wait* because
+    // some *other* connection is the one currently running WAL recovery (the
+    // hot-journal cleanup after that other connection's own unclean exit) —
+    // this connection is the one blocked, not the one recovering. `.unwrap_or(0)`
+    // is unchanged and only reached once a genuinely non-retryable error
+    // comes back. (Nothing in this crate's own test suite reproduces
+    // `SQLITE_BUSY_RECOVERY` — it needs a genuinely killed process leaving a
+    // hot WAL and a second connection racing the recovery, not a live
+    // contending connection alone — so this path relies on code review
+    // rather than a regression test.)
     let current: i64 = retry_busy(conn, || conn.query_row("PRAGMA user_version", [], |row| row.get(0))).unwrap_or(0);
     if current >= SCHEMA_VERSION {
         return;
@@ -822,14 +883,28 @@ impl Drop for TestRegistration {
         // itself a capped, time-based wait. The DELETE below can genuinely
         // contend with another, already-initialized process mid-`BEGIN
         // EXCLUSIVE` inside `coordinate` — that connection never takes this
-        // init lock — so [`retry_busy`] retries past a transient busy/locked
+        // init lock — so [`retry_busy`] retries past a transient busy
         // error, uncapped, and panics loudly (via `unwrap_or_else`) on
         // anything else: a failure that's genuinely possible here is worth
         // surfacing, not just warning about, same as `connect_locked`'s own
         // panics below.
+        //
+        // `ensure_schema_locked` first, unconditionally, not just
+        // `connect_locked`: `connect_locked` alone tolerates `.skuld.db`
+        // having been deleted mid-run (see `connect`'s doc) by recreating it
+        // fresh and *empty*, but a fresh DB has no `running` table yet — the
+        // DELETE below would fail with "no such table", a non-retryable
+        // error, if nothing re-created the schema first. Matching that
+        // error's text to special-case it would violate this crate's own
+        // rule against parsing human-readable errors; running
+        // `ensure_schema_locked` unconditionally sidesteps needing to
+        // classify the error at all, at the cost of a cheap, idempotent
+        // `PRAGMA user_version` check on the overwhelmingly common path
+        // where the schema was never actually gone.
         let cleanup = || {
             lock::with_init_lock(&self.db_path, || {
                 let conn = connect_locked(&self.db_path);
+                ensure_schema_locked(&conn);
                 retry_busy(&conn, || conn.execute_batch("PRAGMA foreign_keys = ON"))
                     .unwrap_or_else(|e| panic!("skuld: failed to unregister test from coordination DB: {e}"));
                 retry_busy(&conn, || conn.execute("DELETE FROM running WHERE id = ?1", [self.id]))
@@ -971,8 +1046,8 @@ pub(crate) fn coordinate(
                 // `connect_locked` (via `open_db`) disabled rusqlite's own
                 // default `busy_timeout` on `conn`, so this branch — not an
                 // internal SQLite busy handler — is the only thing retrying
-                // a transient busy/locked error here; see `retry_busy`'s doc
-                // for why. Not routed through `retry_busy` itself: this loop
+                // a transient busy error here; see `retry_busy`'s doc for
+                // why. Not routed through `retry_busy` itself: this loop
                 // already has its own uncapped backoff below (shared with
                 // the semantic "blocked on a serial constraint" case above),
                 // and re-runs the whole `BEGIN EXCLUSIVE` transaction on each
@@ -980,7 +1055,7 @@ pub(crate) fn coordinate(
                 #[cfg(test)]
                 signal_test_retry_hook();
                 skuld_debug_eprintln!(
-                    "coordination: {name} is retrying a transient busy/locked error against {:?} — \
+                    "coordination: {name} is retrying a transient busy error against {:?} — \
                      uncapped, so if this never resolves, something is holding a lock on that \
                      database indefinitely",
                     conn.path().unwrap_or("<unknown>")
@@ -988,6 +1063,14 @@ pub(crate) fn coordinate(
             }
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");
+                // See `is_retryable`'s doc: `SQLITE_LOCKED` here can only be
+                // a same-connection self-conflict, a bug in this crate's own
+                // code, not a condition worth having retried past.
+                debug_assert!(
+                    e.sqlite_error_code() != Some(rusqlite::ErrorCode::DatabaseLocked),
+                    "coordinate: got SQLITE_LOCKED against {:?}: {e}",
+                    conn.path().unwrap_or("<unknown>")
+                );
                 panic!("skuld: coordination DB error: {e}");
             }
         }

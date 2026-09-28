@@ -192,6 +192,41 @@ fn registration_guard_cleans_up_on_panic() {
     assert_eq!(count, 0);
 }
 
+/// `connect`'s own doc promises a `.skuld.db` deleted mid-run is tolerated —
+/// recreated fresh, same as the very first connection of the run — and that
+/// promise has to hold through `TestRegistration::drop`'s cleanup too, not
+/// just through the bare `connect_locked` call inside it. `connect_locked`
+/// alone already tolerates the deletion (it opens a fresh, schema-less DB),
+/// but the DELETE that follows doesn't unless something re-creates the
+/// schema first: against a table-less DB it fails with "no such table:
+/// running", a non-retryable `rusqlite::Error` `retry_busy` doesn't retry —
+/// and, since `retry_busy`'s callers panic loudly on a non-retryable error
+/// (see `TestRegistration::drop`'s own doc), that used to mean a hard panic
+/// on a case `main` tolerated with nothing worse than a warning.
+#[test]
+fn registration_drop_tolerates_the_db_being_deleted_mid_run() {
+    let (_dir, path) = temp_db();
+    let reg = coordinate(&path, "deleted_mid_run", &[], SERIAL_NONE);
+
+    // Delete the main file and its WAL companions — the exact shape
+    // `connect`'s doc describes as tolerated, just landing during cleanup
+    // instead of during the next connect.
+    std::fs::remove_file(&path).unwrap();
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+    let mut shm = path.as_os_str().to_owned();
+    shm.push("-shm");
+    let _ = std::fs::remove_file(std::path::PathBuf::from(shm));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(reg)));
+    assert!(
+        result.is_ok(),
+        "TestRegistration::drop must tolerate the DB having been deleted mid-run, not panic, \
+         same as connect's own doc promises for the general case"
+    );
+}
+
 // Concurrent coordination =====
 
 #[test]
@@ -327,7 +362,7 @@ fn open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap()
     });
 
     rx.recv()
-        .expect("waiter thread exited without ever hitting a retryable busy/locked error");
+        .expect("waiter thread exited without ever hitting a retryable busy error");
 
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
@@ -367,7 +402,7 @@ fn registration_drop_deletes_past_a_concurrent_held_exclusive_lock_with_no_retry
     });
 
     rx.recv()
-        .expect("dropper thread exited without ever hitting a retryable busy/locked error");
+        .expect("dropper thread exited without ever hitting a retryable busy error");
 
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
@@ -407,7 +442,7 @@ fn open_db_disables_rusqlites_default_busy_timeout() {
 }
 
 /// `coordinate`'s own retry loop — not `retry_busy` (see the comment at its
-/// call site in `coordination.rs`) — is what retries a transient busy/locked
+/// call site in `coordination.rs`) — is what retries a transient busy
 /// error from its `BEGIN EXCLUSIVE` attempt, uncapped, gated on the error
 /// code alone. Reproduced and proven the same deterministic way as
 /// `open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap`:
@@ -437,7 +472,7 @@ fn coordinate_retries_a_busy_begin_exclusive_with_no_retry_cap() {
     });
 
     rx.recv()
-        .expect("coordinate thread exited without ever hitting a retryable busy/locked error");
+        .expect("coordinate thread exited without ever hitting a retryable busy error");
 
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
@@ -450,15 +485,19 @@ fn coordinate_retries_a_busy_begin_exclusive_with_no_retry_cap() {
 // is_retryable =====
 
 #[test]
-fn is_retryable_matches_busy_and_locked_only() {
+fn is_retryable_matches_busy_only() {
     use rusqlite::{ffi, Error};
 
     let busy = Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_BUSY), Some("database is locked".into()));
+    // SQLITE_LOCKED is deliberately excluded: with no connection in this
+    // crate ever using shared-cache mode, it can only mean a same-connection
+    // self-conflict, which is permanent and not something retrying resolves
+    // — see `is_retryable`'s own doc.
     let locked = Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_LOCKED), None);
     let constraint = Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_CONSTRAINT), None);
 
     assert!(is_retryable(&busy));
-    assert!(is_retryable(&locked));
+    assert!(!is_retryable(&locked));
     assert!(!is_retryable(&constraint));
     assert!(!is_retryable(&Error::QueryReturnedNoRows));
 }
@@ -608,7 +647,7 @@ fn migrate_schema_completes_past_a_foreign_held_exclusive_lock_with_no_retry_cap
     });
 
     rx.recv()
-        .expect("waiter thread exited without ever hitting a retryable busy/locked error");
+        .expect("waiter thread exited without ever hitting a retryable busy error");
 
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
