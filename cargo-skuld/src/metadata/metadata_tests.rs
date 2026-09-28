@@ -1,21 +1,19 @@
 use super::*;
 use crate::discovery::discover_binaries;
+use crate::test_support::lock_fixture_workspace;
 use std::path::{Path, PathBuf};
-
-fn fixture_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test-workspace")
-}
 
 /// Builds the named `crate-d-broken` bin and returns its real compiled
 /// path, parsed from `--message-format=json`'s `compiler-artifact`
 /// events rather than assumed at `<root>/target/debug/<name>` — a
 /// global cargo config or an inherited `CARGO_TARGET_DIR` can redirect
-/// build output elsewhere, and a hard-coded path silently breaks in
-/// that case (review round 3 fix: correctness finding 9ba16e98).
-fn build_and_locate_broken_binary(name: &str) -> PathBuf {
-    let root = fixture_root();
+/// build output elsewhere, and a hard-coded path silently breaks in that
+/// case. Takes the fixture root from an already-held `FixtureGuard`
+/// rather than resolving it itself — see `test_support::FixtureGuard`'s
+/// doc for why there is no free-standing accessor to do that instead.
+fn build_and_locate_broken_binary(root: &Path, name: &str) -> PathBuf {
     let output = Command::new("cargo")
-        .current_dir(&root)
+        .current_dir(root)
         .args([
             "build",
             "--package",
@@ -46,7 +44,8 @@ fn build_and_locate_broken_binary(name: &str) -> PathBuf {
 
 #[test]
 fn collects_metadata_across_both_skuld_fixture_binaries() {
-    let binaries = discover_binaries(&fixture_root()).expect("discovery");
+    let _guard = lock_fixture_workspace();
+    let binaries = discover_binaries(_guard.root()).expect("discovery");
     let metadata = collect_metadata(&binaries).expect("collection");
     let find = |name: &str| {
         metadata
@@ -66,7 +65,8 @@ fn collects_metadata_across_both_skuld_fixture_binaries() {
 
 #[test]
 fn non_skuld_binary_is_silently_skipped_without_error() {
-    let binaries = discover_binaries(&fixture_root()).expect("discovery");
+    let _guard = lock_fixture_workspace();
+    let binaries = discover_binaries(_guard.root()).expect("discovery");
     assert!(binaries.iter().any(|b| b.binary_id.contains("fixture-crate-c-plain")));
     let metadata = collect_metadata(&binaries).expect("collection must not error on a non-Skuld binary");
     assert!(!metadata.iter().any(|m| m.name == "plain_libtest_test"));
@@ -85,7 +85,8 @@ fn spawn_failure_contributes_nothing_and_does_not_error() {
 
 #[test]
 fn nonzero_exit_binary_contributes_nothing_and_does_not_error() {
-    let path = build_and_locate_broken_binary("broken-nonzero-exit");
+    let _guard = lock_fixture_workspace();
+    let path = build_and_locate_broken_binary(_guard.root(), "broken-nonzero-exit");
     let binaries = vec![DiscoveredBinary {
         binary_id: "broken".into(),
         binary_path: path,
@@ -97,7 +98,8 @@ fn nonzero_exit_binary_contributes_nothing_and_does_not_error() {
 
 #[test]
 fn malformed_json_dump_contributes_nothing_and_does_not_error() {
-    let path = build_and_locate_broken_binary("broken-bad-json");
+    let _guard = lock_fixture_workspace();
+    let path = build_and_locate_broken_binary(_guard.root(), "broken-bad-json");
     let binaries = vec![DiscoveredBinary {
         binary_id: "broken".into(),
         binary_path: path,
@@ -109,7 +111,8 @@ fn malformed_json_dump_contributes_nothing_and_does_not_error() {
 
 #[test]
 fn unreadable_dump_contributes_nothing_and_does_not_error() {
-    let path = build_and_locate_broken_binary("broken-dir-dump");
+    let _guard = lock_fixture_workspace();
+    let path = build_and_locate_broken_binary(_guard.root(), "broken-dir-dump");
     let binaries = vec![DiscoveredBinary {
         binary_id: "broken".into(),
         binary_path: path,
@@ -121,7 +124,8 @@ fn unreadable_dump_contributes_nothing_and_does_not_error() {
 
 #[test]
 fn hanging_binary_is_killed_after_timeout_and_does_not_error() {
-    let path = build_and_locate_broken_binary("broken-hangs");
+    let _guard = lock_fixture_workspace();
+    let path = build_and_locate_broken_binary(_guard.root(), "broken-hangs");
     let binaries = vec![DiscoveredBinary {
         binary_id: "broken".into(),
         binary_path: path,
@@ -133,7 +137,8 @@ fn hanging_binary_is_killed_after_timeout_and_does_not_error() {
 
 #[test]
 fn test_with_unparsable_serial_filter_is_excluded_but_siblings_survive() {
-    let path = build_and_locate_broken_binary("broken-bad-serial-filter");
+    let _guard = lock_fixture_workspace();
+    let path = build_and_locate_broken_binary(_guard.root(), "broken-bad-serial-filter");
     let binaries = vec![DiscoveredBinary {
         binary_id: "broken".into(),
         binary_path: path,
@@ -153,14 +158,14 @@ fn test_with_unparsable_serial_filter_is_excluded_but_siblings_survive() {
 /// the whole run") is only actually exercised by a call that also
 /// contains a *healthy* binary — a single-broken-binary call can't
 /// distinguish "skip this one" from "abandon the whole run", since both
-/// produce the same empty result (review round 3 fix: failure finding
-/// 9a0d90b6).
+/// produce the same empty result.
 #[test]
 fn broken_binary_does_not_affect_collection_of_other_binaries_in_the_same_call() {
-    let mut binaries = discover_binaries(&fixture_root()).expect("discovery");
+    let _guard = lock_fixture_workspace();
+    let mut binaries = discover_binaries(_guard.root()).expect("discovery");
     binaries.push(DiscoveredBinary {
         binary_id: "broken".into(),
-        binary_path: build_and_locate_broken_binary("broken-nonzero-exit"),
+        binary_path: build_and_locate_broken_binary(_guard.root(), "broken-nonzero-exit"),
     });
     let metadata = collect_metadata(&binaries).expect("must not error even with a broken binary mixed in");
     assert!(

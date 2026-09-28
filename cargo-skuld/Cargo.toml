@@ -28,3 +28,40 @@ petgraph = "0.6"
 blake3 = "1"
 wait-timeout = "0.2"
 tempfile = "3"
+
+[dev-dependencies]
+# test_support.rs's ensure_target_dir uses this to create the fixture's
+# target directory the exact way cargo itself does — same atomicity, same
+# backup/content-indexing exclusion, same CACHEDIR.TAG. Test-only: nothing
+# outside test_support.rs (itself #[cfg(test)]/tests-only) touches it, so
+# it has no business being a normal, published dependency.
+cargo-util = "0.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+# test_support.rs's flock calls: std::fs::File::lock()/try_lock() aren't
+# implemented on every Unix target std itself lists as flock-capable (see
+# the root Cargo.toml's own comment on this) — rustix::fs::flock instead,
+# on every Unix. Already pulled in transitively via tempfile; this only
+# promotes it to a direct dependency. `process` (for `pidfd_open`/`waitid`)
+# is used by gen_and_run.rs's `KillOnDrop` regression test to identify its
+# spawned child by a kernel-tracked identity (a `pidfd` on Linux, the
+# process's own child-list membership via `waitid(P_PID, ...)` on macOS)
+# instead of a bare pid a reaped process's pid could be recycled to.
+# Test-only for the same reason as cargo-util above.
+rustix = { version = "1", features = ["fs", "process"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# test_support_tests.rs reads the Time Machine exclusion xattr directly
+# (rather than parsing `tmutil isexcluded`'s text output, which reports
+# every path under macOS's own ephemeral tmp hierarchy as excluded
+# regardless of whether cargo-util's own exclusion code ran — measured
+# directly) to prove ensure_target_dir's marking actually happened.
+xattr = "1"
+
+[target.'cfg(windows)'.dev-dependencies]
+# gen_and_run.rs's KillOnDrop regression test: a cloned process handle
+# (obtained before the child is killed) keeps referring to the exact same
+# process object even after the original handle, owned by the Child
+# KillOnDrop wraps, is closed — immune to a handle *value* being reused
+# for something unrelated the way a bare pid could be.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
