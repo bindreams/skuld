@@ -1,7 +1,6 @@
 //! Tests for the SQLite coordination module.
 
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
-use std::sync::Barrier;
 use std::time::Duration;
 
 use crate::coordination::test_hooks::{retry_rendezvous, set_test_retry_hook};
@@ -900,6 +899,126 @@ fn windows_open_db_file_blocks_delete_and_rename_while_held() {
     drop(a);
 }
 
+// Panic-safe rendezvous =====
+//
+// `std::sync::Barrier::wait()` blocks until every participant arrives, with
+// no other way out: if one participant's thread panics (or otherwise never
+// reaches the barrier), every other participant blocks in `wait()` forever.
+// The tests below used to accept that — `non_serial_allows_concurrent_execution`
+// said so directly ("the CI job-level timeout is the intended backstop") —
+// but a CI job timeout killing a hung process is exactly the "expiry as
+// proof of something" shape this crate's own retry/wait logic is built to
+// avoid elsewhere; a test relying on the same thing for its own liveness is
+// no different. `rendezvous` replaces `Barrier` with a mechanism that fails
+// fast instead: every participant either proceeds once all of them arrive,
+// or panics immediately once any one of them is detected missing — no
+// timeout, no polling, just a channel closing.
+
+/// One participant's handle to an `n`-way [`rendezvous`]. Call [`Self::wait`]
+/// exactly once per participant.
+struct RendezvousPoint {
+    ready_tx: std::sync::mpsc::Sender<()>,
+    go_rx: std::sync::mpsc::Receiver<()>,
+}
+
+impl RendezvousPoint {
+    /// Block until every participant in this rendezvous has called `wait`,
+    /// or panic as soon as any one of them is detected to have died first
+    /// (its own `RendezvousPoint` dropped without ever calling `wait`) —
+    /// never hangs waiting on a straggler the way `Barrier::wait` would.
+    fn wait(self) {
+        self.ready_tx
+            .send(())
+            .expect("rendezvous coordinator thread must still be running to receive this");
+        self.go_rx
+            .recv()
+            .expect("a fellow rendezvous participant died before the rendezvous completed");
+    }
+}
+
+/// Set up an `n`-participant rendezvous inside `scope`, returning one
+/// [`RendezvousPoint`] per participant (hand each to exactly one thread).
+/// Spawns a coordinator thread (inside `scope`, so `thread::scope` still
+/// waits for it) that releases every participant together once all `n` have
+/// called `wait`, or releases no one — leaving every waiting participant's
+/// `go_rx.recv()` to fail once this coordinator's own channel handles drop —
+/// the moment any one participant's `ready_tx` is dropped without sending
+/// (i.e. that participant's thread ended, panic or not, before `wait`).
+///
+/// Two independent one-shot channels per participant (`ready`/`go`), not one
+/// `Sender` cloned `n` ways: a clone-based design can't tell "one specific
+/// participant died" from "the rest just haven't arrived yet" — the channel
+/// only closes once *every* clone is gone, by which point the others may
+/// already be stuck waiting on a signal that was never coming. A dedicated
+/// pair per participant means that participant's own `ready_rx` closing
+/// (immediately, on `channel()`'s sole `Sender` being dropped) is
+/// unambiguous, specific evidence of that one participant's absence.
+fn rendezvous<'scope>(scope: &'scope std::thread::Scope<'scope, '_>, n: usize) -> Vec<RendezvousPoint> {
+    let (ready_txs, ready_rxs): (Vec<_>, Vec<_>) = (0..n).map(|_| std::sync::mpsc::channel::<()>()).unzip();
+    let (go_txs, go_rxs): (Vec<_>, Vec<_>) = (0..n).map(|_| std::sync::mpsc::channel::<()>()).unzip();
+
+    scope.spawn(move || {
+        for rx in &ready_rxs {
+            if rx.recv().is_err() {
+                // A participant's ready_tx was dropped without sending:
+                // that participant is gone. Don't release anyone — return
+                // without sending on any go_tx, dropping them all, which
+                // fails every already-waiting (or still-arriving) survivor's
+                // go_rx.recv()/ready_tx.send() instead of leaving them
+                // blocked.
+                return;
+            }
+        }
+        for tx in &go_txs {
+            let _ = tx.send(());
+        }
+    });
+
+    ready_txs
+        .into_iter()
+        .zip(go_rxs)
+        .map(|(ready_tx, go_rx)| RendezvousPoint { ready_tx, go_rx })
+        .collect()
+}
+
+/// TDD red/green for [`rendezvous`] itself: a "mutant" participant panics
+/// before ever calling `wait`. On the old `Barrier`-based design this is
+/// exactly the scenario that hangs forever (nothing in this test suite ever
+/// exercised it for that reason). With `rendezvous`, the survivors' `wait`
+/// calls must fail — and therefore panic — promptly instead, so
+/// `thread::scope` returns (propagating a panic) rather than hanging.
+#[test]
+fn rendezvous_fails_fast_instead_of_hanging_when_a_participant_panics_before_it() {
+    const THREADS: usize = 4;
+
+    let result = std::panic::catch_unwind(|| {
+        std::thread::scope(|s| {
+            let mut points = rendezvous(s, THREADS).into_iter();
+
+            // The mutant: never calls wait() at all, panics immediately.
+            // Its RendezvousPoint drops (ready_tx included) as the thread
+            // unwinds.
+            let _mutant_point = points.next().unwrap();
+            s.spawn(move || {
+                panic!("mutant: panicking before the rendezvous");
+            });
+
+            // Survivors: must fail — not hang — once the mutant is gone.
+            for point in points {
+                s.spawn(move || {
+                    point.wait();
+                });
+            }
+        });
+    });
+
+    assert!(
+        result.is_err(),
+        "thread::scope must return (propagating a panic), not hang, when a participant dies \
+         before reaching the rendezvous"
+    );
+}
+
 // Concurrent coordination =====
 
 #[test]
@@ -907,13 +1026,13 @@ fn global_serial_prevents_concurrent_execution() {
     const THREADS: usize = 8;
     let (_dir, path) = temp_db();
 
-    let barrier = Barrier::new(THREADS);
     let running = AtomicU32::new(0);
 
     std::thread::scope(|s| {
-        for _ in 0..THREADS {
+        let points = rendezvous(s, THREADS);
+        for point in points {
             s.spawn(|| {
-                barrier.wait();
+                point.wait();
                 let _reg = coordinate(&path, "serial_test", &[], SERIAL_ALL);
                 running.fetch_add(1, SeqCst);
                 std::thread::sleep(Duration::from_millis(10));
@@ -930,19 +1049,21 @@ fn non_serial_allows_concurrent_execution() {
     const { assert!(THREADS >= 2) };
     let (_dir, path) = temp_db();
 
-    // Two barriers: the first races every thread into coordinate() together
-    // (stressing lock contention); the second holds every thread past
-    // fetch_add before any exits, so peak == THREADS on success regardless
-    // of per-thread coordinate() latency. If coordination regresses and
-    // serializes non-serial tests, the second barrier deadlocks — the CI
-    // job-level timeout is the intended backstop.
-    let entry = Barrier::new(THREADS);
-    let observation = Barrier::new(THREADS);
+    // Two rendezvous points: the first races every thread into coordinate()
+    // together (stressing lock contention); the second holds every thread
+    // past fetch_add before any exits, so peak == THREADS on success
+    // regardless of per-thread coordinate() latency. Unlike the `Barrier`
+    // pair this replaced, a regression that hangs a participant (in
+    // `coordinate()` itself, or in this test's own bookkeeping) now fails
+    // the test directly instead of relying on the CI job's own timeout to
+    // notice.
     let peak = AtomicU32::new(0);
     let running = AtomicU32::new(0);
 
     std::thread::scope(|s| {
-        for _ in 0..THREADS {
+        let entry_points = rendezvous(s, THREADS);
+        let observation_points = rendezvous(s, THREADS);
+        for (entry, observation) in entry_points.into_iter().zip(observation_points) {
             s.spawn(|| {
                 entry.wait();
                 let _reg = coordinate(&path, "parallel_test", &[], SERIAL_NONE);
@@ -1591,11 +1712,11 @@ fn connect_survives_many_threads_racing_the_same_absent_path() {
 
     for _ in 0..ROUNDS {
         let (_dir, path) = temp_db();
-        let barrier = Barrier::new(THREADS);
         std::thread::scope(|s| {
-            for _ in 0..THREADS {
+            let points = rendezvous(s, THREADS);
+            for point in points {
                 s.spawn(|| {
-                    barrier.wait();
+                    point.wait();
                     // `open_db`, not a bare `connect()`, matches how every
                     // real caller reaches `connect()`: it also runs schema
                     // creation through `retry_busy`, which absorbs any
