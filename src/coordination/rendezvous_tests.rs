@@ -12,9 +12,10 @@ use super::rendezvous::rendezvous;
 /// the coordinator is already known to be done. Both choices exist for the
 /// same reason: they make this test's own verdict independent of the
 /// coordinator's internal iteration order or control flow. Every survivor
-/// is a real, already-running thread blocked in `wait()` — not code that
-/// hasn't executed yet — so its ready signal is genuinely available the
-/// moment the coordinator looks for it, in whatever order that happens: a
+/// runs on its own real, independently scheduled thread, each free to reach
+/// `wait()` and send its own ready signal on its own schedule — not code
+/// deferred until after the outcome is already known. So regardless of
+/// which order the coordinator actually observes those signals in, a
 /// coordinator that iterates in reverse, or that keeps going past a
 /// detected failure (`continue`) instead of stopping immediately
 /// (`return`), still can't produce a false "everyone survived," because
@@ -49,10 +50,10 @@ fn rendezvous_fails_fast_instead_of_hanging_when_a_participant_panics_before_it(
     let (points, coordinator) = rendezvous(THREADS);
     let mut points = points.into_iter();
 
-    // Survivors first, each a real thread already blocked in wait() before
-    // the mutant is even spawned — see this function's own doc for why
-    // that's what makes the rest of this test independent of the
-    // coordinator's internal iteration order.
+    // Survivors first, each spawned as its own independently scheduled
+    // thread before the mutant is even spawned — see this function's own
+    // doc for why that's what makes the rest of this test independent of
+    // the coordinator's internal iteration order.
     let survivors: Vec<std::thread::JoinHandle<bool>> = points
         .by_ref()
         .take(THREADS - 1)
