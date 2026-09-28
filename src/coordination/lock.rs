@@ -67,10 +67,14 @@
 //!   this handle no longer locks what a fresh opener would.
 //! - **Windows** locks a sibling [`lock_path`] file, opened with
 //!   `share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)` and, deliberately, no
-//!   `FILE_SHARE_DELETE`. Windows refuses to delete or rename a file out
-//!   from under any handle that didn't grant that share flag, so the lock
-//!   file can't be split out from under a holder at all, not even by
-//!   wholesale replacement.
+//!   `FILE_SHARE_DELETE`. Windows refuses to delete or rename the lock file
+//!   *itself* out from under any handle that didn't grant that share flag —
+//!   but a symlink or junction ancestor of `db_path` being retargeted
+//!   changes what [`lock_path`] resolves to for a *new* opener without
+//!   touching the held file at all, the same split as the Unix bullet
+//!   above, by a different mechanism. [`InitLockHeld::target_has_split`]
+//!   checks for it on Windows too, the same dev/file-index comparison
+//!   technique.
 //!
 //! Any failure to open the lock target — a missing parent directory,
 //! file-descriptor-table exhaustion (`EMFILE`), a permissions problem,
@@ -126,11 +130,14 @@ pub(super) fn lock_path(db_path: &Path) -> PathBuf {
 /// into).
 pub(super) struct InitLockHeld<'a> {
     path: &'a Path,
-    /// `fstat`-derived dev+ino of the lock target `File` this token's lock
-    /// is actually held on, recorded once at acquisition — see
-    /// [`Self::target_has_split`].
+    /// `fstat`-derived dev+ino (Unix) or `GetFileInformationByHandle`-derived
+    /// volume serial + file index (Windows) of the lock target `File` this
+    /// token's lock is actually held on, recorded once at acquisition —
+    /// see [`Self::target_has_split`].
     #[cfg(unix)]
     target_identity: (u64, u64),
+    #[cfg(windows)]
+    target_identity: (u32, u64),
 }
 
 impl<'a> InitLockHeld<'a> {
@@ -148,10 +155,6 @@ impl<'a> InitLockHeld<'a> {
     /// this handle still only excludes callers of the old, now-detached
     /// one. See the module doc's "Wholesale replacement" bullet.
     ///
-    /// Always `false` on Windows: the module doc's Windows bullet explains
-    /// why `FILE_SHARE_DELETE` being withheld already rules out the lock
-    /// target being split out from under a holder there at all, not even
-    /// by wholesale replacement — nothing to check.
     #[cfg(unix)]
     pub(super) fn target_has_split(&self) -> bool {
         use std::os::unix::fs::MetadataExt;
@@ -166,9 +169,39 @@ impl<'a> InitLockHeld<'a> {
         }
     }
 
+    /// `FILE_SHARE_DELETE` being withheld (see the module doc's Windows
+    /// bullet) rules out the lock *file itself* being deleted or renamed
+    /// while held — it says nothing about an ancestor directory of `path`
+    /// being retargeted via a symlink or junction, which changes what
+    /// [`lock_path`] resolves to for a *new* opener without touching the
+    /// held file at all (the same gap `FileIdentity`'s own doc describes
+    /// for the main DB file — confirmed real on Windows by a throwaway CI
+    /// probe before that type had a real Windows implementation). So this
+    /// checks for real here too: a fresh open of [`lock_path`] plus
+    /// `GetFileInformationByHandle`, compared against the identity
+    /// recorded at acquisition.
     #[cfg(windows)]
     pub(super) fn target_has_split(&self) -> bool {
-        false
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+
+        let Ok(fresh) = std::fs::File::open(lock_path(self.path)) else {
+            return true;
+        };
+        let handle = windows::Win32::Foundation::HANDLE(fresh.as_raw_handle());
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // Safety: `handle` is a valid, currently-open handle for as long as
+        // `fresh` is alive, which outlives this call; `&mut info` is a
+        // valid `*mut BY_HANDLE_FILE_INFORMATION` for the call to write
+        // into.
+        if unsafe { GetFileInformationByHandle(handle, &mut info) }.is_err() {
+            return true;
+        }
+        let current = (
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        );
+        current != self.target_identity
     }
 }
 
@@ -194,9 +227,27 @@ pub(super) fn with_init_lock<T>(db_path: &Path, f: impl FnOnce(&InitLockHeld<'_>
             panic!("skuld: failed to inspect coordination DB init lock target for {db_path:?}: {e}")
         })
     };
+    #[cfg(windows)]
+    let target_identity = {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+
+        let handle = windows::Win32::Foundation::HANDLE(target.as_raw_handle());
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // Safety: `handle` is a valid, currently-open handle for as long as
+        // `target` is alive, which outlives this call; `&mut info` is a
+        // valid `*mut BY_HANDLE_FILE_INFORMATION` for the call to write
+        // into.
+        unsafe { GetFileInformationByHandle(handle, &mut info) }.unwrap_or_else(|e| {
+            panic!("skuld: failed to inspect coordination DB init lock target for {db_path:?}: {e}")
+        });
+        (
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        )
+    };
     f(&InitLockHeld {
         path: db_path,
-        #[cfg(unix)]
         target_identity,
     })
 }
