@@ -64,16 +64,26 @@ fn symlinked_target_dir_locks_the_same_underlying_file_as_its_real_path() {
     }
 }
 
-/// Guards the mechanism `metadata_tests`/`discovery_tests`/`gen_and_run.rs`
-/// actually rely on: that `lock_fixture_workspace` really acquires an
+/// Guards the mechanism `metadata_tests`/`gen_and_run.rs` actually rely on:
+/// that `lock_fixture_workspace` really acquires an
 /// exclusive lock a second handle is excluded from, not just that today's
 /// tests happen to pass. A mutant that deleted the `lock_exclusive` call
 /// inside `lock_fixture_workspace` still passed every other fixture-
 /// touching test (measured). `flock`/`LockFileEx` exclude a second handle
 /// opened in the same process just as they would one opened by a separate
 /// process — no subprocess needed to prove it, and no timing: the second
-/// handle's `try_lock_exclusive` only ever runs after `lock_fixture_
-/// workspace` has already returned with the first lock held.
+/// handle's probe only ever runs after `lock_fixture_workspace` has
+/// already returned with the first lock held.
+///
+/// The second handle's probe must be a *shared* lock attempt, not another
+/// exclusive one: any existing lock, shared or exclusive, already blocks a
+/// new exclusive attempt, so an exclusive probe can't tell "the first
+/// holder took a real exclusive lock" from "the first holder took only a
+/// shared one" (a mutant swapping `LockExclusive`/`file.lock()` for
+/// `LockShared`/`file.lock_shared()` inside `lock_fixture_workspace` would
+/// still pass an exclusive-probe version of this test, measured directly).
+/// A shared probe only observes `WouldBlock` if the first lock was
+/// genuinely exclusive.
 #[test]
 fn lock_fixture_workspace_really_locks_something_a_second_handle_is_excluded_from() {
     let _guard = lock_fixture_workspace();
@@ -83,11 +93,12 @@ fn lock_fixture_workspace_really_locks_something_a_second_handle_is_excluded_fro
         .write(true)
         .open(&path)
         .unwrap_or_else(|e| panic!("open a second handle on {path:?}: {e}"));
-    match try_lock_exclusive(&second_handle) {
+    match try_lock_shared(&second_handle) {
         Err(std::fs::TryLockError::WouldBlock) => {}
         other => panic!(
-            "a second handle on the fixture lock file must observe WouldBlock while \
-             lock_fixture_workspace's guard is still held; got {other:?}"
+            "a second handle's SHARED lock attempt on the fixture lock file must observe \
+             WouldBlock while lock_fixture_workspace's guard is still held (if it doesn't, the \
+             first lock wasn't actually exclusive); got {other:?}"
         ),
     }
 }

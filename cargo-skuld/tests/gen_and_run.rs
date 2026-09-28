@@ -163,118 +163,88 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Repeatedly calls `check` until it returns `true` or `bound` elapses.
-/// This is the permitted exception to "don't synchronize via time": a
-/// child process's exit is exactly the kind of external event whose
-/// precise timing isn't ours to control even when the code that triggers
-/// it (`kill`) is correct — signal delivery and process teardown aren't
-/// instantaneous. `bound` is a *failure* bound ("didn't happen within this
-/// long"), not a guessed "long enough" duration a single check is bet on;
-/// each iteration re-checks the real, current condition.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn poll_until(bound: std::time::Duration, mut check: impl FnMut() -> bool) -> bool {
-    let deadline = std::time::Instant::now() + bound;
-    loop {
-        if check() {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+compile_error!(
+    "kill_on_drop_reaps_the_child_even_if_the_scope_panics_before_wait's reaping check is only \
+     implemented for Linux, macOS, and Windows — add a case for this target before enabling the \
+     test here, rather than letting it compile and silently assert nothing"
+);
 
-#[cfg(target_os = "macos")]
-fn macos_kill0(pid: u32) -> std::io::Result<()> {
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-/// The process's start time via `proc_pidinfo(PROC_PIDTBSDINFO)`, or the
-/// OS error if it can't be read. NOT a zombie/reaped distinguisher on its
-/// own — measured directly: `proc_pidinfo` returns `ESRCH` for an
-/// unreaped zombie exactly the same as for a fully reaped (gone) pid,
-/// which `ps -o stat=` (`Z`, `<defunct>`) confirms is still a real,
-/// unreaped zombie at that point. `macos_confirm_reaped` combines this
-/// with `macos_kill0` (which, unlike `proc_pidinfo`, *does* see a zombie)
-/// to actually distinguish the two.
-#[cfg(target_os = "macos")]
-fn macos_process_start_time(pid: u32) -> std::io::Result<(u64, u64)> {
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let ret = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as _,
-            size,
+/// Runs `drop(child)` on a background thread and blocks up to `bound` for
+/// it to finish, panicking instead of hanging the whole test binary if it
+/// doesn't. `KillOnDrop::drop` calls `Child::wait()`, which is itself
+/// unbounded: a Drop that only waits and never kills would block here
+/// forever, since the child (see child mode below) never exits on its
+/// own. This is what turns that hang into an observable test failure —
+/// not a condition worth polling, just one call whose own completion
+/// isn't guaranteed.
+fn drop_bounded(child: KillOnDrop, bound: std::time::Duration) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(child);
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(bound).unwrap_or_else(|_| {
+        panic!(
+            "KillOnDrop's Drop did not return within {bound:?} — a Drop that only waits and \
+             never kills would hang here forever, since the child never exits on its own"
         )
-    };
-    if ret <= 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok((info.pbi_start_tvsec, info.pbi_start_tvusec))
-    }
-}
-
-/// True once `pid` is reaped: either gone entirely (`kill(pid, 0)` fails),
-/// or now a *different* process (`proc_pidinfo`'s start time no longer
-/// matches `original_start`). False for a zombie: `kill(pid, 0)` still
-/// succeeds (a zombie occupies a pid slot until waited on) while
-/// `proc_pidinfo` already can't see it — that combination is exactly the
-/// "killed but not reaped" state a kill-only, no-`wait` mutant leaves
-/// behind, and is the case this function must reject.
-#[cfg(target_os = "macos")]
-fn macos_confirm_reaped(pid: u32, original_start: (u64, u64)) -> bool {
-    if macos_kill0(pid).is_err() {
-        return true;
-    }
-    matches!(macos_process_start_time(pid), Ok(start) if start != original_start)
-}
-
-#[cfg(windows)]
-fn windows_duplicate_handle(handle: windows_sys::Win32::Foundation::HANDLE) -> windows_sys::Win32::Foundation::HANDLE {
-    use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let current = unsafe { GetCurrentProcess() };
-    let mut dup = std::ptr::null_mut();
-    let ok = unsafe { DuplicateHandle(current, handle, current, &mut dup, 0, 0, DUPLICATE_SAME_ACCESS) };
-    assert!(ok != 0, "DuplicateHandle failed: {:?}", std::io::Error::last_os_error());
-    dup
+    });
 }
 
 /// Guards `KillOnDrop` itself: that a panic between spawning a child and
 /// explicitly `wait`ing on it still gets the child killed *and reaped*,
 /// not just killed. Re-invokes this same test binary, filtered to just
 /// this test under a magic env var, as the long-lived child — a small,
-/// self-contained sleep instead of an external `sleep`/`timeout` binary,
-/// which would need one implementation on Unix and a different one on
-/// Windows.
+/// self-contained park loop instead of an external `sleep`/`timeout`
+/// binary, which would need one implementation on Unix and a different
+/// one on Windows. Parks forever rather than sleeping for a fixed
+/// duration: a Drop that only waits and never kills (mutant M2) would
+/// otherwise pass once the child eventually exited on its own, since
+/// `wait()` would then return successfully — just slowly. Bounded by
+/// `drop_bounded`, so the resulting hang is an observable test failure.
+///
+/// Checked once, immediately after `drop_bounded` returns, not polled:
+/// `KillOnDrop::drop` calls `Child::wait()` synchronously, so a correct
+/// Drop has already fully reaped the child by the time it returns — a
+/// polling window only gives a *broken* Drop (e.g. one that kills and
+/// reaps on a detached thread instead of inline) more time to
+/// accidentally still succeed within it (measured: a zero-duration bound
+/// passed 15/15 against correct code, while a detached-reap-after-50ms
+/// mutant passed inside a 5s polling window).
 ///
 /// Identifies the child by more than its bare pid (or, on Windows, a bare
 /// handle *value*): once a pid is reaped, the kernel is free to hand it to
 /// an unrelated process, and a check keyed on the bare pid alone can't
-/// tell the two apart — it would see "something answers to this pid" and
-/// wrongly call that "not reaped". Linux uses a `pidfd` (a stable
-/// reference to the exact process instance, immune to pid reuse by
-/// construction); macOS combines a liveness check that *does* see a
-/// zombie with a start-time check that doesn't, since neither alone
-/// distinguishes "reaped" from "zombie" (see `macos_confirm_reaped`);
-/// Windows duplicates a handle before the kill, which keeps referring to
-/// the exact same process object even after the original handle (owned by
-/// the `Child` `KillOnDrop` wraps) is closed.
+/// tell the two apart. Linux uses a `pidfd` (a stable reference to the
+/// exact process instance, immune to pid reuse by construction). macOS
+/// uses `waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)`: `ECHILD` means
+/// "pid is not an unreaped child of this process", i.e. reaped — checked
+/// against *our own* child list, not "does some process have this pid"
+/// (what `kill(pid, 0)` or `proc_pidinfo` would answer), which is what
+/// closes the reuse gap even if the OS recycles the pid to an unrelated
+/// process elsewhere on the system. The one remaining gap — another child
+/// of *this same process* taking the freed pid before the check runs — is
+/// closed by convention, not by this function: every `gen_and_run.rs` test
+/// that spawns a child holds `_guard` (the fixture's cross-process
+/// `flock`, which also excludes concurrent threads within this same
+/// process, since each acquisition opens its own file description) before
+/// spawning, so no other child of this process can be spawned while this
+/// test holds it. Windows clones a handle before the kill via
+/// `try_clone_to_owned` (not `DuplicateHandle` directly: the returned
+/// `OwnedHandle` closes itself on drop, including if an assert below
+/// panics first, instead of needing a manual, easy-to-skip `CloseHandle`)
+/// — the clone keeps referring to the exact same process object even
+/// after the original handle (owned by the `Child` `KillOnDrop` wraps) is
+/// closed.
 #[test]
 fn kill_on_drop_reaps_the_child_even_if_the_scope_panics_before_wait() {
     if std::env::var_os("GEN_AND_RUN_KILL_ON_DROP_CHILD").is_some() {
-        // Child mode: stay alive for up to 60s (never reached in a
-        // passing run) unless killed first.
-        std::thread::sleep(std::time::Duration::from_secs(60));
-        return;
+        // Child mode: park forever unless killed first — see this
+        // function's own doc for why not a fixed-duration sleep.
+        loop {
+            std::thread::park();
+        }
     }
 
     let _guard = lock_fixture_workspace();
@@ -297,12 +267,14 @@ fn kill_on_drop_reaps_the_child_even_if_the_scope_panics_before_wait() {
         rustix::process::PidfdFlags::empty(),
     )
     .expect("pidfd_open while child is alive");
-    #[cfg(target_os = "macos")]
-    let original_start = macos_process_start_time(pid).expect("proc_pidinfo while child is alive");
     #[cfg(windows)]
-    let dup_handle = {
-        use std::os::windows::io::AsRawHandle;
-        windows_duplicate_handle(child.0.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE)
+    let cloned_handle: std::os::windows::io::OwnedHandle = {
+        use std::os::windows::io::AsHandle;
+        child
+            .0
+            .as_handle()
+            .try_clone_to_owned()
+            .expect("clone process handle while child is alive")
     };
 
     // Simulate a panic between spawn() and an explicit wait() (e.g. a
@@ -314,7 +286,7 @@ fn kill_on_drop_reaps_the_child_even_if_the_scope_panics_before_wait() {
         panic!("simulated failure between spawn() and wait()");
     }));
     assert!(unwound.is_err(), "the simulated panic must have actually panicked");
-    drop(child); // KillOnDrop's Drop must kill and reap here.
+    drop_bounded(child, std::time::Duration::from_secs(10)); // KillOnDrop's Drop must kill and reap here.
 
     #[cfg(target_os = "linux")]
     {
@@ -326,52 +298,62 @@ fn kill_on_drop_reaps_the_child_even_if_the_scope_panics_before_wait() {
         // zombie is still waitable, and without NOWAIT this call would
         // reap it itself and report ECHILD on the very next call
         // regardless of whether KillOnDrop's own Drop ever ran — measured
-        // directly: dropping NOWAIT here let the very first mutant-vs-
-        // correct-code check pass on the kill-only mutant, because
-        // checking became indistinguishable from correctly reaping.
-        // NOWAIT makes this a non-destructive peek: a zombie keeps
-        // reporting `Ok(Some(_))` on every call instead of being consumed
-        // by the first one.
-        let reaped = poll_until(std::time::Duration::from_secs(5), || {
-            matches!(
-                waitid(
-                    WaitId::PidFd(pidfd.as_fd()),
-                    WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT
-                ),
-                Err(Errno::CHILD)
-            )
-        });
+        // directly: dropping NOWAIT here let the very first version of
+        // this check pass on the kill-only mutant, because checking
+        // became indistinguishable from correctly reaping. NOWAIT makes
+        // this a non-destructive peek: a zombie keeps reporting
+        // `Ok(Some(_))` instead of being consumed by the first call.
+        let reaped = matches!(
+            waitid(
+                WaitId::PidFd(pidfd.as_fd()),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT
+            ),
+            Err(Errno::CHILD)
+        );
         assert!(
             reaped,
-            "pid {pid} must be reaped (waitid(P_PIDFD, WNOHANG) -> ECHILD) within 5s of \
-             KillOnDrop's guard being dropped"
+            "pid {pid} must already be reaped (waitid(P_PIDFD, WNOHANG | WNOWAIT) -> ECHILD) \
+             immediately after KillOnDrop's guard was dropped"
         );
     }
     #[cfg(target_os = "macos")]
     {
-        let reaped = poll_until(std::time::Duration::from_secs(5), || {
-            macos_confirm_reaped(pid, original_start)
-        });
+        use rustix::io::Errno;
+        use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+        let rpid = Pid::from_raw(pid as i32).expect("pid must be nonzero");
+        let reaped = matches!(
+            waitid(
+                WaitId::Pid(rpid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT
+            ),
+            Err(Errno::CHILD)
+        );
         assert!(
             reaped,
-            "pid {pid} must be reaped within 5s of KillOnDrop's guard being dropped — still \
-             signalable via kill(pid, 0) with no differing process identity to explain it \
-             (looks like an unreaped zombie)"
+            "pid {pid} must no longer be an unreaped child of this process (waitid(P_PID, \
+             WNOHANG | WNOWAIT) -> ECHILD) immediately after KillOnDrop's guard was dropped"
         );
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE, WAIT_OBJECT_0};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{STILL_ACTIVE, WAIT_OBJECT_0};
         use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-        // A real, bounded OS wait on the exact process object the
-        // duplicated handle refers to — not a sleep-then-check guess.
-        let wait = unsafe { WaitForSingleObject(dup_handle, 5_000) };
+        let raw = cloned_handle.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        // Zero timeout: an asynchronous TerminateProcess that hasn't
+        // actually finished yet must show up as not-yet-signaled right
+        // now, not eventually — a positive timeout here would let a
+        // kill-only mutant's async termination complete somewhere inside
+        // the wait window and pass anyway.
+        let wait = unsafe { WaitForSingleObject(raw, 0) };
         assert_eq!(
             wait, WAIT_OBJECT_0,
-            "process must exit within 5s of KillOnDrop's guard being dropped"
+            "process must already be signaled (exited) immediately after KillOnDrop's guard was \
+             dropped — Child::wait() inside Drop is synchronous, so a correct Drop leaves \
+             nothing left to wait for here"
         );
         let mut exit_code = 0u32;
-        let ok = unsafe { GetExitCodeProcess(dup_handle, &mut exit_code) };
+        let ok = unsafe { GetExitCodeProcess(raw, &mut exit_code) };
         assert_ne!(
             ok,
             0,
@@ -382,7 +364,8 @@ fn kill_on_drop_reaps_the_child_even_if_the_scope_panics_before_wait() {
             exit_code, STILL_ACTIVE as u32,
             "process must not report STILL_ACTIVE once WaitForSingleObject signaled it exited"
         );
-        unsafe { CloseHandle(dup_handle) };
+        // cloned_handle drops here (RAII), closing the handle even if an
+        // assert above panicked first.
     }
 }
 

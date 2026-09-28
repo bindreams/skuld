@@ -192,6 +192,32 @@ pub(crate) fn try_lock_exclusive(file: &File) -> Result<(), std::fs::TryLockErro
     file.try_lock()
 }
 
+/// Used only by `test_support_tests.rs` to prove `lock_fixture_workspace`
+/// actually takes an *exclusive* lock, not merely a shared one: a shared
+/// lock would still exclude a second `try_lock_exclusive` probe (any lock,
+/// shared or exclusive, blocks a new exclusive one), so that probe alone
+/// can't tell the two apart. A second *shared* probe can: it only observes
+/// `WouldBlock` if the first lock was exclusive.
+#[cfg(unix)]
+pub(crate) fn try_lock_shared(file: &File) -> Result<(), std::fs::TryLockError> {
+    match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockShared) {
+        Ok(()) => Ok(()),
+        Err(errno) => {
+            let err: std::io::Error = errno.into();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                Err(std::fs::TryLockError::WouldBlock)
+            } else {
+                Err(std::fs::TryLockError::Error(err))
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn try_lock_shared(file: &File) -> Result<(), std::fs::TryLockError> {
+    file.try_lock_shared()
+}
+
 /// A held exclusive lock on the fixture workspace's target directory, plus
 /// the two paths that were resolved to acquire it. This module deliberately
 /// exposes no free-standing `fixture_root()`/`fixture_target_dir()`

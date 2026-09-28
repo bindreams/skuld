@@ -225,7 +225,6 @@ dependencies = [
  "blake3",
  "cargo-util",
  "clap",
- "libc",
  "petgraph",
  "rustix",
  "serde",
