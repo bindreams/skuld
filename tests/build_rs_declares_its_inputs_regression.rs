@@ -17,12 +17,11 @@
 //! no prior record yet to know it can skip it, and the fixture's own
 //! target directory is cold on every CI run. What actually stops CI's
 //! specific failure is `cargo-skuld/tests/fixtures/test-workspace/
-//! .gitignore`'s `/target*` (see `cargo-skuld/src/test_support.rs`'s
-//! doc), which keeps the scan from ever stepping into the directory in
-//! question regardless of warm or cold. This test guards `build.rs`'s
-//! contribution on its own terms — cutting scan frequency down to one per
-//! target directory instead of one per build — not a claim that it alone
-//! would have stopped CI's failure.
+//! .gitignore`'s `/target*`, which keeps the scan from ever stepping into
+//! the directory in question regardless of warm or cold. This test guards
+//! `build.rs`'s contribution on its own terms — cutting scan frequency
+//! down to one per target directory instead of one per build — not a
+//! claim that it alone would have stopped CI's failure.
 //!
 //! Behavioral, not a source-text check: a commented-out directive still
 //! contains the literal string `cargo:rerun-if-changed=build.rs`, so
