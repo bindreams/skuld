@@ -925,25 +925,33 @@ impl RendezvousPoint {
     /// Block until every participant in this rendezvous has called `wait`,
     /// or panic as soon as any one of them is detected to have died first
     /// (its own `RendezvousPoint` dropped without ever calling `wait`) —
-    /// never hangs waiting on a straggler the way `Barrier::wait` would.
+    /// never hangs waiting on a straggler *that has died* the way
+    /// `Barrier::wait` would. A participant that's merely alive but stuck
+    /// somewhere else (never reaching `wait` at all, without dying either)
+    /// is not distinguishable from "hasn't arrived yet" and still hangs
+    /// every other participant, same as `Barrier` — this only fixes the
+    /// death case.
     fn wait(self) {
         self.ready_tx
             .send(())
-            .expect("rendezvous coordinator thread must still be running to receive this");
+            .expect("rendezvous aborted: a fellow participant died");
         self.go_rx
             .recv()
-            .expect("a fellow rendezvous participant died before the rendezvous completed");
+            .expect("rendezvous aborted: a fellow participant died");
     }
 }
 
-/// Set up an `n`-participant rendezvous inside `scope`, returning one
-/// [`RendezvousPoint`] per participant (hand each to exactly one thread).
-/// Spawns a coordinator thread (inside `scope`, so `thread::scope` still
-/// waits for it) that releases every participant together once all `n` have
-/// called `wait`, or releases no one — leaving every waiting participant's
-/// `go_rx.recv()` to fail once this coordinator's own channel handles drop —
-/// the moment any one participant's `ready_tx` is dropped without sending
-/// (i.e. that participant's thread ended, panic or not, before `wait`).
+/// Set up an `n`-participant rendezvous, returning one [`RendezvousPoint`]
+/// per participant (hand each to exactly one thread) and a [`JoinHandle`]
+/// for its coordinator thread — callers must join it themselves (inside or
+/// outside whatever scope hands out the points; the coordinator has no
+/// borrows tying it to one) so a coordinator-side panic is never silently
+/// dropped. The coordinator releases every participant together once all
+/// `n` have called `wait`, or releases no one — leaving every waiting
+/// participant's `go_rx.recv()` to fail once this coordinator's own channel
+/// handles drop — the moment any one participant's `ready_tx` is dropped
+/// without sending (i.e. that participant's thread ended, panic or not,
+/// before `wait`).
 ///
 /// Two independent one-shot channels per participant (`ready`/`go`), not one
 /// `Sender` cloned `n` ways: a clone-based design can't tell "one specific
@@ -953,11 +961,11 @@ impl RendezvousPoint {
 /// pair per participant means that participant's own `ready_rx` closing
 /// (immediately, on `channel()`'s sole `Sender` being dropped) is
 /// unambiguous, specific evidence of that one participant's absence.
-fn rendezvous<'scope>(scope: &'scope std::thread::Scope<'scope, '_>, n: usize) -> Vec<RendezvousPoint> {
+fn rendezvous(n: usize) -> (Vec<RendezvousPoint>, std::thread::JoinHandle<()>) {
     let (ready_txs, ready_rxs): (Vec<_>, Vec<_>) = (0..n).map(|_| std::sync::mpsc::channel::<()>()).unzip();
     let (go_txs, go_rxs): (Vec<_>, Vec<_>) = (0..n).map(|_| std::sync::mpsc::channel::<()>()).unzip();
 
-    scope.spawn(move || {
+    let coordinator = std::thread::spawn(move || {
         for rx in &ready_rxs {
             if rx.recv().is_err() {
                 // A participant's ready_tx was dropped without sending:
@@ -974,48 +982,68 @@ fn rendezvous<'scope>(scope: &'scope std::thread::Scope<'scope, '_>, n: usize) -
         }
     });
 
-    ready_txs
+    let points = ready_txs
         .into_iter()
         .zip(go_rxs)
         .map(|(ready_tx, go_rx)| RendezvousPoint { ready_tx, go_rx })
-        .collect()
+        .collect();
+    (points, coordinator)
 }
 
 /// TDD red/green for [`rendezvous`] itself: a "mutant" participant panics
 /// before ever calling `wait`. On the old `Barrier`-based design this is
 /// exactly the scenario that hangs forever (nothing in this test suite ever
-/// exercised it for that reason). With `rendezvous`, the survivors' `wait`
-/// calls must fail — and therefore panic — promptly instead, so
-/// `thread::scope` returns (propagating a panic) rather than hanging.
+/// exercised it for that reason) — and a `Barrier`-backed `rendezvous`
+/// mutant would make *this test itself* hang too, since spawning survivor
+/// threads that block on a real `Barrier::wait()` inside `thread::scope`
+/// never returns. So this never spawns survivor threads at all: the
+/// coordinator's own `JoinHandle` is the only thing this test blocks on,
+/// and every survivor's `wait()` is called synchronously, one at a time,
+/// only after that join proves the coordinator has already made its
+/// (uncapped, but here always-terminating-once-the-mutant-dies) decision.
+///
+/// The mutant's `RendezvousPoint` is moved bodily into its own spawned
+/// thread (`let _p = mutant_point;`), not just held in this function's own
+/// stack frame: that's what makes its drop — and the coordinator's
+/// detection of it — a genuine consequence of a panicking thread's unwind,
+/// the real mechanism under test, rather than an ordinary drop this test
+/// would trigger on its own regardless of whether panics correctly unwind
+/// through spawned threads at all.
 #[test]
 fn rendezvous_fails_fast_instead_of_hanging_when_a_participant_panics_before_it() {
     const THREADS: usize = 4;
 
-    let result = std::panic::catch_unwind(|| {
-        std::thread::scope(|s| {
-            let mut points = rendezvous(s, THREADS).into_iter();
+    let (points, coordinator) = rendezvous(THREADS);
+    let mut points = points.into_iter();
 
-            // The mutant: never calls wait() at all, panics immediately.
-            // Its RendezvousPoint drops (ready_tx included) as the thread
-            // unwinds.
-            let _mutant_point = points.next().unwrap();
-            s.spawn(move || {
-                panic!("mutant: panicking before the rendezvous");
-            });
-
-            // Survivors: must fail — not hang — once the mutant is gone.
-            for point in points {
-                s.spawn(move || {
-                    point.wait();
-                });
-            }
-        });
+    let mutant_point = points.next().unwrap();
+    let mutant = std::thread::spawn(move || {
+        let _p = mutant_point;
+        panic!("mutant: panicking before the rendezvous");
     });
+    // The mutant's own panic isn't itself the thing under test — only that
+    // its point dropped as a result of it. Swallow it here.
+    let _ = mutant.join();
 
-    assert!(
-        result.is_err(),
-        "thread::scope must return (propagating a panic), not hang, when a participant dies \
-         before reaching the rendezvous"
+    // The coordinator must have detected the mutant's absence and returned
+    // cleanly (not itself panicked) without releasing anyone.
+    coordinator
+        .join()
+        .expect("rendezvous coordinator thread must not itself panic");
+
+    // Every survivor's wait() must now fail — synchronously, no thread, no
+    // possibility of hanging — since the coordinator already gave up.
+    let mut failures = 0usize;
+    for point in points {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| point.wait())).is_err() {
+            failures += 1;
+        }
+    }
+    assert_eq!(
+        failures,
+        THREADS - 1,
+        "every survivor's wait() must fail once a fellow participant dies before the \
+         rendezvous, not just some of them"
     );
 }
 
@@ -1027,9 +1055,9 @@ fn global_serial_prevents_concurrent_execution() {
     let (_dir, path) = temp_db();
 
     let running = AtomicU32::new(0);
+    let (points, coordinator) = rendezvous(THREADS);
 
     std::thread::scope(|s| {
-        let points = rendezvous(s, THREADS);
         for point in points {
             s.spawn(|| {
                 point.wait();
@@ -1041,6 +1069,10 @@ fn global_serial_prevents_concurrent_execution() {
             });
         }
     });
+
+    coordinator
+        .join()
+        .expect("rendezvous coordinator thread must not panic");
 }
 
 #[test]
@@ -1052,17 +1084,20 @@ fn non_serial_allows_concurrent_execution() {
     // Two rendezvous points: the first races every thread into coordinate()
     // together (stressing lock contention); the second holds every thread
     // past fetch_add before any exits, so peak == THREADS on success
-    // regardless of per-thread coordinate() latency. Unlike the `Barrier`
-    // pair this replaced, a regression that hangs a participant (in
-    // `coordinate()` itself, or in this test's own bookkeeping) now fails
-    // the test directly instead of relying on the CI job's own timeout to
-    // notice.
+    // regardless of per-thread coordinate() latency. `rendezvous` only
+    // protects against a participant *dying* before reaching it, not one
+    // that's simply alive but stuck — a live-but-blocked participant (e.g.
+    // a genuine deadlock regression inside `coordinate()` itself) still
+    // hangs every other participant here, same as the `Barrier` pair this
+    // replaced would have; see `non_serial_registrations_do_not_block_can_start_for_another_non_serial_test`
+    // below for a non-blocking counterpart that can't hang at all, for
+    // exactly that reason.
     let peak = AtomicU32::new(0);
     let running = AtomicU32::new(0);
+    let (entry_points, entry_coordinator) = rendezvous(THREADS);
+    let (observation_points, observation_coordinator) = rendezvous(THREADS);
 
     std::thread::scope(|s| {
-        let entry_points = rendezvous(s, THREADS);
-        let observation_points = rendezvous(s, THREADS);
         for (entry, observation) in entry_points.into_iter().zip(observation_points) {
             s.spawn(|| {
                 entry.wait();
@@ -1075,11 +1110,43 @@ fn non_serial_allows_concurrent_execution() {
         }
     });
 
+    entry_coordinator
+        .join()
+        .expect("entry rendezvous coordinator thread must not panic");
+    observation_coordinator
+        .join()
+        .expect("observation rendezvous coordinator thread must not panic");
+
     debug_assert!(peak.load(SeqCst) <= THREADS as u32);
     assert_eq!(
         peak.load(SeqCst) as usize,
         THREADS,
         "non-serial tests should run concurrently",
+    );
+}
+
+/// Non-blocking counterpart to `non_serial_allows_concurrent_execution`,
+/// for the same underlying regression ("non-serial tests wrongly
+/// serialized") but immune to the hang that test's own comment now admits
+/// it can't rule out: no threads at all here, just `can_start`'s own policy
+/// logic, checked directly against `THREADS - 1` already-registered
+/// non-serial rows. If a regression made non-serial registrations block
+/// each other, this fails immediately — it cannot hang, since nothing here
+/// ever waits on anything.
+#[test]
+fn non_serial_registrations_do_not_block_can_start_for_another_non_serial_test() {
+    const THREADS: usize = 8;
+    let (_dir, path) = temp_db();
+    let conn = open_db(&path);
+
+    for i in 0..THREADS - 1 {
+        register(&conn, &format!("parallel_test_{i}"), &[], SERIAL_NONE).unwrap();
+    }
+
+    assert!(
+        can_start(&conn, &[], SERIAL_NONE).unwrap(),
+        "{} live non-serial registrations must not block another non-serial test from starting",
+        THREADS - 1
     );
 }
 
@@ -1712,8 +1779,8 @@ fn connect_survives_many_threads_racing_the_same_absent_path() {
 
     for _ in 0..ROUNDS {
         let (_dir, path) = temp_db();
+        let (points, coordinator) = rendezvous(THREADS);
         std::thread::scope(|s| {
-            let points = rendezvous(s, THREADS);
             for point in points {
                 s.spawn(|| {
                     point.wait();
@@ -1729,6 +1796,9 @@ fn connect_survives_many_threads_racing_the_same_absent_path() {
                 });
             }
         });
+        coordinator
+            .join()
+            .expect("rendezvous coordinator thread must not panic");
     }
 }
 
