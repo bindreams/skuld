@@ -155,26 +155,48 @@ All notable changes to this project are documented in this file.
     `.skuld.db` publish step entirely (there's no uid-mixing hazard to
     guard against there) but takes the same init lock as every other
     platform, since `open_db`'s WAL negotiation race is cross-platform.
-  - Acquiring the lock is always a single open-then-lock with no retry and
-    no check that the locked handle still matches what's on disk. On Unix,
-    the lock is a directory `flock` taken directly on `.skuld.db`'s parent
-    directory, opened on a read-only fd (which still needs ordinary read
-    permission on the directory, not only search/execute), rather than a
-    separate lock file: an ordinary delete of `.skuld.db` itself can't split
-    the lock, since a non-empty directory can't be `rmdir`'d and nothing in
-    this crate ever removes the directory itself, only files inside it —
-    but wholesale replacement of the directory (rename-and-recreate, or
-    empty-rmdir-recreate) still can, the same accepted risk as deleting
-    `.skuld.db` itself mid-run. Some network filesystems refuse to `flock` a
-    directory at all — NFS's emulated `flock` among them — and skuld panics
-    loudly, naming the path, rather than falling back to a weaker lock. On
-    Windows, the lock is a sibling `.skuld.db.lock` file opened with
-    `FILE_SHARE_READ | FILE_SHARE_WRITE` and no `FILE_SHARE_DELETE`, so
-    Windows itself refuses to delete or rename it while any handle holds
-    it — that guarantee has no gap on Windows. A failure to open the lock
-    target on either platform — a missing parent directory,
-    file-descriptor exhaustion, or anything else — panics immediately,
-    naming the path, rather than retrying.
+  - Acquiring the lock is always a single open-then-lock with no retry. On
+    Unix, the lock is a directory `flock` taken directly on `.skuld.db`'s
+    parent directory, opened on a read-only fd (which still needs ordinary
+    read permission on the directory, not only search/execute), rather than
+    a separate lock file: an ordinary delete of `.skuld.db` itself can't
+    split the lock, since a non-empty directory can't be `rmdir`'d and
+    nothing in this crate ever removes the directory itself, only files
+    inside it — but wholesale replacement of the directory
+    (rename-and-recreate, or empty-rmdir-recreate) still can. Skuld now
+    detects that too: the held lock's own `fstat` identity, recorded at
+    acquisition, is checked against a fresh `stat` of the same path before
+    every schema-init write, so a directory replaced wholesale while the
+    lock is held panics loudly instead of silently losing mutual exclusion
+    (see the next entry below for the matching detection on the DB file
+    itself). Some network filesystems refuse to `flock` a directory at all
+    — NFS's emulated `flock` among them — and skuld panics loudly, naming
+    the path, rather than falling back to a weaker lock. On Windows, the
+    lock is a sibling `.skuld.db.lock` file opened with `FILE_SHARE_READ |
+FILE_SHARE_WRITE` and no `FILE_SHARE_DELETE`, so Windows itself refuses
+    to delete or rename it while any handle holds it — that guarantee has
+    no gap on Windows. A failure to open the lock target on either platform
+    — a missing parent directory, file-descriptor exhaustion, or anything
+    else — panics immediately, naming the path, rather than retrying.
+- **A `.skuld.db` deleted, renamed, or replaced while a test run is using
+  it now fails loudly instead of silently corrupting whatever now exists
+  at that path (or, on a connection that never wrote again, doing
+  nothing).** Every write through a connection `coordinate()` or its
+  cleanup on drop has held open across more than one operation — including
+  `open_db`'s own schema initialization and migration — checks the
+  connection's file identity immediately beforehand (on Unix,
+  `SQLITE_FCNTL_HAS_MOVED` plus an independent device+inode comparison
+  against the identity recorded at open, which also catches a symlink
+  _ancestor_ of the path being retargeted mid-run; on Windows, the VFS
+  already refuses to let any other handle delete or rename a file this
+  crate has open, so there's nothing to detect there) and panics, naming
+  the path, rather than writing through a connection whose file has moved
+  out from under it. The check runs inside every retry loop, before each
+  attempt, not just once beforehand, so a move landing mid-retry under
+  contention is still caught. What this cannot detect, by design: content
+  overwritten _in place_ at the same path (same device, same inode) —
+  that's indistinguishable from this crate's own ordinary writes without
+  fingerprinting content, which nothing here attempts.
   - Only creation needs mode and no-replace-rename support: `ensure_published`
     checks for an existing `.skuld.db` first (`lstat`, so a dangling symlink
     counts as "already there" too, matching the rename's own `EEXIST`
