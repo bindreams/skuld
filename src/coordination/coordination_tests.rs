@@ -1725,14 +1725,10 @@ fn registration_drop_fails_loudly_when_a_parent_symlink_is_retargeted_mid_run_wi
     std::fs::remove_dir(&link).unwrap();
     std::os::windows::fs::symlink_dir(&real2, &link).unwrap();
 
-    let b = coordinate(&path, "b", &[], SERIAL_ALL);
-
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(a)));
     assert!(
         result.is_err(),
         "drop(a) must panic: its connection's file is reachable only through the OLD symlink \
          target, which `path` no longer names now that the symlink was retargeted"
     );
-
-    drop(b);
 }
