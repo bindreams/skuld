@@ -42,13 +42,12 @@ cargo-util = "0.2"
 # implemented on every Unix target std itself lists as flock-capable (see
 # the root Cargo.toml's own comment on this) — rustix::fs::flock instead,
 # on every Unix. Already pulled in transitively via tempfile; this only
-# promotes it to a direct dependency. Test-only for the same reason as
-# cargo-util above.
-rustix = { version = "1", features = ["fs"] }
-# gen_and_run.rs's KillOnDrop regression test: kill(pid, 0) distinguishes
-# a killed-and-reaped child (ESRCH) from a killed-but-zombie one (still
-# signalable), which std alone has no portable way to observe.
-libc = "0.2"
+# promotes it to a direct dependency. `process` (for `pidfd_open`/
+# `waitid`) is used by gen_and_run.rs's `KillOnDrop` regression test on
+# Linux, to identify its spawned child by a kernel-refcounted pidfd
+# instead of a bare pid a reaped process's pid could be recycled to.
+# Test-only for the same reason as cargo-util above.
+rustix = { version = "1", features = ["fs", "process"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # test_support_tests.rs reads the Time Machine exclusion xattr directly
@@ -57,3 +56,17 @@ libc = "0.2"
 # regardless of whether cargo-util's own exclusion code ran — measured
 # directly) to prove ensure_target_dir's marking actually happened.
 xattr = "1"
+# gen_and_run.rs's KillOnDrop regression test: kill(pid, 0) and
+# proc_pidinfo(PROC_PIDTBSDINFO), combined, distinguish a killed-and-reaped
+# child from a killed-but-zombie one — neither alone does (measured
+# directly: proc_pidinfo returns ESRCH for an unreaped zombie exactly like
+# it does for a fully reaped pid, even though `ps` still shows the zombie).
+libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+# gen_and_run.rs's KillOnDrop regression test: a duplicated process handle
+# (obtained before the child is killed) keeps referring to the exact same
+# process object even after the original handle, owned by the Child
+# KillOnDrop wraps, is closed — immune to a handle *value* being reused
+# for something unrelated the way a bare pid could be.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
