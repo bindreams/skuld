@@ -128,10 +128,11 @@ fn gen_on_a_workspace_with_no_skuld_binaries_is_a_harmless_noop() {
 /// index of `name`'s `start`/`end` lines. The file's own append order — not
 /// any timestamp — is the ordering: `SystemTime::now()` is wall-clock and
 /// can step backward (e.g. an NTP adjustment), which would silently corrupt
-/// a timestamp-based overlap comparison. A single `write_all` per line under
-/// `O_APPEND` is atomic at or under `PIPE_BUF` on POSIX, so the two
-/// processes' lines can't interleave into a corrupt line, and the file's
-/// byte order is a real happens-before relation between them.
+/// a timestamp-based overlap comparison. A single, un-retried `write()` per
+/// line under `O_APPEND` (Unix) / `FILE_APPEND_DATA` (Windows) — see
+/// crate-a's `append_order_log` for the full contract — is what makes the
+/// two processes' lines unable to interleave into a corrupt line, so the
+/// file's byte order is a real happens-before relation between them.
 fn read_window(dir: &Path, name: &str) -> (usize, usize) {
     let log = std::fs::read_to_string(dir.join("order.log")).expect("read shared order log");
     let start = log
