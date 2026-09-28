@@ -329,6 +329,249 @@ fn registration_drop_fails_loudly_instead_of_corrupting_when_only_the_main_file_
     );
 }
 
+/// Finding 1 (round-5 review): the moved-DB check used to run once, before
+/// `retry_busy`'s loop, not inside it — so a `.skuld.db` deleted while
+/// `Drop`'s `DELETE` was mid-retry (busy-waiting on a foreign connection's
+/// held lock) went undetected: the check had already passed before the
+/// move happened, and nothing re-checked once contention cleared and the
+/// retried `DELETE` finally ran.
+///
+/// **RED, before this fix:** `drop(a)` below succeeded silently even
+/// though `.skuld.db` was deleted while it was blocked retrying past a
+/// foreign `BEGIN EXCLUSIVE`. **GREEN, now:** the check runs inside the
+/// retried closure, before every attempt, so it catches the move the very
+/// next time `retry_busy` calls back into it.
+#[cfg(unix)]
+#[test]
+fn registration_drop_fails_loudly_when_the_db_moves_mid_retry() {
+    let (_dir, path) = temp_db();
+    let a = coordinate(&path, "a", &[], SERIAL_NONE);
+
+    // Force `drop(a)`'s DELETE into `retry_busy`'s loop: hold an exclusive
+    // transaction open on a second, foreign connection first.
+    let foreign_conn = open_db(&path);
+    foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        set_test_retry_hook(tx);
+        drop(a);
+    });
+    // Wait until the dropper has genuinely entered retry_busy's loop at
+    // least once — an actual signal from the retry site itself, not a
+    // fixed sleep standing in for one.
+    rx.recv()
+        .expect("dropper never retried — test setup is broken, not the fix");
+
+    // Move the DB out from under the dropper while it's still blocked
+    // retrying, then release the foreign lock so the retry can proceed.
+    std::fs::remove_file(&path).unwrap();
+    foreign_conn.execute_batch("COMMIT").unwrap();
+    drop(foreign_conn);
+
+    let result = dropper.join();
+    assert!(
+        result.is_err(),
+        "drop(a) must panic once its retried DELETE discovers the DB moved mid-retry, not \
+         succeed silently because the check only ran once before the retry loop started"
+    );
+}
+
+/// Finding 2 (round-5 review): `open_db`'s own schema-init write
+/// (`ensure_schema_locked`'s `retry_busy(conn, || conn.execute_batch(INIT_SQL))`)
+/// had no moved-DB check at all — a `.skuld.db` deleted while this write
+/// was mid-retry went completely unguarded, silently writing `INIT_SQL`
+/// through a connection whose file identity had already changed
+/// underneath it.
+///
+/// **RED, before this fix:** `open_db` below returned successfully even
+/// though `.skuld.db` was deleted while its schema-init write was
+/// mid-retry. **GREEN, now:** the check inside `retry_busy`'s closure
+/// catches it on the next attempt.
+#[cfg(unix)]
+#[test]
+fn open_db_schema_init_fails_loudly_when_the_db_moves_mid_retry() {
+    let (_dir, path) = temp_db();
+
+    // A foreign connection creates the file and holds an exclusive write
+    // lock via WAL mode before skuld's own schema even exists at `path`,
+    // forcing `open_db`'s own INIT_SQL write into `retry_busy`'s loop.
+    let foreign_conn = rusqlite::Connection::open(&path).unwrap();
+    foreign_conn
+        .execute_batch("PRAGMA journal_mode=WAL; BEGIN EXCLUSIVE")
+        .unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path2 = path.clone();
+    let opener = std::thread::spawn(move || {
+        set_test_retry_hook(tx);
+        open_db(&path2);
+    });
+    rx.recv()
+        .expect("open_db never retried — test setup is broken, not the fix");
+
+    std::fs::remove_file(&path).unwrap();
+    foreign_conn.execute_batch("COMMIT").unwrap();
+    drop(foreign_conn);
+
+    let result = opener.join();
+    assert!(
+        result.is_err(),
+        "open_db's schema-init write must panic once it discovers the DB moved mid-retry, not \
+         return a connection that silently wrote INIT_SQL through a stale file identity"
+    );
+}
+
+/// Finding 4a's corollary (round-5 review): the init lock itself can split
+/// the same way a DB file can "move" — wholesale replacement of the
+/// profile directory (rename aside, `mkdir` fresh) while the lock is held
+/// leaves the holder locking the old, now-detached directory while a fresh
+/// opener locks the new one, defeating the mutual exclusion `open_db`'s own
+/// schema-init write depends on. `InitLockHeld::target_has_split` catches
+/// it the same way `FileIdentity` catches a moved DB file: an `fstat`
+/// recorded at acquisition, compared against a fresh `stat` of the same
+/// path on every check.
+///
+/// **RED, before this fix:** `open_db` below returned successfully even
+/// though its own profile directory was replaced wholesale while its
+/// schema-init write was mid-retry. **GREEN, now:** the check inside
+/// `retry_busy`'s closure catches it.
+#[cfg(unix)]
+#[test]
+fn open_db_fails_loudly_when_the_profile_directory_is_replaced_wholesale_mid_retry() {
+    let outer = tempfile::tempdir().unwrap();
+    let profile = outer.path().join("profile");
+    std::fs::create_dir(&profile).unwrap();
+    let path = profile.join("test-coordination.db");
+
+    let foreign_conn = rusqlite::Connection::open(&path).unwrap();
+    foreign_conn
+        .execute_batch("PRAGMA journal_mode=WAL; BEGIN EXCLUSIVE")
+        .unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path2 = path.clone();
+    let opener = std::thread::spawn(move || {
+        set_test_retry_hook(tx);
+        open_db(&path2);
+    });
+    rx.recv()
+        .expect("open_db never retried — test setup is broken, not the fix");
+
+    // Replace the profile directory wholesale — rename aside, `mkdir` a
+    // fresh one at the same path — while `opener`'s init lock is held and
+    // its schema-init write is stuck retrying.
+    let aside = outer.path().join("profile-aside");
+    std::fs::rename(&profile, &aside).unwrap();
+    std::fs::create_dir(&profile).unwrap();
+
+    foreign_conn.execute_batch("COMMIT").unwrap();
+    drop(foreign_conn);
+
+    let result = opener.join();
+    assert!(
+        result.is_err(),
+        "open_db must panic once it discovers its own init lock's directory was replaced \
+         wholesale mid-retry, not silently keep writing under a lock that no longer excludes \
+         anyone"
+    );
+}
+
+/// Finding 4a (round-5 review): `SQLITE_FCNTL_HAS_MOVED` alone doesn't
+/// reliably catch a symlink *ancestor* of `path` being retargeted mid-run —
+/// see `db_has_moved`'s doc for why. `FileIdentity`'s own independent
+/// dev+ino check closes this: it always re-resolves the caller's own
+/// `path` fresh, following whatever a symlink in it currently points to
+/// right now, rather than relying solely on what SQLite itself tracks
+/// internally.
+///
+/// **RED, before this fix:** `drop(a)` below succeeded silently even
+/// though `a`'s connection was opened through a symlink retargeted to a
+/// completely different directory before the drop ran. **GREEN, now:** the
+/// independent `FileIdentity` comparison catches it.
+#[cfg(unix)]
+#[test]
+fn registration_drop_fails_loudly_when_a_parent_symlink_is_retargeted_mid_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let real1 = dir.path().join("real1");
+    let real2 = dir.path().join("real2");
+    std::fs::create_dir(&real1).unwrap();
+    std::fs::create_dir(&real2).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real1, &link).unwrap();
+    let path = link.join(".skuld.db");
+
+    let a = coordinate(&path, "a", &[], SERIAL_ALL);
+
+    // Retarget atomically — a fresh symlink renamed over the old one, not
+    // an edit of the existing one — the same shape a real swap to a
+    // different profile directory mid-run would take.
+    let tmp = dir.path().join("link.tmp");
+    std::os::unix::fs::symlink(&real2, &tmp).unwrap();
+    std::fs::rename(&tmp, &link).unwrap();
+
+    // `b` registers through the now-retargeted symlink — a completely
+    // different, independent database from `a`'s perspective — and must
+    // not block waiting on `a`'s (unrelated) global-serial slot.
+    let b = coordinate(&path, "b", &[], SERIAL_ALL);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(a)));
+    assert!(
+        result.is_err(),
+        "drop(a) must panic: its connection's file is reachable only through the OLD symlink \
+         target, which `path` no longer names now that the symlink was retargeted"
+    );
+
+    drop(b);
+}
+
+/// Finding 4b (round-5 review): a write against a connection whose
+/// `-wal`/`-shm` companion vanished out from under it (main file identity
+/// untouched, so `db_has_moved` has nothing to catch) tends to surface as
+/// SQLite's broad, opaque `SQLITE_IOERR` family rather than anything
+/// naming "moved" — `moved_db_message_for` remaps that specific shape to
+/// the same clear message. Exercised directly against a synthetic error
+/// rather than a live filesystem race: forcing a real `-wal` deletion to
+/// actually produce `SQLITE_IOERR` (rather than SQLite silently
+/// recreating a fresh WAL, which is what several filesystems do) is
+/// inherently filesystem- and timing-dependent, exactly the kind of
+/// non-determinism a regression test must not carry — the classification
+/// itself is what this crate controls and is what's worth testing
+/// directly.
+#[test]
+fn moved_db_message_maps_a_system_io_failure_to_the_clear_moved_message() {
+    let io_err = rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::SystemIoFailure,
+            extended_code: rusqlite::ffi::SQLITE_IOERR_SHORT_READ,
+        },
+        Some("disk I/O error".to_string()),
+    );
+    let msg = super::moved_db_message_for(&io_err, std::path::Path::new("/tmp/.skuld.db"));
+    assert!(
+        msg.is_some_and(|m| m.contains("deleted or replaced mid-run") && m.contains(".skuld.db")),
+        "an I/O-failure-class error must map to the same clear moved-DB message, naming the path"
+    );
+}
+
+/// The flip side of the test above: `moved_db_message_for` must stay
+/// narrow — only the I/O-failure shape, not a blanket reinterpretation of
+/// every SQLite error as "moved."
+#[test]
+fn moved_db_message_does_not_reclassify_unrelated_errors() {
+    let busy_err = rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::DatabaseBusy,
+            extended_code: rusqlite::ffi::SQLITE_BUSY,
+        },
+        None,
+    );
+    assert!(
+        super::moved_db_message_for(&busy_err, std::path::Path::new("/tmp/.skuld.db")).is_none(),
+        "moved_db_message_for must be narrow — only the I/O-failure shape, not every SQLite error"
+    );
+}
+
 /// `db_has_moved` skips the `SQLITE_FCNTL_HAS_MOVED` file-control on
 /// Windows entirely (SQLite's `winFileControl` has no case for it — it
 /// always answers `SQLITE_NOTFOUND`, confirmed against the `bundled`
@@ -345,17 +588,29 @@ fn windows_open_db_file_blocks_delete_and_rename_while_held() {
     let (_dir, path) = temp_db();
     let a = coordinate(&path, "a", &[], SERIAL_NONE);
 
-    assert!(
-        std::fs::remove_file(&path).is_err(),
+    // Specifically `ERROR_SHARING_VIOLATION` (32) — not just any error — so
+    // this test can't quietly start passing for an unrelated reason (a
+    // missing/inaccessible path, say) while the actual invariant under
+    // test silently stops holding.
+    let remove_err = std::fs::remove_file(&path).expect_err(
         "a registration's connection is still open on this file; Windows must refuse to delete \
-         it out from under that connection"
+         it out from under that connection",
+    );
+    assert_eq!(
+        remove_err.raw_os_error(),
+        Some(32),
+        "expected ERROR_SHARING_VIOLATION specifically, not just any failure: {remove_err}"
     );
 
     let renamed = path.with_file_name("renamed.skuld.db");
-    assert!(
-        std::fs::rename(&path, &renamed).is_err(),
+    let rename_err = std::fs::rename(&path, &renamed).expect_err(
         "a registration's connection is still open on this file; Windows must refuse to rename \
-         it out from under that connection"
+         it out from under that connection",
+    );
+    assert_eq!(
+        rename_err.raw_os_error(),
+        Some(32),
+        "expected ERROR_SHARING_VIOLATION specifically, not just any failure: {rename_err}"
     );
 
     drop(a);

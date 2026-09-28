@@ -28,13 +28,15 @@
 //!
 //! **The lock target can't be deleted or replaced by anything short of
 //! recreating the directory (Unix) or the file (Windows) it lives at.** That
-//! is what lets [`with_init_lock`] be a single open-then-lock with no retry
-//! loop and no check that the locked handle still matches whatever is on
-//! disk: an open that succeeds is already the lock every other caller will
-//! contend, permanently, for as long as this handle stays open — *unless*
-//! something outside this crate replaces the lock target's directory entry
-//! wholesale while that handle is open (see the Unix bullet below); this
-//! crate itself never does that.
+//! is what lets [`with_init_lock`]'s own acquisition be a single
+//! open-then-lock with no retry loop: an open that succeeds is already the
+//! lock every other caller will contend, permanently, for as long as this
+//! handle stays open — *unless* something outside this crate replaces the
+//! lock target's directory entry wholesale while that handle is open (see
+//! the Unix bullet below), which does still need checking for, and does get
+//! checked — see [`InitLockHeld::target_has_split`] — everywhere a caller
+//! goes on to do uncapped-retry writes while holding this lock, not at
+//! acquisition alone.
 //!
 //! - **Unix** locks `db_path`'s parent directory — the profile directory
 //!   holding `.skuld.db` — opened `O_RDONLY | O_DIRECTORY | O_CLOEXEC` (the
@@ -52,14 +54,17 @@
 //!   `ENOTEMPTY` still blocks a plain `rmdir` while any of them remain, and
 //!   nothing in this crate ever removes the directory itself, only files
 //!   inside it. **Wholesale replacement of the directory does still split
-//!   it**, the same accepted risk class as deleting `.skuld.db` itself
-//!   mid-run (see [`super::connect`]'s doc): renaming the directory aside
-//!   and `mkdir`ing a fresh one at the same path, or emptying it,
-//!   `rmdir`ing it, and `mkdir`ing it again, both leave the holder locking
-//!   its old (now-detached) directory while every new opener locks the
-//!   fresh one instead — this module verifies nothing about what's still at
-//!   the path beyond a successful open, so nothing here would notice the
-//!   swap to tell the two groups apart.
+//!   it** — the same "path now means something else" hazard [`super::connect`]'s
+//!   doc covers for `.skuld.db` itself, not a risk this crate accepts:
+//!   renaming the directory aside and `mkdir`ing a fresh one at the same
+//!   path, or emptying it, `rmdir`ing it, and `mkdir`ing it again, both
+//!   leave the holder locking its old (now-detached) directory while every
+//!   new opener locks the fresh one instead. [`InitLockHeld::target_has_split`]
+//!   is what tells the two groups apart: it records the held directory's
+//!   own `fstat` identity at acquisition and compares it against a fresh
+//!   `stat` of the same path on each check, the same dev+ino comparison
+//!   `super::FileIdentity` does for the DB file itself — a mismatch means
+//!   this handle no longer locks what a fresh opener would.
 //! - **Windows** locks a sibling [`lock_path`] file, opened with
 //!   `share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)` and, deliberately, no
 //!   `FILE_SHARE_DELETE`. Windows refuses to delete or rename a file out
@@ -119,12 +124,51 @@ pub(super) fn lock_path(db_path: &Path) -> PathBuf {
 /// past `with_init_lock`'s call that the borrow checker doesn't already
 /// rule out, since the reference can't outlive the closure it was handed
 /// into).
-pub(super) struct InitLockHeld<'a>(&'a Path);
+pub(super) struct InitLockHeld<'a> {
+    path: &'a Path,
+    /// `fstat`-derived dev+ino of the lock target `File` this token's lock
+    /// is actually held on, recorded once at acquisition — see
+    /// [`Self::target_has_split`].
+    #[cfg(unix)]
+    target_identity: (u64, u64),
+}
 
 impl<'a> InitLockHeld<'a> {
     /// The path [`with_init_lock`] acquired this token's lock for.
     pub(super) fn path(&self) -> &Path {
-        self.0
+        self.path
+    }
+
+    /// True once the directory this token's lock is actually held on (its
+    /// own `fstat`, recorded at acquisition) no longer matches what
+    /// [`Self::path`]'s parent directory currently resolves to on disk —
+    /// the lock has been "split": something replaced the lock target
+    /// wholesale (rename-aside + fresh `mkdir`, or equivalent) while this
+    /// lock was held, so a *new* opener now locks the fresh directory while
+    /// this handle still only excludes callers of the old, now-detached
+    /// one. See the module doc's "Wholesale replacement" bullet.
+    ///
+    /// Always `false` on Windows: the module doc's Windows bullet explains
+    /// why `FILE_SHARE_DELETE` being withheld already rules out the lock
+    /// target being split out from under a holder there at all, not even
+    /// by wholesale replacement — nothing to check.
+    #[cfg(unix)]
+    pub(super) fn target_has_split(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let dir = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        match std::fs::metadata(dir) {
+            Ok(m) => (m.dev(), m.ino()) != self.target_identity,
+            Err(_) => true,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn target_has_split(&self) -> bool {
+        false
     }
 }
 
@@ -143,7 +187,18 @@ pub(super) fn with_init_lock<T>(db_path: &Path, f: impl FnOnce(&InitLockHeld<'_>
     let target = open_lock_target(db_path);
     lock_exclusive(&target)
         .unwrap_or_else(|e| panic!("skuld: failed to acquire coordination DB init lock for {db_path:?}: {e}"));
-    f(&InitLockHeld(db_path))
+    #[cfg(unix)]
+    let target_identity = {
+        use std::os::unix::fs::MetadataExt;
+        target.metadata().map(|m| (m.dev(), m.ino())).unwrap_or_else(|e| {
+            panic!("skuld: failed to inspect coordination DB init lock target for {db_path:?}: {e}")
+        })
+    };
+    f(&InitLockHeld {
+        path: db_path,
+        #[cfg(unix)]
+        target_identity,
+    })
 }
 
 /// Open `db_path`'s lock target, ready to be locked or try-locked (via
