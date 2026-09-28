@@ -193,24 +193,38 @@ fn registration_guard_cleans_up_on_panic() {
 }
 
 /// `connect`'s own doc promises a `.skuld.db` deleted mid-run is tolerated —
-/// recreated fresh, same as the very first connection of the run. But
-/// recreation also resets `running`'s `AUTOINCREMENT` sequence back to 1
-/// (it's tracked in `sqlite_sequence`, part of the schema that goes with the
-/// deleted file), so a test (`b`) registered against the fresh incarnation
-/// can end up with the exact same numeric `id` an earlier test (`a`),
-/// registered against the deleted one, already had. Dropping `a` must not
-/// then delete `b`'s row just because the ids collide: `a` deletes through
-/// its own original connection — which still points at the original,
-/// now-unlinked-but-still-open inode (POSIX doesn't invalidate an open fd
-/// on unlink), not the fresh one `b` registered against — so the DELETE
-/// lands on `a`'s own (invisible-to-everyone-else) incarnation regardless of
-/// what `b`'s id happens to be.
+/// recreated fresh, same as the very first connection of the run, relying
+/// on POSIX's tolerance for unlinking a file another open handle still
+/// points at. Recreation also resets `running`'s `AUTOINCREMENT` sequence
+/// back to 1 (tracked in `sqlite_sequence`, part of the schema that goes
+/// with the deleted file), so a test (`b`) registered against the fresh
+/// incarnation can end up with the exact same numeric `id` an earlier test
+/// (`a`), registered against the deleted one, already had. Dropping `a`
+/// must not then delete `b`'s row just because the ids collide: `a` deletes
+/// through its own original connection, not a fresh one, so the DELETE
+/// lands on `a`'s own incarnation regardless of what `b`'s id happens to
+/// be.
 ///
 /// This is the shape a real review probe found live on `main`: an old
 /// design that reconnected fresh in `Drop` (instead of keeping the original
 /// connection) has no way to tell the two incarnations apart by id alone,
 /// and silently deletes whichever row currently has that id — `b`'s, not
 /// `a`'s, once the file's been recreated.
+///
+/// Unix-only, and genuinely deletes the file (not just its content, via a
+/// second connection) — both for the same reason: this specific bug's
+/// precondition is two *physically distinct* incarnations of `.skuld.db`
+/// (different inodes) with `a`'s connection bound to the old one, which
+/// only a real unlink-and-recreate produces; forcing the id collision some
+/// other way (e.g. `DELETE FROM running` through a second connection to the
+/// *same* file) leaves both registrations on the very same incarnation,
+/// where nothing — this fix included — can tell them apart, since there is
+/// genuinely nothing to tell apart. Windows can't reach this precondition
+/// at all: deleting a file any handle still has open fails outright there
+/// (confirmed — this test's own first version, before it was made
+/// Unix-only, failed exactly that way on both Windows CI lanes), unlike
+/// POSIX's unlink-while-open tolerance `connect`'s own doc relies on.
+#[cfg(unix)]
 #[test]
 fn registration_drop_does_not_delete_a_different_registration_that_reused_its_id() {
     let (_dir, path) = temp_db();
