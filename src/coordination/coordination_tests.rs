@@ -1427,3 +1427,40 @@ fn win32_open_process_error_means_dead_only_for_invalid_parameter() {
         "an unrelated error code must not be treated as 'no such process' either"
     );
 }
+
+// THROWAWAY PROBE (round-6 review item 6) — not meant to be merged.
+#[cfg(windows)]
+#[test]
+fn zz_probe_windows_symlink_ancestor_retarget() {
+    let dir = tempfile::tempdir().unwrap();
+    let real1 = dir.path().join("real1");
+    let real2 = dir.path().join("real2");
+    std::fs::create_dir(&real1).unwrap();
+    std::fs::create_dir(&real2).unwrap();
+    let link = dir.path().join("link");
+    let symlink_result = std::os::windows::fs::symlink_dir(&real1, &link);
+    if let Err(e) = &symlink_result {
+        panic!("PROBE: symlink_dir failed (privilege issue?): {e}");
+    }
+    let path = link.join(".skuld.db");
+
+    let a = coordinate(&path, "a", &[], SERIAL_ALL);
+
+    // Retarget: remove the symlink reparse point itself (not real1's
+    // contents — remove_dir on a symlink-to-a-directory removes only the
+    // link on Windows), then point a fresh one at real2.
+    std::fs::remove_dir(&link).unwrap();
+    std::os::windows::fs::symlink_dir(&real2, &link).unwrap();
+
+    let b_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| coordinate(&path, "b", &[], SERIAL_ALL)));
+    let b_ok = b_result.is_ok();
+
+    let a_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(a)));
+    let a_panicked = a_result.is_err();
+
+    if let Ok(b) = b_result {
+        drop(b);
+    }
+
+    panic!("PROBE windows symlink retarget: b registered ok={b_ok} drop(a) panicked={a_panicked}");
+}
