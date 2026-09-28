@@ -498,10 +498,10 @@ fn negative_control_two_directly_spawned_processes_overlap() {
 /// machine-readable `--message-format json` output. NOT group membership
 /// itself — nextest has no JSON output for that; see
 /// `assert_shared_resource_tests_share_a_serial_group`'s doc. Used to size
-/// `--test-threads` so a *missing* tool-config-file can't make
-/// `run_serializes_the_cross_binary_conflict_via_generated_tool_config`
-/// accidentally pass by nextest naturally serializing everything anyway on
-/// a low-core-count runner, regardless of whether the config is honored.
+/// `--test-threads` so concurrent scheduling of the two conflicting tests
+/// is at least *possible* on a low-core-count runner — not a guarantee
+/// that nextest actually schedules them concurrently, which is what the
+/// two checks below this function's call site are for.
 fn fixture_test_count(root: &Path) -> usize {
     let output = Command::new("cargo")
         .current_dir(root)
@@ -582,9 +582,12 @@ fn run_serializes_the_cross_binary_conflict_via_generated_tool_config() {
     // primary signal — unlike before, the fixture tests no longer widen
     // their own process lifetime with a sleep to make this observable.
     //
-    // --test-threads is set to at least the fixture's own test count so a
-    // *missing* tool-config can't pass by nextest naturally serializing
-    // everything anyway on a low-core-count runner.
+    // --test-threads is set to at least the fixture's own test count so
+    // concurrent scheduling of the conflicting tests is at least possible
+    // on a low-core-count runner, rather than structurally impossible
+    // regardless of the tool-config — it does not by itself guarantee
+    // nextest schedules them concurrently, which is what the two checks
+    // below actually verify.
     let _guard = lock_fixture_workspace();
     let real_dir = tempfile::tempdir().expect("tempdir");
     let output_dir = tempfile::tempdir().expect("tempdir");
