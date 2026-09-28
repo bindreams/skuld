@@ -19,6 +19,10 @@ mod publish;
 #[cfg(all(test, unix))]
 mod publish_tests;
 #[cfg(test)]
+mod rendezvous;
+#[cfg(test)]
+mod rendezvous_tests;
+#[cfg(test)]
 mod test_hooks;
 #[cfg(test)]
 mod test_hooks_tests;
