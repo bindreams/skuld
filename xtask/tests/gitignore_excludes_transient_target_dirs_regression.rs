@@ -1,16 +1,19 @@
 //! Guards the mechanism behind the repo's `/target*` `.gitignore` entries
-//! (fixture and repo root): a *literal* `/target` doesn't cover
-//! `target<hex>`, the temporary name cargo's atomic
-//! create-under-a-temp-name-then-rename uses while initializing a target
-//! directory it finds missing (this is where CI run 36320721947's
-//! `target3133ED` came from). A scan that respects `.gitignore` at all
-//! still steps into a literally-unlisted `target<hex>` mid-rename; the
-//! wildcard excludes it categorically. Reverting either `/target*` back
-//! to `/target` leaves every other test in the workspace green — this is
-//! the only thing that would catch it.
+//! (fixture and repo root): a *literal* `/target` doesn't cover the
+//! directory cargo creates while atomically initializing a target
+//! directory it finds missing — a create-under-a-temporary-name-then-
+//! rename, where the temporary name is `target` plus a 6-character random
+//! alphanumeric suffix (`tempfile`'s own default `NUM_RAND_CHARS`; this is
+//! where CI run 36320721947's `target3133ED` came from — alphanumeric, not
+//! specifically hex, even though that particular suffix happened to look
+//! hex-shaped). A scan that respects `.gitignore` at all still steps into
+//! a literally-unlisted `target<suffix>` mid-rename; the wildcard excludes
+//! it categorically. Reverting either `/target*` back to `/target` leaves
+//! every other test in the workspace green — this is the only thing that
+//! would catch it.
 
+use ignore::gitignore::GitignoreBuilder;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -19,41 +22,46 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// `git check-ignore --no-index -q` — `--no-index` so this works for a
-/// path that doesn't exist on disk (`target<hex>` is transient; nothing
-/// should have to create one just to test this), `-q` to suppress the
-/// matched-pattern output we don't need. Exit 0 means ignored, exit 1
-/// means not ignored; any other exit code is a real error (e.g. a
-/// malformed path or `git` itself failing) that must not be silently
-/// folded into "not ignored".
-fn is_git_ignored(repo_root: &Path, relative_path: &str) -> bool {
-    let output = Command::new("git")
-        .current_dir(repo_root)
-        .args(["check-ignore", "--no-index", "-q", relative_path])
-        .output()
-        .expect("spawn git check-ignore");
-    match output.status.code() {
-        Some(0) => true,
-        Some(1) => false,
-        _ => panic!(
-            "git check-ignore exited with {:?} for {relative_path:?}, expected 0 or 1. stderr:\n{}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        ),
+/// Whether `candidate` is ignored by exactly the globs in `gitignore_file`
+/// — nothing else. Deliberately does not shell out to `git check-ignore`:
+/// that also consults the current user's (or CI runner's) global excludes
+/// file and this repo's `.git/info/exclude`, neither of which this repo
+/// controls or this test can see from its source. Measured directly: with
+/// a global `core.excludesFile` containing a `target*` pattern,
+/// `git check-ignore` reports "ignored" even with the literal, unfixed
+/// `/target` entry still in this repo's own `.gitignore` — which would
+/// make this regression test pass while the bug it exists to catch was
+/// still there. `GitignoreBuilder` parses gitignore syntax itself (the
+/// same engine `ripgrep` and `cargo`'s own `ignore`-crate-based tooling
+/// use) from exactly the one file handed to `add`, with no notion of a
+/// global excludes file or any other `.gitignore` to consult.
+fn is_ignored_by(gitignore_file: &Path, candidate: &Path) -> bool {
+    let dir = gitignore_file.parent().expect("gitignore file has a parent directory");
+    let mut builder = GitignoreBuilder::new(dir);
+    if let Some(err) = builder.add(gitignore_file) {
+        panic!("failed to parse {gitignore_file:?}: {err}");
     }
+    let matcher = builder.build().expect("build gitignore matcher");
+    matcher.matched(candidate, /* is_dir */ true).is_ignore()
 }
 
 #[test]
 fn gitignore_excludes_transient_target_dirs_in_the_fixture_and_at_the_repo_root() {
     let root = repo_root();
+    let fixture_gitignore = root.join("cargo-skuld/tests/fixtures/test-workspace/.gitignore");
+    let root_gitignore = root.join(".gitignore");
+
     assert!(
-        is_git_ignored(&root, "cargo-skuld/tests/fixtures/test-workspace/target0A1B2C"),
-        "cargo-skuld/tests/fixtures/test-workspace/.gitignore must ignore target<hex> \
+        is_ignored_by(
+            &fixture_gitignore,
+            &fixture_gitignore.parent().unwrap().join("targetXk9mQz")
+        ),
+        "cargo-skuld/tests/fixtures/test-workspace/.gitignore must ignore target<suffix> \
          directories, not just the literal `target`"
     );
     assert!(
-        is_git_ignored(&root, "target0A1B2C"),
-        "the repo root .gitignore must ignore target<hex> directories, not just the literal \
+        is_ignored_by(&root_gitignore, &root.join("targetXk9mQz")),
+        "the repo root .gitignore must ignore target<suffix> directories, not just the literal \
          `target`"
     );
 }
