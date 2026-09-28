@@ -192,24 +192,24 @@ fn registration_guard_cleans_up_on_panic() {
     assert_eq!(count, 0);
 }
 
-/// `connect`'s own doc promises a `.skuld.db` deleted mid-run is tolerated —
-/// recreated fresh, same as the very first connection of the run, relying
-/// on POSIX's tolerance for unlinking a file another open handle still
-/// points at. Recreation also resets `running`'s `AUTOINCREMENT` sequence
-/// back to 1 (tracked in `sqlite_sequence`, part of the schema that goes
-/// with the deleted file), so a test (`b`) registered against the fresh
-/// incarnation can end up with the exact same numeric `id` an earlier test
-/// (`a`), registered against the deleted one, already had. Dropping `a`
-/// must not then delete `b`'s row just because the ids collide: `a` deletes
-/// through its own original connection, not a fresh one, so the DELETE
-/// lands on `a`'s own incarnation regardless of what `b`'s id happens to
-/// be.
+/// `.skuld.db` deleted mid-run — main file and its `-wal`/`-shm`
+/// companions, all of them — recreates fresh, same as the very first
+/// connection of the run, relying on POSIX's tolerance for unlinking a file
+/// another open handle still points at (see `connect`'s doc). Recreation
+/// also resets `running`'s `AUTOINCREMENT` sequence back to 1 (tracked in
+/// `sqlite_sequence`, part of the schema that goes with the deleted file),
+/// so a test (`b`) registered against the fresh incarnation can end up with
+/// the exact same numeric `id` an earlier test (`a`), registered against
+/// the deleted one, already had.
 ///
-/// This is the shape a real review probe found live on `main`: an old
-/// design that reconnected fresh in `Drop` (instead of keeping the original
-/// connection) has no way to tell the two incarnations apart by id alone,
-/// and silently deletes whichever row currently has that id — `b`'s, not
-/// `a`'s, once the file's been recreated.
+/// A real review probe once found this live on `main`: an old design that
+/// reconnected fresh in `Drop` (instead of keeping the original connection)
+/// has no way to tell the two incarnations apart by id alone, and silently
+/// deletes whichever row currently has that id — `b`'s, not `a`'s, once the
+/// file's been recreated. `a` now fails loudly instead (its connection's
+/// file has moved — see `panic_on_moved_db`), which incidentally also
+/// closes the id-collision hole: a drop that panics before ever reaching
+/// the `DELETE` can't delete the wrong row either.
 ///
 /// Unix-only, and genuinely deletes the file (not just its content, via a
 /// second connection) — both for the same reason: this specific bug's
@@ -226,14 +226,12 @@ fn registration_guard_cleans_up_on_panic() {
 /// POSIX's unlink-while-open tolerance `connect`'s own doc relies on.
 #[cfg(unix)]
 #[test]
-fn registration_drop_does_not_delete_a_different_registration_that_reused_its_id() {
+fn registration_drop_fails_loudly_instead_of_deleting_a_different_registration_that_reused_its_id() {
     let (_dir, path) = temp_db();
 
     let a = coordinate(&path, "a", &[], SERIAL_NONE);
 
-    // Delete the main file and its WAL companions — the exact shape
-    // `connect`'s doc describes as tolerated. Resets AUTOINCREMENT for
-    // whatever registers against the recreated file next.
+    // Delete the main file and its WAL companions.
     std::fs::remove_file(&path).unwrap();
     let mut wal = path.as_os_str().to_owned();
     wal.push("-wal");
@@ -253,9 +251,9 @@ fn registration_drop_does_not_delete_a_different_registration_that_reused_its_id
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(a)));
     assert!(
-        result.is_ok(),
-        "TestRegistration::drop must tolerate the DB having been deleted mid-run, not panic, \
-         same as connect's own doc promises for the general case"
+        result.is_err(),
+        "TestRegistration::drop must fail loudly once its own connection's file has been \
+         deleted/replaced mid-run, not silently succeed"
     );
 
     let conn = open_db(&path);
@@ -268,28 +266,31 @@ fn registration_drop_does_not_delete_a_different_registration_that_reused_its_id
     drop(b);
 }
 
-/// **Known defect, held for the owner's decision — do not fix by changing
-/// `TestRegistration`'s design without it.** Deleting *only* `.skuld.db`
-/// mid-run (not its `-wal`/`-shm` companions, unlike the sibling test above)
-/// corrupts the DB from a's connection's perspective: `-wal`/`-shm` are
+/// Deleting *only* `.skuld.db` mid-run (not its `-wal`/`-shm` companions,
+/// unlike the sibling test above) is a real corruption hazard, not just a
+/// harmless split like the "everything deleted" case: `-wal`/`-shm` are
 /// identified by *path*, shared with whatever `b` recreates at the same
-/// path, while a's connection keeps writing through its own still-open
-/// handle to the (now-detached) main file. The two halves — a's old main
-/// file, b's fresh `-wal`/`-shm` — stop agreeing on the database's actual
-/// size and content, and SQLite detects it. Reproduces `SQLITE_IOERR_SHORT_READ`
-/// (extended code 522) on `drop(b)`, confirmed by running this exact
-/// sequence: `a.id`/`b.id` collide as in the sibling test, `drop(a)`
-/// succeeds (it doesn't touch `-wal`/`-shm` on the path `b` now owns), and
-/// `drop(b)` panics.
+/// path, while `a`'s connection is still bound to the (now-detached) old
+/// main file — the two halves stop agreeing on the database's actual size
+/// and content. The owner's decision: fail loudly instead of writing
+/// through a connection in that state. `a`'s cleanup now checks
+/// `SQLITE_FCNTL_HAS_MOVED` (see [`panic_on_moved_db`]) before its `DELETE`
+/// and refuses to run it once the file it opened is gone, panicking with a
+/// clear message instead — and never risks touching `-wal`/`-shm` at all,
+/// so `b`'s own DB stays intact.
 ///
-/// This assertion documents *today's* behavior, not the desired one — it
-/// will need to change once the owner decides how `-wal`/`-shm` should be
-/// handled (delete them too on recreation? tie `a`'s connection to
-/// `-wal`/`-shm` state some other way? something else?). Don't treat a
-/// green run of this test as "fixed."
+/// **RED, before this fix landed:** `a.id`/`b.id` collide as in the sibling
+/// test; `drop(a)` used to *succeed* silently (it doesn't touch `b`'s
+/// `-wal`/`-shm`, so nothing stopped it); `drop(b)` then panicked with
+/// `SQLITE_IOERR_SHORT_READ` (extended code 522) — the corruption
+/// surfacing on the *wrong* registration's drop, with no indication of
+/// what actually went wrong. **GREEN, now:** `drop(a)` is the one that
+/// panics, with a clear "deleted or replaced mid-run" message naming the
+/// path; `drop(b)` succeeds, and `b`'s row is cleanly removed — `b`'s DB
+/// was never at risk in the first place.
 #[cfg(unix)]
 #[test]
-fn registration_drop_corrupts_the_recreated_db_when_only_the_main_file_is_deleted_mid_run() {
+fn registration_drop_fails_loudly_instead_of_corrupting_when_only_the_main_file_is_deleted_mid_run() {
     let (_dir, path) = temp_db();
 
     let a = coordinate(&path, "a", &[], SERIAL_NONE);
@@ -304,15 +305,27 @@ fn registration_drop_corrupts_the_recreated_db_when_only_the_main_file_is_delete
          to mean anything"
     );
 
-    drop(a);
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(b)));
+    let result_a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(a)));
     assert!(
-        result.is_err(),
-        "KNOWN DEFECT (held for the owner): dropping b currently panics with SQLITE_IOERR_SHORT_READ \
-         because deleting only .skuld.db (not -wal/-shm) mid-run corrupts the DB from a's \
-         connection's perspective. This assertion documents today's behavior, not the desired \
-         one — see this test's own doc comment"
+        result_a.is_err(),
+        "dropping a must fail loudly (its connection's file was deleted/replaced mid-run), not \
+         silently succeed and leave the corruption for something else to discover"
+    );
+
+    let result_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(b)));
+    assert!(
+        result_b.is_ok(),
+        "dropping b must succeed: b's own connection was never touched by a's file having been \
+         deleted out from under a, so nothing about a's mishap should affect b"
+    );
+
+    let conn = open_db(&path);
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
+        .expect("b's DB must still be queryable, not corrupted, after this whole sequence");
+    assert_eq!(
+        count, 0,
+        "b's row must have been cleanly deleted by its own successful drop"
     );
 }
 

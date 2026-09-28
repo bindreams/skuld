@@ -96,23 +96,30 @@ const SCHEMA_VERSION: i64 = 1;
 /// to retry through. A broken entry panics loudly, naming the path, rather
 /// than being waited out.
 ///
-/// A `.skuld.db` deleted mid-run is *not* what makes this panic, no matter
-/// how many times it happens: every absence the open discovers, including a
-/// repeat one after `ensure_published` already ran once, gets recreated
-/// fresh at 0666, same as the very first connection of the run. Recreation
-/// gets a new inode; any process that still holds a connection open to the
-/// deleted file's old inode (POSIX doesn't invalidate an open fd on unlink)
-/// keeps operating on that old inode, coordinating separately from
-/// processes that connect afterward and see the new one — a split this
-/// module's minimal-publish design doesn't try to detect or reconcile
-/// (there's no verification of what's actually at `path` beyond "something
-/// is," so nothing here would notice the swap to tell the two groups
-/// apart). [`TestRegistration`] relies on exactly this split, deliberately:
-/// it keeps registering and deleting through its own original connection
-/// for its entire lifetime rather than ever reconnecting, specifically so
-/// its cleanup stays scoped to the one incarnation of the file its row
-/// actually lives in — see its own doc for why reconnecting there would be
-/// a correctness bug, not just an unnecessary one.
+/// A `.skuld.db` deleted mid-run is *not* what makes *this function* panic,
+/// no matter how many times it happens: every absence the open discovers,
+/// including a repeat one after `ensure_published` already ran once, gets
+/// recreated fresh at 0666, same as the very first connection of the run.
+/// Recreation gets a new inode, so any connection that opened the file
+/// *before* the deletion — including one held open across the deletion
+/// itself, since POSIX doesn't invalidate an open fd on unlink — is now
+/// bound to that old, detached inode while this fresh `connect` sees the
+/// new one. This function itself has no opinion about that: it just
+/// recreates and returns a connection to whatever is at `path` right now.
+///
+/// What a connection does *after* that split matters a great deal, though:
+/// writing through the old, detached one would silently corrupt whatever
+/// now exists at `path` (`-wal`/`-shm` are identified by path, so a
+/// recreated file's companions get mixed with the old connection's writes).
+/// Skuld does not tolerate that. [`coordinate`] and [`TestRegistration`]'s
+/// cleanup each hold one connection open across more than one operation —
+/// see [`TestRegistration`]'s own doc for why that's deliberate, not just
+/// an optimization — and each checks `SQLITE_FCNTL_HAS_MOVED` on it (see
+/// [`panic_on_moved_db`]) immediately before every write, refusing to write
+/// and panicking loudly, naming `path`, the moment that connection's file
+/// has been swapped out from under it. A `.skuld.db` deleted mid-run is a
+/// contract violation Skuld surfaces as a failure, not a condition it
+/// silently works around.
 ///
 /// Windows is unchanged: no Windows lane mixes uids, so there's nothing for
 /// the publish step to protect against there, and the open keeps its
@@ -385,6 +392,63 @@ pub(crate) fn probe_hold_init_lock(path: &std::path::Path, while_held: impl FnOn
 /// can observe contention against the held lock.
 pub(crate) fn probe_try_init_lock(path: &std::path::Path) -> Result<(), std::fs::TryLockError> {
     lock::try_lock_exclusive(&lock::open_lock_target(path))
+}
+
+// Moved-database detection =====
+
+/// True once `conn`'s underlying main database file has been deleted,
+/// renamed, or replaced since `conn` opened it — `SQLITE_FCNTL_HAS_MOVED`,
+/// which SQLite's own unix and Windows VFSes both implement by comparing
+/// the file's current identity (inode on Unix, file id on Windows) against
+/// the one recorded at open time. This is what makes it safe for
+/// [`coordinate`] and [`TestRegistration`]'s cleanup to keep using one
+/// connection for their whole lifetime instead of reconnecting per
+/// operation (see their own docs for why reconnecting is itself a
+/// correctness bug, not just inefficient): every write first checks this,
+/// and refuses — loudly, via [`panic_on_moved_db`] — rather than risk
+/// writing through a connection whose own file has been swapped out from
+/// under it, which `registration_drop_corrupts_the_recreated_db_when_only_the_main_file_is_deleted_mid_run`
+/// demonstrates can otherwise corrupt whatever now exists at that path.
+///
+/// A single, fast, synchronous file-control call — no I/O beyond what the
+/// OS already cached identifying the open file, no blocking, so checking
+/// this before every write costs nothing worth avoiding it for.
+fn db_has_moved(conn: &rusqlite::Connection) -> bool {
+    let mut has_moved: std::os::raw::c_int = 0;
+    let main = c"main";
+    // Safety: `conn.handle()` is a valid, currently-open `sqlite3*` for as
+    // long as `conn` is borrowed, which outlives this call; `main` is a
+    // NUL-terminated C string naming the (only) attached database Skuld
+    // ever uses; `&mut has_moved` is a valid `*mut c_int` for SQLite to
+    // write its 0-or-1 answer into, matching what `SQLITE_FCNTL_HAS_MOVED`
+    // documents it expects.
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            main.as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&raw mut has_moved).cast(),
+        )
+    };
+    assert_eq!(
+        rc,
+        rusqlite::ffi::SQLITE_OK,
+        "skuld: SQLITE_FCNTL_HAS_MOVED file-control failed with code {rc} — this platform's \
+         SQLite VFS may not implement it, which means Skuld can no longer tell a moved \
+         database apart from a live one and must not be trusted to keep writing"
+    );
+    has_moved != 0
+}
+
+/// Panic loudly, naming `path`, if `conn`'s database has moved (see
+/// [`db_has_moved`]) — call this immediately before any write through a
+/// connection [`coordinate`] or [`TestRegistration`] has held open across
+/// more than one operation, so a `.skuld.db` deleted or replaced mid-run is
+/// caught here instead of corrupting whatever now exists at `path`.
+fn panic_on_moved_db(conn: &rusqlite::Connection, path: &std::path::Path) {
+    if db_has_moved(conn) {
+        panic!("skuld coordination DB {path:?} was deleted or replaced mid-run");
+    }
 }
 
 // Transient error classification =====
@@ -914,22 +978,34 @@ fn register(
 /// Keeps the very same [`rusqlite::Connection`] [`coordinate`] registered
 /// `id` on — not just `id` and a path to reconnect with — and deletes
 /// through that connection on drop, never a fresh one. That matters beyond
-/// tolerating `.skuld.db` being deleted mid-run (see [`connect`]'s doc):
-/// reconnecting can delete a *different* test's row outright. `id` comes
-/// from `running`'s `AUTOINCREMENT` column, and `AUTOINCREMENT`'s
-/// no-reuse guarantee is scoped to one schema's lifetime, tracked in
-/// `sqlite_sequence` — a `.skuld.db` deleted and recreated mid-run starts
-/// that sequence over from 1. Two tests registered against two different
-/// incarnations of the file can end up with the same numeric `id`, and a
-/// reconnect-then-`DELETE FROM running WHERE id = ?` keyed on that id alone
-/// has no way to tell which incarnation it's actually deleting from — it
-/// deletes whatever currently has that id, correct target or not. Holding
-/// the original connection sidesteps the ambiguity instead of trying to
-/// detect it: this connection's open file descriptor still points at the
-/// exact inode `id` was minted against (POSIX doesn't invalidate an open fd
-/// on unlink), so every operation through it — including this cleanup — is
-/// unambiguously scoped to that one incarnation, whatever anyone else has
-/// since done to the path.
+/// the connection split `.skuld.db` deleted mid-run causes (see
+/// [`connect`]'s doc): reconnecting can delete a *different* test's row
+/// outright. `id` comes from `running`'s `AUTOINCREMENT` column, and
+/// `AUTOINCREMENT`'s no-reuse guarantee is scoped to one schema's lifetime,
+/// tracked in `sqlite_sequence` — a `.skuld.db` deleted and recreated
+/// mid-run starts that sequence over from 1. Two tests registered against
+/// two different incarnations of the file can end up with the same numeric
+/// `id`, and a reconnect-then-`DELETE FROM running WHERE id = ?` keyed on
+/// that id alone has no way to tell which incarnation it's actually
+/// deleting from — it deletes whatever currently has that id, correct
+/// target or not. Holding the original connection sidesteps the ambiguity
+/// instead of trying to detect it: this connection's open file descriptor
+/// still points at the exact inode `id` was minted against (POSIX doesn't
+/// invalidate an open fd on unlink), so every operation through it —
+/// including this cleanup — is unambiguously scoped to that one
+/// incarnation, whatever anyone else has since done to the path.
+///
+/// Scoped to the right incarnation is not the same as safe to write to,
+/// though: if the path has moved on to a *different* incarnation, this
+/// connection's own file is a detached, orphaned inode nobody else can see
+/// or coordinate through — deleting the row here accomplishes nothing real,
+/// and any write at all risks corrupting whatever now lives at the path (a
+/// recreated file's `-wal`/`-shm`, identified by path rather than inode,
+/// getting mixed with this connection's own writes). So `Drop` checks
+/// `SQLITE_FCNTL_HAS_MOVED` (see [`panic_on_moved_db`]) before its `DELETE`
+/// and refuses to run it once that's true, panicking loudly instead —
+/// Skuld fails a mid-run `.skuld.db` deletion, it does not silently work
+/// around it.
 pub(crate) struct TestRegistration {
     conn: rusqlite::Connection,
     id: i64,
@@ -953,6 +1029,10 @@ impl Drop for TestRegistration {
         // anything else: a failure that's genuinely possible here is worth
         // surfacing, not just warning about.
         let cleanup = || {
+            panic_on_moved_db(
+                &self.conn,
+                std::path::Path::new(self.conn.path().unwrap_or("<unknown>")),
+            );
             retry_busy(&self.conn, || {
                 self.conn.execute("DELETE FROM running WHERE id = ?1", [self.id])
             })
@@ -1050,6 +1130,13 @@ pub(crate) fn coordinate(
     let mut logged_first_wait = false;
 
     loop {
+        // Before every coordination step, not just the first: a retry loop
+        // can spend an arbitrary (uncapped) amount of time here under
+        // contention, and `.skuld.db` deleted or replaced mid-retry is just
+        // as real a hazard as one deleted before `coordinate` was ever
+        // called.
+        panic_on_moved_db(&conn, db_path);
+
         let txn = || -> Result<Option<i64>, rusqlite::Error> {
             conn.execute_batch("BEGIN EXCLUSIVE")?;
             clean_stale_entries(&conn)?;
