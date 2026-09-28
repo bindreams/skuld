@@ -58,10 +58,9 @@ pub(super) fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 /// Test helper: run [`register`] inside a transaction, matching its own
-/// documented contract — enforced by a `debug_assert!` now, not just
-/// documented, so calling it directly on an autocommit connection (as every
-/// test below used to) panics in debug builds. Commits and returns the row
-/// id.
+/// documented contract — enforced by a `debug_assert!`, not just
+/// documented, so calling it directly on an autocommit connection panics in
+/// debug builds. Commits and returns the row id.
 fn register_in_txn(conn: &rusqlite::Connection, name: &str, labels: &[Label], serial_filter: &str) -> i64 {
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     let id = register(conn, name, labels, serial_filter).unwrap();
