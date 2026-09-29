@@ -3,13 +3,13 @@
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering::SeqCst};
-use std::sync::Barrier;
 
 #[cfg(windows)]
 use super::lock::lock_path;
 #[cfg(unix)]
 use super::lock::{lock_exclusive, EINTR_RETRIES};
 use super::lock::{open_lock_target, try_lock_exclusive, with_init_lock};
+use super::rendezvous::rendezvous;
 
 #[cfg(windows)]
 #[test]
@@ -20,7 +20,7 @@ fn lock_path_appends_dot_lock_to_the_full_db_path_verbatim() {
 
 /// `with_init_lock` must be a *mutual exclusion* primitive, not just "don't
 /// panic under concurrency": many threads race to enter the same critical
-/// section at once, lined up on a `Barrier` so they all arrive together —
+/// section at once, lined up on a rendezvous so they all arrive together —
 /// maximizing the chance a missing exclusion would show up — and each
 /// checks, via an atomic counter rather than a sleep-widened window, that
 /// it is ever the *only* thread inside. A single overlap anywhere across
@@ -38,12 +38,12 @@ fn with_init_lock_serializes_concurrent_callers() {
         let db_path = dir.path().join(".skuld.db");
         let in_critical_section = AtomicI64::new(0);
         let max_seen = AtomicI64::new(0);
-        let barrier = Barrier::new(THREADS);
+        let points = rendezvous(THREADS);
 
         std::thread::scope(|s| {
-            for _ in 0..THREADS {
+            for point in points {
                 s.spawn(|| {
-                    barrier.wait();
+                    point.wait();
                     with_init_lock(&db_path, |_token| {
                         let now = in_critical_section.fetch_add(1, SeqCst) + 1;
                         max_seen.fetch_max(now, SeqCst);
@@ -96,12 +96,12 @@ fn with_init_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet()
 
     let in_critical_section = AtomicI64::new(0);
     let max_seen = AtomicI64::new(0);
-    let barrier = Barrier::new(THREADS);
+    let points = rendezvous(THREADS);
 
     std::thread::scope(|s| {
-        for _ in 0..THREADS {
+        for point in points {
             s.spawn(|| {
-                barrier.wait();
+                point.wait();
                 with_init_lock(&db_path, |_token| {
                     let now = in_critical_section.fetch_add(1, SeqCst) + 1;
                     max_seen.fetch_max(now, SeqCst);

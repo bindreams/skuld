@@ -19,6 +19,10 @@ mod publish;
 #[cfg(all(test, unix))]
 mod publish_tests;
 #[cfg(test)]
+mod rendezvous;
+#[cfg(test)]
+mod rendezvous_tests;
+#[cfg(test)]
 mod test_hooks;
 #[cfg(test)]
 mod test_hooks_tests;
@@ -850,13 +854,18 @@ fn can_start(
 ///
 /// Must be called inside an active transaction: the two INSERTs are not atomic
 /// at the function level, and a mid-call failure leaves a half-inserted row
-/// that the caller's surrounding txn must roll back.
+/// that the caller's surrounding txn must roll back. Checked by a
+/// `debug_assert!`.
 fn register(
     conn: &rusqlite::Connection,
     name: &str,
     labels: &[Label],
     serial_filter: &str,
 ) -> Result<i64, rusqlite::Error> {
+    debug_assert!(
+        !conn.is_autocommit(),
+        "register: must be called inside an active transaction, not on an autocommit connection"
+    );
     conn.execute(
         "INSERT INTO running (instance_id, name, serial_filter) VALUES (?1, ?2, ?3)",
         rusqlite::params![instance_id(), name, serial_filter],
