@@ -9,6 +9,8 @@ mod coordination_tests;
 mod lock;
 #[cfg(test)]
 mod lock_tests;
+#[cfg(test)]
+mod migrate_tests;
 mod moved_db;
 #[cfg(all(test, unix))]
 mod moved_db_tests;
@@ -23,7 +25,7 @@ mod test_hooks_tests;
 
 use crate::label::{Label, LabelFilter};
 
-use moved_db::DbIdentity;
+use moved_db::{DbIdentity, Failure};
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -400,20 +402,17 @@ fn ensure_schema_locked(
         path,
         "ensure_schema_locked: called with a path different from the one whose init lock is held"
     );
-    retry_busy(conn, || {
-        identity.panic_if_moved(conn, path);
-        panic_on_split_lock(init_lock);
-        conn.execute_batch(INIT_SQL)
-    })
-    .unwrap_or_else(|e| {
-        if let Some(msg) = identity.io_failure_message(conn, &e, path) {
-            panic!("{msg}");
-        }
-        panic!(
-            "skuld: failed to initialize coordination DB at {:?}: {e}",
-            conn.path().unwrap_or("<unknown>")
-        )
-    });
+    or_panic(
+        conn,
+        path,
+        identity,
+        "failed to initialize coordination DB",
+        retry_busy(conn, || {
+            identity.panic_if_moved(conn, path);
+            panic_on_split_lock(init_lock);
+            conn.execute_batch(INIT_SQL)
+        }),
+    );
     // Defense for the unavoidable window between the last successful write
     // above and this check: a move landing exactly there must still end
     // loud, not slip through because nothing checked again afterward.
@@ -441,6 +440,22 @@ fn panic_on_split_lock(init_lock: &lock::InitLockHeld<'_>) {
             init_lock.path()
         );
     }
+}
+
+/// `result`'s value, or a panic naming `path` (see
+/// [`DbIdentity::failure_message`]). The failure is captured before anything
+/// else touches `conn`.
+fn or_panic<T>(
+    conn: &rusqlite::Connection,
+    path: &std::path::Path,
+    identity: &DbIdentity,
+    context: &str,
+    result: Result<T, rusqlite::Error>,
+) -> T {
+    result.unwrap_or_else(|e| {
+        let failure = Failure::capture(conn, e);
+        panic!("{}", identity.failure_message(conn, &failure, path, context))
+    })
 }
 
 // Test probe hooks =====
@@ -582,75 +597,82 @@ fn retry_busy<T>(
 /// Once a migration completes, the version pragma is bumped and subsequent
 /// connections skip the work.
 ///
-/// `identity` — see [`ensure_schema_locked`]'s doc, its only caller, for
-/// where this comes from and why every write step below checks it (via
-/// [`DbIdentity::panic_if_moved`]) immediately before running, not just once on
-/// entry: this function's two `retry_busy` calls can each retry for an
-/// uncapped amount of time, and every other write here — the scrub, the
-/// version bump, the commit — still runs after them, so a move landing at
-/// any point along the way must still be caught before the next write
-/// trusts a connection that's no longer pointed at `path`.
+/// Every failure panics, naming `path` ([`or_panic`]): nothing is read as a
+/// default or warned past, and a failed `COMMIT` rolls back first so the
+/// connection is never left inside its transaction.
+///
+/// `identity` is checked before and after each write, not once on entry: the
+/// `BEGIN IMMEDIATE` retry is uncapped and the writes after it still follow.
 fn migrate_schema(conn: &rusqlite::Connection, path: &std::path::Path, identity: &DbIdentity) {
-    // The read below is wrapped in `retry_busy` not because a concurrent
-    // `BEGIN EXCLUSIVE` elsewhere would block it — in WAL mode a plain read
-    // like this one doesn't contend with another connection's write lock at
-    // all, exclusive or not — but because `SQLITE_BUSY_RECOVERY` can still
-    // surface here: it's reported to a connection that has to *wait* because
-    // some *other* connection is the one currently running WAL recovery (the
-    // hot-journal cleanup after that other connection's own unclean exit) —
-    // this connection is the one blocked, not the one recovering. `.unwrap_or(0)`
-    // is unchanged and only reached once a genuinely non-retryable error
-    // comes back. (Nothing in this crate's own test suite reproduces
-    // `SQLITE_BUSY_RECOVERY` — it needs a genuinely killed process leaving a
-    // hot WAL and a second connection racing the recovery, not a live
-    // contending connection alone — so this path relies on code review
-    // rather than a regression test.)
-    let current: i64 = retry_busy(conn, || {
-        identity.panic_if_moved(conn, path);
-        conn.query_row("PRAGMA user_version", [], |row| row.get(0))
-    })
-    .unwrap_or(0);
-    identity.panic_if_moved(conn, path);
+    // In `retry_busy` because `SQLITE_BUSY_RECOVERY` can still surface on a
+    // plain WAL read: it is reported to a connection that must wait while
+    // another runs WAL recovery.
+    let current: i64 = or_panic(
+        conn,
+        path,
+        identity,
+        "failed to read the schema version",
+        retry_busy(conn, || conn.query_row("PRAGMA user_version", [], |row| row.get(0))),
+    );
     if current >= SCHEMA_VERSION {
         return;
     }
-    // Take an immediate write lock so two processes don't both start
-    // scrubbing. Unlike the read above, this genuinely does contend with a
-    // concurrent `BEGIN EXCLUSIVE`/`BEGIN IMMEDIATE` elsewhere (any live
-    // `coordinate` caller, which never takes this connection's own init
-    // lock) — `retry_busy` retries that, uncapped, instead of relying on
-    // rusqlite's default `busy_timeout` (disabled in `connect_locked`) to
-    // paper over it with a capped internal wait.
-    if let Err(e) = retry_busy(conn, || {
-        identity.panic_if_moved(conn, path);
-        conn.execute_batch("BEGIN IMMEDIATE")
-    }) {
-        if let Some(msg) = identity.io_failure_message(conn, &e, path) {
-            panic!("{msg}");
-        }
-        eprintln!("[skuld] warning: failed to acquire migration lock: {e}");
-        return;
-    }
+    // An immediate write lock, so two processes don't both scrub. Unlike the
+    // read above this genuinely contends with a live `coordinate`'s
+    // `BEGIN EXCLUSIVE`.
+    or_panic(
+        conn,
+        path,
+        identity,
+        "failed to acquire the migration lock",
+        retry_busy(conn, || {
+            identity.panic_if_moved(conn, path);
+            conn.execute_batch("BEGIN IMMEDIATE")
+        }),
+    );
     identity.panic_if_moved(conn, path);
     // Re-check inside the transaction in case another process beat us to it.
-    let inside_tx: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap_or(0);
+    let inside_tx: i64 = or_panic(
+        conn,
+        path,
+        identity,
+        "failed to re-read the schema version",
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0)),
+    );
     if inside_tx >= SCHEMA_VERSION {
-        let _ = conn.execute_batch("COMMIT");
+        commit_migration(conn, path, identity);
         return;
     }
     if current < 1 {
-        identity.panic_if_moved(conn, path);
         scrub_serial_filters_v1(conn, path, identity);
     }
     identity.panic_if_moved(conn, path);
-    if let Err(e) = conn.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), []) {
-        eprintln!("[skuld] warning: failed to bump schema version: {e}");
-    }
+    or_panic(
+        conn,
+        path,
+        identity,
+        "failed to bump the schema version",
+        conn.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), []),
+    );
     identity.panic_if_moved(conn, path);
+    commit_migration(conn, path, identity);
+    identity.panic_if_moved(conn, path);
+}
+
+/// `COMMIT` the migration transaction. On failure, roll back (SQLite only
+/// *might* have) and panic, so the connection is never handed on mid-transaction.
+fn commit_migration(conn: &rusqlite::Connection, path: &std::path::Path, identity: &DbIdentity) {
     if let Err(e) = conn.execute_batch("COMMIT") {
-        eprintln!("[skuld] warning: failed to commit schema migration: {e}");
+        let failure = Failure::capture(conn, e);
+        if !conn.is_autocommit() {
+            // Best effort: the panic below is what reports the failure.
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        panic!(
+            "{}",
+            identity.failure_message(conn, &failure, path, "failed to commit the schema migration")
+        );
     }
-    identity.panic_if_moved(conn, path);
 }
 
 /// Migration v0 → v1: rewrite every `serial_filter` to its canonical Display
@@ -660,33 +682,31 @@ fn migrate_schema(conn: &rusqlite::Connection, path: &std::path::Path, identity:
 /// serialization invariants); only the standard `clean_stale_entries` path
 /// removes them later.
 ///
-/// `identity` — see [`migrate_schema`]'s doc: checked (via
-/// [`DbIdentity::panic_if_moved`]) before each row's `UPDATE`, since this can loop
-/// over an arbitrary number of rows and a move landing partway through must
-/// still be caught before the next one trusts a connection that's no
-/// longer pointed at `path`.
+/// `identity` is checked before each row's `UPDATE`: this loops over an
+/// arbitrary number of rows, and a move partway through must be caught before
+/// the next one.
 fn scrub_serial_filters_v1(conn: &rusqlite::Connection, path: &std::path::Path, identity: &DbIdentity) {
-    let mut stmt =
-        match conn.prepare("SELECT id, instance_id, serial_filter FROM running WHERE serial_filter NOT IN ('', ?1)") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[skuld] warning: schema scrub: prepare failed: {e}");
-                return;
-            }
-        };
-    let rows: Vec<(i64, String, String)> = match stmt.query_map([SERIAL_ALL], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    }) {
-        Ok(it) => it.filter_map(|r| r.ok()).collect(),
-        Err(e) => {
-            eprintln!("[skuld] warning: schema scrub: query failed: {e}");
-            return;
-        }
-    };
+    let mut stmt = or_panic(
+        conn,
+        path,
+        identity,
+        "schema scrub: failed to prepare",
+        conn.prepare("SELECT id, instance_id, serial_filter FROM running WHERE serial_filter NOT IN ('', ?1)"),
+    );
+    let rows: Vec<(i64, String, String)> = or_panic(
+        conn,
+        path,
+        identity,
+        "schema scrub: failed to read the running table",
+        stmt.query_map([SERIAL_ALL], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .and_then(|it| it.collect::<Result<Vec<_>, _>>()),
+    );
     for (id, iid, raw) in rows {
         match LabelFilter::parse(&raw) {
             Ok(filter) => {
@@ -699,15 +719,16 @@ fn scrub_serial_filters_v1(conn: &rusqlite::Connection, path: &std::path::Path, 
                 };
                 if canonical != raw {
                     identity.panic_if_moved(conn, path);
-                    if let Err(e) = conn.execute(
-                        "UPDATE running SET serial_filter = ?1 WHERE id = ?2",
-                        rusqlite::params![canonical, id],
-                    ) {
-                        if let Some(msg) = identity.io_failure_message(conn, &e, path) {
-                            panic!("{msg}");
-                        }
-                        eprintln!("[skuld] warning: schema scrub: update id={id} failed: {e}");
-                    }
+                    or_panic(
+                        conn,
+                        path,
+                        identity,
+                        &format!("schema scrub: failed to update running id={id}"),
+                        conn.execute(
+                            "UPDATE running SET serial_filter = ?1 WHERE id = ?2",
+                            rusqlite::params![canonical, id],
+                        ),
+                    );
                 }
             }
             Err(e) => {
@@ -1025,19 +1046,16 @@ impl Drop for TestRegistration {
         // last successful write and this function returning must still end
         // loud, not slip through unnoticed.
         let cleanup = || {
-            retry_busy(&self.conn, || {
-                self.identity.panic_if_moved(&self.conn, &self.path);
-                self.conn.execute("DELETE FROM running WHERE id = ?1", [self.id])
-            })
-            .unwrap_or_else(|e| {
-                if let Some(msg) = self.identity.io_failure_message(&self.conn, &e, &self.path) {
-                    panic!("{msg}");
-                }
-                panic!(
-                    "skuld: failed to unregister test from coordination DB at {:?}: {e}",
-                    self.path
-                )
-            });
+            or_panic(
+                &self.conn,
+                &self.path,
+                &self.identity,
+                "failed to unregister test from coordination DB",
+                retry_busy(&self.conn, || {
+                    self.identity.panic_if_moved(&self.conn, &self.path);
+                    self.conn.execute("DELETE FROM running WHERE id = ?1", [self.id])
+                }),
+            );
             #[cfg(test)]
             test_hooks::run_seam(test_hooks::Seam::Delete);
             self.identity.panic_if_moved(&self.conn, &self.path);
@@ -1161,15 +1179,6 @@ pub(crate) fn coordinate(
 
         match txn() {
             Ok(Some(id)) => {
-                // A move landing between the check at the top of this loop
-                // and the COMMIT above must still end loud: otherwise this
-                // registration lands in an orphaned file, unserialized
-                // against anything real, and the only place that would
-                // ever surface it is this connection's own eventual Drop —
-                // as a downgraded warning, not a panic, if the test itself
-                // already panicked by then (see `TestRegistration::drop`'s
-                // own doc). Catching it here, before any of that, is what
-                // makes it a loud failure at the point it happened instead.
                 #[cfg(test)]
                 test_hooks::run_seam(test_hooks::Seam::Commit);
                 identity.panic_if_moved(&conn, db_path);
@@ -1216,26 +1225,23 @@ pub(crate) fn coordinate(
                 );
             }
             Err(e) => {
+                // Captured before the ROLLBACK, whose own failure would
+                // overwrite the errno.
+                let failure = Failure::capture(&conn, e);
                 let _ = conn.execute_batch("ROLLBACK");
                 // See `is_retryable`'s doc: `SQLITE_LOCKED` here can only be
                 // a same-connection self-conflict, a bug in this crate's own
                 // code, not a condition worth having retried past.
                 debug_assert!(
-                    e.sqlite_error_code() != Some(rusqlite::ErrorCode::DatabaseLocked),
-                    "coordinate: got SQLITE_LOCKED against {:?}: {e}",
-                    conn.path().unwrap_or("<unknown>")
+                    failure.error().sqlite_error_code() != Some(rusqlite::ErrorCode::DatabaseLocked),
+                    "coordinate: got SQLITE_LOCKED against {:?}: {}",
+                    conn.path().unwrap_or("<unknown>"),
+                    failure.error()
                 );
-                // A missing `-wal`/`-shm` companion (main file identity
-                // untouched, so the check above never caught it) tends to
-                // surface as exactly this shape of opaque I/O error —
-                // re-checked here at this exact moment (including the
-                // companions) rather than assumed from the error's shape
-                // alone, so a genuine I/O error (e.g. `ENOSPC`) still
-                // reports as what it actually is.
-                if let Some(msg) = identity.io_failure_message(&conn, &e, db_path) {
-                    panic!("{msg}");
-                }
-                panic!("skuld: coordination DB error: {e}");
+                panic!(
+                    "{}",
+                    identity.failure_message(&conn, &failure, db_path, "coordination DB error")
+                );
             }
         }
 

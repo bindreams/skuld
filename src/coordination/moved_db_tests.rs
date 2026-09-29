@@ -4,7 +4,8 @@
 
 use super::coordination_tests::temp_db;
 use super::moved_db::{
-    companion_path, has_moved_via_fcntl, open_file_identities, scan_open_file_identities, DbIdentity, FileIdentity,
+    companion_path, has_moved_via_fcntl, open_file_identities, scan_open_file_identities, DbIdentity, Failure,
+    FileIdentity,
 };
 use super::test_hooks::{retry_rendezvous, set_test_retry_hook, set_test_seam_hook, Seam};
 use super::{coordinate, open_db, SERIAL_NONE};
@@ -187,43 +188,144 @@ fn registration_drop_fails_loudly_when_the_db_moves_right_after_its_delete() {
     assert_moved_panic(result, &path);
 }
 
-fn io_err() -> rusqlite::Error {
-    rusqlite::Error::SqliteFailure(
+/// A SQLite failure of `code`, captured against `conn` as production would.
+fn failure(conn: &rusqlite::Connection, code: rusqlite::ErrorCode, extended: i32, text: &str) -> Failure {
+    let err = rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::SystemIoFailure,
-            extended_code: rusqlite::ffi::SQLITE_IOERR_SHORT_READ,
+            code,
+            extended_code: extended,
         },
-        Some("disk I/O error".to_string()),
+        Some(text.to_owned()),
+    );
+    Failure::capture(conn, err)
+}
+
+fn io_failure(conn: &rusqlite::Connection) -> Failure {
+    failure(
+        conn,
+        rusqlite::ErrorCode::SystemIoFailure,
+        rusqlite::ffi::SQLITE_IOERR_SHORT_READ,
+        "disk I/O error",
     )
 }
 
-/// `moved_db_message_for_full` says "moved" only when a check confirms it.
+/// One failure per error class the message builder must handle identically.
+fn every_class(conn: &rusqlite::Connection) -> Vec<Failure> {
+    use rusqlite::ffi::*;
+    use rusqlite::ErrorCode::*;
+    vec![
+        io_failure(conn),
+        failure(conn, DiskFull, SQLITE_FULL, "database or disk is full"),
+        failure(
+            conn,
+            DatabaseCorrupt,
+            SQLITE_CORRUPT,
+            "database disk image is malformed",
+        ),
+        failure(conn, CannotOpen, SQLITE_CANTOPEN, "unable to open database file"),
+        failure(conn, ReadOnly, SQLITE_READONLY, "attempt to write a readonly database"),
+        failure(conn, NotADatabase, SQLITE_NOTADB, "file is not a database"),
+        failure(conn, DatabaseBusy, SQLITE_BUSY, "database is locked"),
+    ]
+}
+
+/// Nothing moved: every class is reported as what it is, naming the path and
+/// SQLite's extended code, and never mislabelled as a move.
 #[test]
-fn full_io_message_is_reported_as_is_when_nothing_moved() {
+fn failure_message_reports_every_class_as_is_when_nothing_moved() {
     let (_dir, path) = temp_db();
     let (conn, identity) = open_db(&path);
-    let msg = identity.io_failure_message(&conn, &io_err(), &path);
+    for f in every_class(&conn) {
+        let msg = identity.failure_message(&conn, &f, &path, "some context");
+        assert!(
+            msg.contains("some context")
+                && msg.contains(&format!("{path:?}"))
+                && msg.contains("extended code")
+                && msg.contains("system errno")
+                && !msg.contains("deleted or replaced mid-run"),
+            "{:?} must be reported as-is: {msg:?}",
+            f.error()
+        );
+    }
+}
+
+/// A full disk is I/O-class: its message names the path, the extended code and
+/// the disk-full text, and says SQLite recorded no errno for it (its errno
+/// would be stale).
+#[test]
+fn failure_message_names_a_full_disk() {
+    let (_dir, path) = temp_db();
+    let (conn, identity) = open_db(&path);
+    let full = failure(
+        &conn,
+        rusqlite::ErrorCode::DiskFull,
+        rusqlite::ffi::SQLITE_FULL,
+        "database or disk is full",
+    );
+
+    let msg = identity.failure_message(&conn, &full, &path, "ctx");
+
     assert!(
-        msg.as_ref().is_some_and(|m| !m.contains("deleted or replaced mid-run")
-            && m.contains(path.to_str().unwrap())
-            && m.contains("extended code")
-            && m.contains("system errno")),
-        "got {msg:?}"
+        msg.contains(&format!("{path:?}"))
+            && msg.contains("database or disk is full")
+            && msg.contains(&format!("extended code: Some({})", rusqlite::ffi::SQLITE_FULL))
+            && msg.contains("none recorded"),
+        "{msg:?}"
     );
 }
 
-/// A lost `-wal` alone is a confirmed move for the companion-aware message.
+/// Once the DB moved, every error class gets the clear "moved" message: any of
+/// them can be the symptom of a swapped `-wal`/`-shm`.
 #[test]
-fn full_io_message_says_moved_when_only_a_companion_was_lost() {
+fn failure_message_says_moved_for_every_class_when_the_db_moved() {
     let (_dir, path) = temp_db();
     let (conn, identity) = open_db(&path);
-    let mut wal = path.as_os_str().to_owned();
-    wal.push("-wal");
-    std::fs::remove_file(&wal).unwrap();
-    let msg = identity.io_failure_message(&conn, &io_err(), &path);
+    std::fs::remove_file(&path).unwrap();
+    for f in every_class(&conn) {
+        let msg = identity.failure_message(&conn, &f, &path, "ctx");
+        assert!(
+            msg.contains("deleted or replaced mid-run") && msg.contains(&format!("{path:?}")),
+            "{:?} must say moved once the DB moved: {msg:?}",
+            f.error()
+        );
+    }
+}
+
+/// A lost `-wal` alone is a confirmed move.
+#[test]
+fn failure_message_says_moved_when_only_a_companion_was_lost() {
+    let (_dir, path) = temp_db();
+    let (conn, identity) = open_db(&path);
+    std::fs::remove_file(companion_path(&path, "-wal")).unwrap();
+    let msg = identity.failure_message(&conn, &io_failure(&conn), &path, "ctx");
+    assert!(msg.contains("deleted or replaced mid-run"), "{msg:?}");
+}
+
+/// The errno is read when the failure is captured, not when the message is
+/// built: a later failure on the same connection (a best-effort ROLLBACK, say)
+/// overwrites `sqlite3_system_errno`, and would otherwise be paired with the
+/// original error.
+#[cfg(unix)]
+#[test]
+fn a_captured_failure_keeps_its_errno_after_a_later_failure_overwrites_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_db_dir, path) = temp_db();
+    let (conn, identity) = open_db(&path);
+    let attach = |target: &std::path::Path| {
+        conn.execute_batch(&format!("ATTACH DATABASE '{}' AS other", target.display()))
+            .expect_err("attach must fail")
+    };
+    // ENOENT: the directory does not exist.
+    let first = Failure::capture(&conn, attach(&dir.path().join("missing").join("x.db")));
+    // ENOTDIR: a regular file where a directory is needed.
+    std::fs::write(dir.path().join("file"), b"").unwrap();
+    let _second = Failure::capture(&conn, attach(&dir.path().join("file").join("x.db")));
+
+    let msg = identity.failure_message(&conn, &first, &path, "ctx");
+
     assert!(
-        msg.as_ref().is_some_and(|m| m.contains("deleted or replaced mid-run")),
-        "got {msg:?}"
+        msg.contains(&format!("system errno: {}", libc::ENOENT)),
+        "the first failure's own errno must survive the second: {msg:?}"
     );
 }
 

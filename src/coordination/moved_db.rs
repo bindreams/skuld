@@ -223,24 +223,62 @@ impl DbIdentity {
         }
     }
 
-    /// For an I/O-class `err`, the message to panic with: the "moved" message
-    /// if [`Self::has_moved`] confirms it right now, else [`io_error_message`],
-    /// so an unrelated I/O failure is not mislabelled as a move. `None` for
-    /// every other error class.
-    pub(super) fn io_failure_message(
+    /// The message to panic with for `failure`, whatever its error class:
+    /// the "moved" message if [`Self::has_moved`] confirms a move right now
+    /// (any class can be a symptom of one: `CANTOPEN`, `READONLY`, `NOTADB`,
+    /// `CORRUPT` from a swapped `-wal`/`-shm`), else `context` at `path`. Both
+    /// name the SQLite error, its extended code and the errno behind it, so an
+    /// unrelated failure (`ENOSPC`, say) is never mislabelled as a move.
+    pub(super) fn failure_message(
         &self,
         conn: &rusqlite::Connection,
-        err: &rusqlite::Error,
+        failure: &Failure,
         path: &Path,
-    ) -> Option<String> {
-        if !is_io_error(err) {
-            return None;
-        }
-        Some(if self.has_moved(conn, path) {
-            format!("skuld coordination DB {path:?} was deleted or replaced mid-run: {err}")
+        context: &str,
+    ) -> String {
+        let detail = failure.detail();
+        if self.has_moved(conn, path) {
+            format!("skuld coordination DB {path:?} was deleted or replaced mid-run: {detail}")
         } else {
-            io_error_message(conn, err, path)
-        })
+            format!("skuld: {context} at {path:?}: {detail}")
+        }
+    }
+}
+
+/// A SQLite error with the OS errno behind it, captured when it happened.
+///
+/// `sqlite3_system_errno` is overwritten by every later `CANTOPEN`/`IOERR`, so
+/// it must be read before anything else (a best-effort `ROLLBACK`, say) runs on
+/// the connection.
+pub(crate) struct Failure {
+    err: rusqlite::Error,
+    errno: Option<i32>,
+}
+
+impl Failure {
+    /// Capture `err` and, for the error classes SQLite records one for, the
+    /// errno. SQLite records none for `SQLITE_FULL` (its errno would be stale),
+    /// so a full disk reports the error alone.
+    pub(crate) fn capture(conn: &rusqlite::Connection, err: rusqlite::Error) -> Self {
+        let records_errno = matches!(
+            err.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::SystemIoFailure)
+        );
+        // Safety: `conn.handle()` is a valid `sqlite3*` while `conn` is borrowed.
+        let errno = records_errno.then(|| unsafe { rusqlite::ffi::sqlite3_system_errno(conn.handle()) });
+        Self { err, errno }
+    }
+
+    pub(crate) fn error(&self) -> &rusqlite::Error {
+        &self.err
+    }
+
+    fn detail(&self) -> String {
+        let extended = self.err.sqlite_extended_error_code();
+        let errno = self
+            .errno
+            .map_or_else(|| "none recorded for this error class".to_owned(), |n| n.to_string());
+        format!("{} (extended code: {extended:?}, system errno: {errno})", self.err)
     }
 }
 
@@ -440,27 +478,4 @@ fn record_main_identity(conn: &rusqlite::Connection, path: &Path) -> FileIdentit
          something retargeted it in the open-to-record window"
     );
     identity
-}
-
-// Messages =====
-
-/// True for SQLite's "system I/O failed" family (`SQLITE_IOERR` and every
-/// extended variant; rusqlite collapses them onto one primary code). A write
-/// against a connection whose `-wal`/`-shm` vanished tends to surface this way
-/// rather than as "moved", but any I/O failure (`ENOSPC` included) takes the
-/// same shape, so this is a reason to check, not evidence of a move.
-fn is_io_error(err: &rusqlite::Error) -> bool {
-    matches!(err.sqlite_error_code(), Some(rusqlite::ErrorCode::SystemIoFailure))
-}
-
-/// `err` reported as-is, naming `path`, SQLite's extended error code and the OS
-/// errno behind it (`sqlite3_system_errno`).
-fn io_error_message(conn: &rusqlite::Connection, err: &rusqlite::Error, path: &Path) -> String {
-    let extended = err.sqlite_extended_error_code();
-    // Safety: `conn.handle()` is a valid `sqlite3*` while `conn` is borrowed.
-    let system_errno = unsafe { rusqlite::ffi::sqlite3_system_errno(conn.handle()) };
-    format!(
-        "skuld: coordination DB I/O error at {path:?}: {err} (extended code: {extended:?}, \
-         system errno: {system_errno})"
-    )
 }
