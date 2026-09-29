@@ -3,8 +3,10 @@
 //! else) turns the test red.
 
 use super::coordination_tests::temp_db;
-use super::moved_db::{has_moved_via_fcntl, DbIdentity, FileIdentity};
-use super::test_hooks::{retry_rendezvous, set_test_after_write_hook, set_test_retry_hook, AfterWriteSite};
+use super::moved_db::{
+    companion_path, has_moved_via_fcntl, open_file_identities, scan_open_file_identities, DbIdentity, FileIdentity,
+};
+use super::test_hooks::{retry_rendezvous, set_test_retry_hook, set_test_seam_hook, Seam};
 use super::{coordinate, open_db, SERIAL_NONE};
 
 /// `dir/link` -> `dir/first`, with `dir/first/.skuld.db` opened through it.
@@ -157,7 +159,7 @@ fn coordinate_fails_loudly_when_the_db_moves_right_after_its_commit() {
     let path2 = path.clone();
     let result = std::thread::spawn(move || {
         let doomed = path2.clone();
-        let _hook = set_test_after_write_hook(AfterWriteSite::Coordinate, move || {
+        let _hook = set_test_seam_hook(Seam::Commit, move || {
             std::fs::remove_file(&doomed).unwrap();
         });
         // Forgotten, not dropped: its own Drop would also panic on the
@@ -176,7 +178,7 @@ fn registration_drop_fails_loudly_when_the_db_moves_right_after_its_delete() {
     let a = coordinate(&path, "a", &[], SERIAL_NONE);
     let path2 = path.clone();
     let result = std::thread::spawn(move || {
-        let _hook = set_test_after_write_hook(AfterWriteSite::Drop, move || {
+        let _hook = set_test_seam_hook(Seam::Delete, move || {
             std::fs::remove_file(&path2).unwrap();
         });
         drop(a);
@@ -223,4 +225,157 @@ fn full_io_message_says_moved_when_only_a_companion_was_lost() {
         msg.as_ref().is_some_and(|m| m.contains("deleted or replaced mid-run")),
         "got {msg:?}"
     );
+}
+
+// Record-time identity =====
+
+/// The panic message of a caught `open_db`-style call that must have panicked.
+fn panic_message<T>(result: std::thread::Result<T>) -> String {
+    let payload = match result {
+        Ok(_) => panic!("expected a panic"),
+        Err(p) => p,
+    };
+    crate::coordination::panic_payload_message(payload.as_ref()).to_owned()
+}
+
+/// A different file renamed over the path after the `SQLITE_FCNTL_HAS_MOVED`
+/// check passed and before the stat it is validated against. Recording the
+/// stat alone would adopt the replacement as this connection's own identity;
+/// the record must reject it instead, before any write.
+#[test]
+fn record_rejects_a_file_swapped_in_between_the_fcntl_check_and_the_stat() {
+    let (dir, path) = temp_db();
+    let other = dir.path().join("other.db");
+    let swap_path = path.clone();
+    let _seam = set_test_seam_hook(Seam::Fcntl, move || {
+        std::fs::write(&other, b"a different file").unwrap();
+        std::fs::rename(&other, &swap_path).unwrap();
+    });
+
+    let msg = panic_message(std::panic::catch_unwind(|| open_db(&path)));
+
+    assert!(
+        msg.contains(&format!("{path:?}")) && msg.contains("open-to-record window"),
+        "the record must reject the swap before schema init writes anything: {msg:?}"
+    );
+}
+
+/// A different file renamed over the path right after the open: SQLite's own
+/// record already disagrees with the path, which `SQLITE_FCNTL_HAS_MOVED` reports.
+#[test]
+fn record_rejects_a_file_swapped_in_right_after_the_open() {
+    let (dir, path) = temp_db();
+    let other = dir.path().join("other.db");
+    let swap_path = path.clone();
+    let _seam = set_test_seam_hook(Seam::Open, move || {
+        std::fs::write(&other, b"a different file").unwrap();
+        std::fs::rename(&other, &swap_path).unwrap();
+    });
+
+    let msg = panic_message(std::panic::catch_unwind(|| open_db(&path)));
+
+    assert!(
+        msg.contains(&format!("{path:?}")) && msg.contains("already reported moved"),
+        "SQLITE_FCNTL_HAS_MOVED must reject the swap at record time: {msg:?}"
+    );
+}
+
+/// A symlink ancestor retargeted right after the open: the connection's file
+/// and what `path` now resolves to disagree, so nothing may be recorded.
+#[test]
+fn record_rejects_an_ancestor_retargeted_right_after_the_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = open_through_symlink(dir.path());
+    let second = dir.path().join("second");
+    std::fs::create_dir(&second).unwrap();
+    std::fs::write(second.join(".skuld.db"), b"a different file").unwrap();
+    let root = dir.path().to_owned();
+    let _seam = set_test_seam_hook(Seam::Open, move || retarget_link(&root, &second));
+
+    let msg = panic_message(std::panic::catch_unwind(|| open_db(&path)));
+
+    assert!(
+        msg.contains(&format!("{path:?}")) && msg.contains("open-to-record window"),
+        "the record must reject the retarget before schema init writes anything: {msg:?}"
+    );
+}
+
+/// SQLite's own path is swapped after the fcntl check passed while the
+/// caller's path, through a retargeted ancestor, still resolves to the original
+/// file (hard-linked). Only the second stat of SQLite's path sees it.
+#[test]
+fn record_rejects_sqlites_own_path_swapped_while_the_callers_path_still_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = open_through_symlink(dir.path());
+    let root = dir.path().to_owned();
+    let _seam = set_test_seam_hook(Seam::Fcntl, move || {
+        let first_db = root.join("first").join(".skuld.db");
+        let second = root.join("second");
+        std::fs::create_dir(&second).unwrap();
+        std::fs::hard_link(&first_db, second.join(".skuld.db")).unwrap();
+        let other = root.join("other.db");
+        std::fs::write(&other, b"a different file").unwrap();
+        std::fs::rename(&other, &first_db).unwrap();
+        retarget_link(&root, &second);
+    });
+
+    let msg = panic_message(std::panic::catch_unwind(|| open_db(&path)));
+
+    assert!(
+        msg.contains(&format!("{path:?}")) && msg.contains("while its identity was being recorded"),
+        "the second stat of SQLite's own path must reject this: {msg:?}"
+    );
+}
+
+/// The `-wal`/`-shm` this connection has open are unlinked after schema init
+/// and recreated by another connection before the companions are recorded.
+/// Recording the path's files would adopt the other connection's; the record
+/// must reject them, because a connection writing to an unlinked WAL while
+/// another uses the new one is the split-brain this crate exists to prevent.
+#[test]
+fn record_rejects_companions_swapped_after_schema_init() {
+    let (_dir, path) = temp_db();
+    let swap_path = path.clone();
+    let _seam = set_test_seam_hook(Seam::SchemaInit, move || {
+        // Replace each companion with a copy on a new inode, the way another
+        // opener recreating it would, while this connection keeps the old ones.
+        for suffix in ["-wal", "-shm"] {
+            let companion = companion_path(&swap_path, suffix);
+            let copy = companion_path(&swap_path, &format!("{suffix}.copy"));
+            std::fs::copy(&companion, &copy).unwrap();
+            std::fs::rename(&copy, &companion).unwrap();
+        }
+    });
+
+    let msg = panic_message(std::panic::catch_unwind(|| open_db(&path)));
+
+    assert!(
+        msg.contains(&format!("{path:?}")) && msg.contains("-wal/-shm"),
+        "the record must reject swapped companions: {msg:?}"
+    );
+}
+
+// Open-file identities =====
+
+/// A file this process holds open is listed, and stops being once closed.
+#[test]
+fn open_file_identities_lists_exactly_the_files_this_process_holds_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::File::create(dir.path().join("f")).unwrap();
+    let id = FileIdentity::of(&dir.path().join("f")).unwrap();
+
+    assert!(open_file_identities().contains(&id), "an open file must be listed");
+    drop(file);
+    assert!(!open_file_identities().contains(&id), "a closed file must not be");
+}
+
+/// The fallback that tries every descriptor agrees with the directory listing
+/// for a file this test holds open.
+#[test]
+fn scanning_descriptors_finds_the_same_open_file_as_the_directory_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    let _file = std::fs::File::create(dir.path().join("f")).unwrap();
+    let id = FileIdentity::of(&dir.path().join("f")).unwrap();
+
+    assert!(scan_open_file_identities(4096).contains(&id));
 }

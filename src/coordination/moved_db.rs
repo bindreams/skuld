@@ -10,15 +10,45 @@
 //! Not detected, by construction: content overwritten in place at the same
 //! path, device and inode looks exactly like this connection's own writes.
 //! "Moved" means "the path now names a different file, or nothing".
+//!
+//! # How the recorded identity is tied to the connection's own files
+//!
+//! Recording `stat(path)` after the open would adopt whatever a retarget or
+//! swap put there in the meantime, and every later check would then agree with
+//! the wrong value. So an identity is never trusted for being what a path
+//! resolved to; it is validated against what this process actually has open:
+//!
+//! - **Windows main file:** SQLite exposes its handle
+//!   (`SQLITE_FCNTL_WIN32_GET_HANDLE`), and the identity is taken from that
+//!   handle, then asserted equal to a fresh resolution of the caller's path.
+//!   The companion paths come from the same handle's final path name, which
+//!   contains no reparse point an ancestor retarget could redirect.
+//! - **Unix main file:** SQLite exposes no fd (`unixFileControl` has no such
+//!   opcode). The main identity is `stat(conn.path())`, bracketed around
+//!   `SQLITE_FCNTL_HAS_MOVED` (stat, fcntl, stat must agree), asserted equal to
+//!   a fresh resolution of the caller's path, and required to be one of the
+//!   files this process holds open ([`open_file_identities`]).
+//! - **`-wal` / `-shm`, both platforms:** SQLite exposes no handle for either.
+//!   On Unix each companion's identity must likewise be one of the files this
+//!   process holds open, so a companion unlinked and recreated by another
+//!   opener before recording is rejected, never adopted. Windows withholds
+//!   `FILE_SHARE_DELETE` on both, so neither can be replaced except through a
+//!   reparse-point ancestor, which the handle-derived path already excludes.
+//!
+//! Residual: a Unix file that some *other* connection in this same process holds
+//! open passes the membership test. Nothing in this crate opens the coordination
+//! database outside `open_db`, which holds the init lock while recording.
+
+use std::path::{Path, PathBuf};
 
 /// A file's identity, following symlinks and reparse points as a fresh
 /// `connect`/`open_db` of the same path would.
 ///
 /// Unix: device + inode (`stat`). Windows: volume serial + 64-bit file index
-/// (`GetFileInformationByHandle` on a *fresh* open of the path). A held handle
-/// would not observe a retargeted ancestor: that changes what a new resolution
-/// reaches, not the file, so `FILE_SHARE_DELETE` being withheld does not cover
-/// it.
+/// (`GetFileInformationByHandle`). Resolving a path fresh, not reusing a held
+/// handle, is what lets it observe a retargeted ancestor: that changes what a
+/// new resolution reaches, not the file, so `FILE_SHARE_DELETE` being
+/// withheld does not cover it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct FileIdentity {
     #[cfg(unix)]
@@ -35,7 +65,7 @@ impl FileIdentity {
     /// `None` means nothing resolvable exists at `path` right now, which is as
     /// much "moved" as a mismatched identity.
     #[cfg(unix)]
-    pub(super) fn of(path: &std::path::Path) -> Option<Self> {
+    pub(super) fn of(path: &Path) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata(path).ok().map(|m| Self {
             dev: m.dev(),
@@ -44,15 +74,21 @@ impl FileIdentity {
     }
 
     #[cfg(windows)]
-    pub(super) fn of(path: &std::path::Path) -> Option<Self> {
+    pub(super) fn of(path: &Path) -> Option<Self> {
         use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
 
         let file = std::fs::File::open(path).ok()?;
-        let handle = windows::Win32::Foundation::HANDLE(file.as_raw_handle());
+        Self::of_handle(windows::Win32::Foundation::HANDLE(file.as_raw_handle()))
+    }
+
+    /// `handle` must be a valid open file handle.
+    #[cfg(windows)]
+    fn of_handle(handle: windows::Win32::Foundation::HANDLE) -> Option<Self> {
+        use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        // Safety: `handle` is valid while `file` lives, which outlives this
-        // call; `&mut info` is a valid out-pointer.
+        // Safety: the caller guarantees `handle` is valid; `&mut info` is a
+        // valid out-pointer.
         unsafe { GetFileInformationByHandle(handle, &mut info) }.ok()?;
         Some(Self {
             volume_serial: info.dwVolumeSerialNumber,
@@ -61,20 +97,33 @@ impl FileIdentity {
     }
 }
 
-/// `-wal` and `-shm` identities. Deleting only a companion leaves the main
-/// file's identity untouched, so the main identity alone cannot catch it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct CompanionIdentities {
-    wal: FileIdentity,
-    shm: FileIdentity,
+/// A companion file and the identity recorded for it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Tracked {
+    path: PathBuf,
+    identity: FileIdentity,
 }
 
-/// `path` with `suffix` appended verbatim (not [`std::path::Path::with_extension`],
-/// which would replace `.skuld.db`'s `db`).
-pub(super) fn companion_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+impl Tracked {
+    fn has_moved(&self) -> bool {
+        FileIdentity::of(&self.path) != Some(self.identity)
+    }
+}
+
+/// `-wal` and `-shm`. Deleting only a companion leaves the main file's
+/// identity untouched, so the main identity alone cannot catch it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) struct Companions {
+    wal: Tracked,
+    shm: Tracked,
+}
+
+/// `path` with `suffix` appended verbatim (not [`Path::with_extension`], which
+/// would replace `.skuld.db`'s `db`).
+pub(super) fn companion_path(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
-    std::path::PathBuf::from(name)
+    PathBuf::from(name)
 }
 
 /// Everything recorded about a connection's files, checked before and after
@@ -84,44 +133,58 @@ pub(super) fn companion_path(path: &std::path::Path, suffix: &str) -> std::path:
 /// do not reliably exist before schema init (SQLite deletes both when the last
 /// connection closes; `PRAGMA journal_mode = WAL` recreates them). Every
 /// later phase (`coordinate`, `TestRegistration`) holds `Some`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct DbIdentity {
     pub(super) main: FileIdentity,
-    pub(super) companions: Option<CompanionIdentities>,
+    pub(super) companions: Option<Companions>,
 }
 
 impl DbIdentity {
     /// Record `conn`'s main-file identity right after a successful open, while
-    /// holding `path`'s init lock.
-    ///
-    /// Derived from `conn.path()` (what SQLite opened), not from a later
-    /// `stat` of `path`, and cross-checked against `path` and the fcntl: any
-    /// disagreement means something moved in the open-to-record window, and
-    /// panics instead of recording a value that would answer "not moved"
-    /// forever.
-    pub(super) fn record_main(conn: &rusqlite::Connection, path: &std::path::Path) -> Self {
-        let main = record_main_identity(conn, path);
-        Self { main, companions: None }
+    /// holding `path`'s init lock. Panics, naming `path`, on any disagreement
+    /// between the connection's own file and what `path` resolves to; see the
+    /// module doc for how each platform ties the identity to the connection.
+    pub(super) fn record_main(conn: &rusqlite::Connection, path: &Path) -> Self {
+        Self {
+            main: record_main_identity(conn, path),
+            companions: None,
+        }
     }
 
-    /// Record `path`'s `-wal`/`-shm` identities. Call after schema init, whose
-    /// `PRAGMA journal_mode = WAL` guarantees both exist, so a missing one is a
-    /// broken precondition. Their inodes are stable while any connection holds
-    /// the database open (checkpoints truncate in place), so one recording
-    /// suffices.
-    pub(super) fn with_companions(self, path: &std::path::Path) -> Self {
-        let missing = |which: &str| -> ! {
-            panic!(
-                "skuld: coordination DB {path:?}'s {which} companion is missing right after schema \
-                 init, where PRAGMA journal_mode=WAL having just run unconditionally should \
-                 guarantee it exists"
-            )
+    /// Record the `-wal`/`-shm` this connection uses. Call after schema init,
+    /// whose `PRAGMA journal_mode = WAL` guarantees both exist, so a missing
+    /// one is a broken precondition. Their inodes are stable while any
+    /// connection holds the database open (checkpoints truncate in place), so
+    /// one recording suffices.
+    pub(super) fn with_companions(self, conn: &rusqlite::Connection, path: &Path) -> Self {
+        let base = companion_base(conn, path);
+        let track = |suffix: &str| -> Tracked {
+            let companion = companion_path(&base, suffix);
+            let identity = FileIdentity::of(&companion).unwrap_or_else(|| {
+                panic!(
+                    "skuld: coordination DB {path:?}'s {suffix} companion is missing right after \
+                     schema init, where PRAGMA journal_mode=WAL having just run unconditionally \
+                     should guarantee it exists"
+                )
+            });
+            #[cfg(unix)]
+            assert!(
+                open_file_identities().contains(&identity),
+                "skuld: coordination DB {path:?}'s {suffix} companion at {companion:?} is not a file \
+                 this process has open — it was replaced between the connection opening it and \
+                 being recorded, so the -wal/-shm files at that path are not the ones this \
+                 connection is using"
+            );
+            Tracked {
+                path: companion,
+                identity,
+            }
         };
-        let wal = FileIdentity::of(&companion_path(path, "-wal")).unwrap_or_else(|| missing("-wal"));
-        let shm = FileIdentity::of(&companion_path(path, "-shm")).unwrap_or_else(|| missing("-shm"));
+        let wal = track("-wal");
+        let shm = track("-shm");
         Self {
             main: self.main,
-            companions: Some(CompanionIdentities { wal, shm }),
+            companions: Some(Companions { wal, shm }),
         }
     }
 
@@ -138,25 +201,23 @@ impl DbIdentity {
     /// fresh identity applies; `winOpen` withholds `FILE_SHARE_DELETE`, so
     /// nothing can delete or rename an open file, and an ancestor retarget
     /// changes what `path` resolves to and is caught by the identity check.
-    pub(super) fn has_moved(&self, conn: &rusqlite::Connection, path: &std::path::Path) -> bool {
+    pub(super) fn has_moved(&self, conn: &rusqlite::Connection, path: &Path) -> bool {
         #[cfg(unix)]
         if has_moved_via_fcntl(conn) {
             return true;
         }
         #[cfg(windows)]
         let _ = conn;
-        if FileIdentity::of(path) != Some(self.main) {
-            return true;
-        }
-        self.companions.is_some_and(|c| {
-            FileIdentity::of(&companion_path(path, "-wal")) != Some(c.wal)
-                || FileIdentity::of(&companion_path(path, "-shm")) != Some(c.shm)
-        })
+        FileIdentity::of(path) != Some(self.main)
+            || self
+                .companions
+                .as_ref()
+                .is_some_and(|c| c.wal.has_moved() || c.shm.has_moved())
     }
 
     /// Panic, naming `path`, if [`Self::has_moved`]. Call immediately before
     /// and after every write through a long-lived connection.
-    pub(super) fn panic_if_moved(&self, conn: &rusqlite::Connection, path: &std::path::Path) {
+    pub(super) fn panic_if_moved(&self, conn: &rusqlite::Connection, path: &Path) {
         if self.has_moved(conn, path) {
             panic!("skuld coordination DB {path:?} was deleted or replaced mid-run");
         }
@@ -170,7 +231,7 @@ impl DbIdentity {
         &self,
         conn: &rusqlite::Connection,
         err: &rusqlite::Error,
-        path: &std::path::Path,
+        path: &Path,
     ) -> Option<String> {
         if !is_io_error(err) {
             return None;
@@ -182,6 +243,26 @@ impl DbIdentity {
         })
     }
 }
+
+/// The path the `-wal`/`-shm` names are appended to: the one SQLite itself
+/// derives them from. Unix: `conn.path()`, SQLite's own resolved filename.
+/// Windows: the main handle's final path name, which contains no reparse point.
+fn companion_base(conn: &rusqlite::Connection, path: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from(
+            conn.path()
+                .unwrap_or_else(|| panic!("skuld: coordination DB connection for {path:?} has no path")),
+        )
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+        final_path(main_handle(conn))
+    }
+}
+
+// Unix =====
 
 /// `SQLITE_FCNTL_HAS_MOVED` alone.
 #[cfg(unix)]
@@ -209,18 +290,149 @@ pub(super) fn has_moved_via_fcntl(conn: &rusqlite::Connection) -> bool {
     has_moved != 0
 }
 
-fn record_main_identity(conn: &rusqlite::Connection, path: &std::path::Path) -> FileIdentity {
-    #[cfg(unix)]
+/// The identity of every file this process currently holds open.
+///
+/// Listed from `/dev/fd` (macOS, the BSDs with `fdescfs`, Linux) or
+/// `/proc/self/fd`; where neither exists, every descriptor up to the
+/// `RLIMIT_NOFILE` soft limit is tried instead.
+#[cfg(unix)]
+pub(super) fn open_file_identities() -> Vec<FileIdentity> {
+    for dir in ["/dev/fd", "/proc/self/fd"] {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            return entries
+                .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+                .filter_map(fd_identity)
+                .collect();
+        }
+    }
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // Safety: `&mut limit` is a valid out-pointer.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    assert_eq!(rc, 0, "skuld: getrlimit(RLIMIT_NOFILE) failed");
+    scan_open_file_identities(i32::try_from(limit.rlim_cur).unwrap_or(i32::MAX))
+}
+
+/// Every descriptor in `0..limit` that is open, by trying each.
+#[cfg(unix)]
+pub(super) fn scan_open_file_identities(limit: i32) -> Vec<FileIdentity> {
+    (0..limit).filter_map(fd_identity).collect()
+}
+
+/// `None` if `fd` is not open.
+#[cfg(unix)]
+fn fd_identity(fd: i32) -> Option<FileIdentity> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // Safety: `st` is a valid out-pointer; `fstat` on a closed fd just fails.
+    if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // Safety: `fstat` succeeded, so it initialised `st`.
+    let st = unsafe { st.assume_init() };
+    // The same widening `std::os::unix::fs::MetadataExt::{dev, ino}` does.
+    #[allow(clippy::unnecessary_cast)]
+    Some(FileIdentity {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+    })
+}
+
+#[cfg(unix)]
+fn record_main_identity(conn: &rusqlite::Connection, path: &Path) -> FileIdentity {
+    let sqlite_path = Path::new(
+        conn.path()
+            .unwrap_or_else(|| panic!("skuld: coordination DB connection for {path:?} has no path")),
+    );
+    // Stat first, then ask SQLite whether its own record still agrees, then stat
+    // again: the fcntl validates that the stat just taken still names the file
+    // SQLite opened, and the second stat that nothing changed around it.
+    let identity = FileIdentity::of(sqlite_path)
+        .unwrap_or_else(|| panic!("skuld: coordination DB {path:?} vanished immediately after being opened"));
     assert!(
         !has_moved_via_fcntl(conn),
         "skuld: coordination DB {path:?} was already reported moved immediately after being \
          opened — something retargeted it in the open-to-record window"
     );
-    let sqlite_path = conn
-        .path()
-        .unwrap_or_else(|| panic!("skuld: coordination DB connection for {path:?} has no path"));
-    let identity = FileIdentity::of(std::path::Path::new(sqlite_path))
-        .unwrap_or_else(|| panic!("skuld: coordination DB {path:?} vanished immediately after being opened"));
+    #[cfg(test)]
+    super::test_hooks::run_seam(super::test_hooks::Seam::Fcntl);
+    assert_eq!(
+        FileIdentity::of(sqlite_path),
+        Some(identity),
+        "skuld: coordination DB {path:?} changed while its identity was being recorded — \
+         something replaced it in the open-to-record window"
+    );
+    assert_eq!(
+        FileIdentity::of(path),
+        Some(identity),
+        "skuld: coordination DB {path:?} disagreed with the connection just opened through it — \
+         something retargeted it in the open-to-record window"
+    );
+    assert!(
+        open_file_identities().contains(&identity),
+        "skuld: coordination DB {path:?} resolves to a file this process does not have open — \
+         something replaced it in the open-to-record window"
+    );
+    identity
+}
+
+// Windows =====
+
+/// The connection's own main-file handle (`SQLITE_FCNTL_WIN32_GET_HANDLE`).
+#[cfg(windows)]
+fn main_handle(conn: &rusqlite::Connection) -> windows::Win32::Foundation::HANDLE {
+    let mut handle = windows::Win32::Foundation::HANDLE::default();
+    let main = c"main";
+    // Safety: `conn.handle()` is a valid `sqlite3*` while `conn` is borrowed;
+    // `main` is NUL-terminated; `&mut handle` is a valid `*mut HANDLE`, which
+    // is what `SQLITE_FCNTL_WIN32_GET_HANDLE` writes through.
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            main.as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
+            (&raw mut handle).cast(),
+        )
+    };
+    assert_eq!(
+        rc,
+        rusqlite::ffi::SQLITE_OK,
+        "skuld: SQLITE_FCNTL_WIN32_GET_HANDLE file-control failed with code {rc}"
+    );
+    handle
+}
+
+/// The final path name of `handle`'s file: symlinks and junctions resolved.
+#[cfg(windows)]
+fn final_path(handle: windows::Win32::Foundation::HANDLE) -> PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED};
+
+    let mut buf = vec![0u16; 512];
+    loop {
+        // Safety: `handle` is valid (it is the connection's own open handle);
+        // `buf` is a valid buffer of the length passed.
+        let n = unsafe { GetFinalPathNameByHandleW(handle, &mut buf, FILE_NAME_NORMALIZED) } as usize;
+        assert!(
+            n != 0,
+            "skuld: GetFinalPathNameByHandleW failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // `n` is the length written, or, when the buffer was too small, the
+        // length needed including the NUL.
+        if n < buf.len() {
+            return PathBuf::from(std::ffi::OsString::from_wide(&buf[..n]));
+        }
+        buf.resize(n, 0);
+    }
+}
+
+#[cfg(windows)]
+fn record_main_identity(conn: &rusqlite::Connection, path: &Path) -> FileIdentity {
+    let identity = FileIdentity::of_handle(main_handle(conn)).unwrap_or_else(|| {
+        panic!("skuld: coordination DB {path:?}: could not read the connection's own file identity")
+    });
     assert_eq!(
         FileIdentity::of(path),
         Some(identity),
@@ -229,6 +441,8 @@ fn record_main_identity(conn: &rusqlite::Connection, path: &std::path::Path) -> 
     );
     identity
 }
+
+// Messages =====
 
 /// True for SQLite's "system I/O failed" family (`SQLITE_IOERR` and every
 /// extended variant; rusqlite collapses them onto one primary code). A write
@@ -241,7 +455,7 @@ fn is_io_error(err: &rusqlite::Error) -> bool {
 
 /// `err` reported as-is, naming `path`, SQLite's extended error code and the OS
 /// errno behind it (`sqlite3_system_errno`).
-fn io_error_message(conn: &rusqlite::Connection, err: &rusqlite::Error, path: &std::path::Path) -> String {
+fn io_error_message(conn: &rusqlite::Connection, err: &rusqlite::Error, path: &Path) -> String {
     let extended = err.sqlite_extended_error_code();
     // Safety: `conn.handle()` is a valid `sqlite3*` while `conn` is borrowed.
     let system_errno = unsafe { rusqlite::ffi::sqlite3_system_errno(conn.handle()) };

@@ -333,9 +333,14 @@ fn path_is_absent(path: &std::path::Path) -> bool {
 pub(crate) fn open_db(path: &std::path::Path) -> (rusqlite::Connection, DbIdentity) {
     lock::with_init_lock(path, |token| {
         let conn = connect_locked(path, token);
+        #[cfg(test)]
+        test_hooks::run_seam(test_hooks::Seam::Open);
         let identity = DbIdentity::record_main(&conn, path);
         ensure_schema_locked(path, &conn, &identity, token);
-        (conn, identity.with_companions(path))
+        #[cfg(test)]
+        test_hooks::run_seam(test_hooks::Seam::SchemaInit);
+        let identity = identity.with_companions(&conn, path);
+        (conn, identity)
     })
 }
 
@@ -1034,7 +1039,7 @@ impl Drop for TestRegistration {
                 )
             });
             #[cfg(test)]
-            test_hooks::run_after_write(test_hooks::AfterWriteSite::Drop);
+            test_hooks::run_seam(test_hooks::Seam::Delete);
             self.identity.panic_if_moved(&self.conn, &self.path);
         };
 
@@ -1166,7 +1171,7 @@ pub(crate) fn coordinate(
                 // own doc). Catching it here, before any of that, is what
                 // makes it a loud failure at the point it happened instead.
                 #[cfg(test)]
-                test_hooks::run_after_write(test_hooks::AfterWriteSite::Coordinate);
+                test_hooks::run_seam(test_hooks::Seam::Commit);
                 identity.panic_if_moved(&conn, db_path);
                 return TestRegistration {
                     conn,

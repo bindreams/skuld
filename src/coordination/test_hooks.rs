@@ -121,47 +121,56 @@ pub(super) fn signal_retry() {
     });
 }
 
-// After-write seam =====
+// Seams =====
 
-/// A write whose post-write moved-DB check a test wants to intercept.
+/// A window immediately after a production step where a test injects a filesystem
+/// change: the one place no contention can open deterministically.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum AfterWriteSite {
+pub(crate) enum Seam {
     /// `coordinate`, right after its COMMIT succeeded.
-    Coordinate,
+    Commit,
     /// `TestRegistration::drop`, right after its DELETE succeeded.
-    Drop,
+    Delete,
+    /// `open_db`, right after the connection opened, before identity is recorded.
+    Open,
+    /// Recording the main identity, between the `SQLITE_FCNTL_HAS_MOVED` check
+    /// and the stat it is validated against.
+    #[cfg(unix)]
+    Fcntl,
+    /// `open_db`, right after schema init, before the companions are recorded.
+    SchemaInit,
 }
 
-type AfterWriteHook = (AfterWriteSite, Box<dyn FnOnce()>);
+type SeamHook = (Seam, Box<dyn FnOnce()>);
 
 thread_local! {
-    static AFTER_WRITE_HOOK: RefCell<Option<AfterWriteHook>> = const { RefCell::new(None) };
+    static SEAM_HOOK: RefCell<Option<SeamHook>> = const { RefCell::new(None) };
 }
 
 /// Clears the calling thread's after-write hook on drop.
 #[must_use = "the hook is removed when this guard drops"]
 #[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) struct AfterWriteHookGuard(());
+pub(crate) struct SeamHookGuard(());
 
-impl Drop for AfterWriteHookGuard {
+impl Drop for SeamHookGuard {
     fn drop(&mut self) {
-        AFTER_WRITE_HOOK.with(|c| *c.borrow_mut() = None);
+        SEAM_HOOK.with(|c| *c.borrow_mut() = None);
     }
 }
 
 /// Run `f` on the calling thread once, at the next `site` write.
 #[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn set_test_after_write_hook(site: AfterWriteSite, f: impl FnOnce() + 'static) -> AfterWriteHookGuard {
-    AFTER_WRITE_HOOK.with(|c| {
+pub(crate) fn set_test_seam_hook(site: Seam, f: impl FnOnce() + 'static) -> SeamHookGuard {
+    SEAM_HOOK.with(|c| {
         let mut slot = c.borrow_mut();
-        debug_assert!(slot.is_none(), "set_test_after_write_hook: already set on this thread");
+        debug_assert!(slot.is_none(), "set_test_seam_hook: already set on this thread");
         *slot = Some((site, Box::new(f)));
     });
-    AfterWriteHookGuard(())
+    SeamHookGuard(())
 }
 
-pub(super) fn run_after_write(site: AfterWriteSite) {
-    let hook = AFTER_WRITE_HOOK.with(|c| {
+pub(super) fn run_seam(site: Seam) {
+    let hook = SEAM_HOOK.with(|c| {
         let mut slot = c.borrow_mut();
         match slot.take() {
             Some((s, f)) if s == site => Some(f),
