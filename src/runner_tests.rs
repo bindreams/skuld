@@ -4,7 +4,9 @@
 //! tested in [`crate::coordination::coordination_tests`]. These tests verify
 //! that the runner correctly wires up coordination for test execution.
 
-use crate::runner::{check_duplicate_trial_names, effective_trial_name, ensure_valid_thread_name, TestRunner};
+use crate::runner::{
+    check_duplicate_trial_names, effective_trial_name, ensure_valid_thread_name, fail_on_violations, TestRunner,
+};
 
 // Trial-name derivation and duplicate detection =====
 
@@ -244,5 +246,32 @@ fn dump_captured_bytes_to_is_a_no_op_when_empty() {
     assert!(
         written.is_empty(),
         "must not write anything when nothing was captured: {written:?}"
+    );
+}
+
+// Coordination failures downgraded during an unwind =====
+
+fn passing_conclusion() -> libtest_mimic::Conclusion {
+    libtest_mimic::Conclusion {
+        num_filtered_out: 0,
+        num_passed: 3,
+        num_failed: 0,
+        num_ignored: 0,
+        num_measured: 0,
+    }
+}
+
+#[test]
+fn a_recorded_violation_fails_an_otherwise_passing_run() {
+    let conclusion = fail_on_violations(passing_conclusion(), vec!["cleanup failed at /db".to_owned()]);
+    assert!(conclusion.has_failed(), "a recorded violation must fail the run");
+    assert_eq!(conclusion.num_failed, 1);
+}
+
+#[test]
+fn no_violations_leave_the_conclusion_untouched() {
+    assert_eq!(
+        fail_on_violations(passing_conclusion(), Vec::new()),
+        passing_conclusion()
     );
 }

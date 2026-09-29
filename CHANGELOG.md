@@ -155,26 +155,30 @@ All notable changes to this project are documented in this file.
     `.skuld.db` publish step entirely (there's no uid-mixing hazard to
     guard against there) but takes the same init lock as every other
     platform, since `open_db`'s WAL negotiation race is cross-platform.
-  - Acquiring the lock is always a single open-then-lock with no retry and
-    no check that the locked handle still matches what's on disk. On Unix,
-    the lock is a directory `flock` taken directly on `.skuld.db`'s parent
-    directory, opened on a read-only fd (which still needs ordinary read
-    permission on the directory, not only search/execute), rather than a
-    separate lock file: an ordinary delete of `.skuld.db` itself can't split
-    the lock, since a non-empty directory can't be `rmdir`'d and nothing in
-    this crate ever removes the directory itself, only files inside it —
-    but wholesale replacement of the directory (rename-and-recreate, or
-    empty-rmdir-recreate) still can, the same accepted risk as deleting
-    `.skuld.db` itself mid-run. Some network filesystems refuse to `flock` a
-    directory at all — NFS's emulated `flock` among them — and skuld panics
-    loudly, naming the path, rather than falling back to a weaker lock. On
-    Windows, the lock is a sibling `.skuld.db.lock` file opened with
-    `FILE_SHARE_READ | FILE_SHARE_WRITE` and no `FILE_SHARE_DELETE`, so
-    Windows itself refuses to delete or rename it while any handle holds
-    it — that guarantee has no gap on Windows. A failure to open the lock
-    target on either platform — a missing parent directory,
-    file-descriptor exhaustion, or anything else — panics immediately,
-    naming the path, rather than retrying.
+  - Acquiring the lock is always a single open-then-lock with no retry. On
+    Unix, the lock is a directory `flock` taken directly on `.skuld.db`'s
+    parent directory, opened on a read-only fd (which still needs ordinary
+    read permission on the directory, not only search/execute), rather than
+    a separate lock file: an ordinary delete of `.skuld.db` itself can't
+    split the lock, since a non-empty directory can't be `rmdir`'d and
+    nothing in this crate ever removes the directory itself, only files
+    inside it — but wholesale replacement of the directory
+    (rename-and-recreate, or empty-rmdir-recreate) still can. Skuld now
+    detects that too: the held lock's own `fstat` identity, recorded at
+    acquisition, is checked against a fresh `stat` of the same path before
+    every schema-init write, so a directory replaced wholesale while the
+    lock is held panics loudly instead of silently losing mutual exclusion
+    (see the next entry below for the matching detection on the DB file
+    itself). Some network filesystems refuse to `flock` a directory at all
+    — NFS's emulated `flock` among them — and skuld panics loudly, naming
+    the path, rather than falling back to a weaker lock. On Windows, the
+    lock is a sibling `.skuld.db.lock` file opened with `FILE_SHARE_READ |
+FILE_SHARE_WRITE` and no `FILE_SHARE_DELETE`, so Windows itself refuses
+    to delete or rename the lock file while any handle holds it. A symlink
+    or junction ancestor of the lock file can still be retargeted, which
+    splits the lock; that split is detected (see the entry below). A failure
+    to open the lock target on either platform — a missing parent directory, file-descriptor exhaustion, or anything
+    else — panics immediately, naming the path, rather than retrying.
   - Only creation needs mode and no-replace-rename support: `ensure_published`
     checks for an existing `.skuld.db` first (`lstat`, so a dangling symlink
     counts as "already there" too, matching the rename's own `EEXIST`
@@ -193,6 +197,52 @@ All notable changes to this project are documented in this file.
     DB file's already-0666 mode, so once `.skuld.db` is published they come
     out 0666 on their own, umask or not — verified under a restrictive
     umask in `tests/coordination_publish_cli.rs`.
+- **A `.skuld.db` deleted, renamed, or replaced while a test run is using
+  it now fails loudly instead of silently corrupting whatever now exists
+  at that path.** Every write through a connection held open across more
+  than one operation (`coordinate()`, the cleanup on drop, and `open_db`'s
+  own schema initialization and migration) checks the connection's file
+  identity before and after, inside every retry loop, and panics naming the
+  path.
+  - The `-wal`/`-shm` companions are tracked too: losing either while the
+    main file is untouched splits the database's state just as a deletion
+    does.
+  - A symlink or junction _ancestor_ of the path being retargeted is
+    detected, on both platforms.
+  - The recorded identity is read from the file descriptors SQLite itself
+    holds open (Unix) or its own handle (Windows), not from a `stat` of the
+    path, so a file swapped in between the open and the recording is
+    rejected instead of adopted, even one on another device with the same
+    inode number.
+  - The coordination DB's init lock is checked for the same split (a
+    replaced profile directory, or a retargeted ancestor of the lock file on
+    Windows).
+  - Not detected: content overwritten _in place_ at the same path, device
+    and inode, which looks like this crate's own writes.
+- **Coordination DB failures now name the path, SQLite's extended error
+  code and the OS errno, instead of relaying SQLite's text alone**, and say
+  "deleted or replaced mid-run" instead when a check at that moment
+  confirms the DB moved. An unrelated failure (`ENOSPC` on a full
+  filesystem, e.g.) is reported as what it is.
+- **A failure while migrating the coordination DB's schema now panics
+  naming the path**, where it previously printed a warning and continued
+  (or read a failed version query as version 0).
+- **A `TestRegistration` cleanup failure while a test is already unwinding
+  now fails the run.** It cannot panic then (a second panic aborts the
+  process), so it is still printed as a warning, but the runner now also
+  counts it as a failure and exits non-zero.
+- **`open_db` no longer blocks for up to 5 seconds inside SQLite's own
+  busy handler before reporting contention as a failure.** Every connection
+  this crate opens disables rusqlite's default `sqlite3_busy_timeout`, and
+  contention during schema initialization is retried until it clears
+  instead of panicking after 5 s.
+- **`TestRegistration::drop`'s cleanup now panics on a failure to
+  unregister a test, where it previously printed a warning and continued.**
+  A failed `DELETE` there means the coordination DB's `running` table can
+  keep a stale row for a test that has already finished, which can block
+  later tests indefinitely on a serialization constraint that no longer
+  reflects reality — worth failing loudly over, not leaving as a warning
+  easy to miss in a large test run's output.
 - **`TestRunner::libtest_names()`**: an opt-in builder method that reports
   each trial under its `<module path minus the crate name>::<test name>`
   instead of the bare test name, matching `cargo test`'s own libtest naming.

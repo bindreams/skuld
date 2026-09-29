@@ -44,7 +44,7 @@ fn with_init_lock_serializes_concurrent_callers() {
             for _ in 0..THREADS {
                 s.spawn(|| {
                     barrier.wait();
-                    with_init_lock(&db_path, || {
+                    with_init_lock(&db_path, |_token| {
                         let now = in_critical_section.fetch_add(1, SeqCst) + 1;
                         max_seen.fetch_max(now, SeqCst);
                         // Give any missing exclusion room to show up: real
@@ -102,7 +102,7 @@ fn with_init_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet()
         for _ in 0..THREADS {
             s.spawn(|| {
                 barrier.wait();
-                with_init_lock(&db_path, || {
+                with_init_lock(&db_path, |_token| {
                     let now = in_critical_section.fetch_add(1, SeqCst) + 1;
                     max_seen.fetch_max(now, SeqCst);
                     in_critical_section.fetch_sub(1, SeqCst);
@@ -132,7 +132,7 @@ fn a_fresh_try_lock_reports_would_block_while_with_init_lock_holds_the_lock() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join(".skuld.db");
 
-    with_init_lock(&db_path, || {
+    with_init_lock(&db_path, |_token| {
         let fresh = open_lock_target(&db_path);
         match try_lock_exclusive(&fresh) {
             Err(std::fs::TryLockError::WouldBlock) => {}
@@ -153,7 +153,7 @@ fn with_init_lock_panics_immediately_when_the_profile_directory_does_not_exist_i
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("nonexistent-subdir").join(".skuld.db");
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| with_init_lock(&db_path, || {})));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| with_init_lock(&db_path, |_token| {})));
 
     assert!(
         result.is_err(),
