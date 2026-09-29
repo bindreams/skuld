@@ -344,6 +344,10 @@ pub(crate) fn open_db(path: &std::path::Path) -> (rusqlite::Connection, DbIdenti
         #[cfg(test)]
         test_hooks::run_seam(test_hooks::Seam::SchemaInit);
         let identity = identity.with_companions(&conn, path);
+        // The window between the last check in `ensure_schema_locked` and here
+        // records the baseline the rest of the connection's life is checked
+        // against; a split landing in it must not become that baseline.
+        panic_on_split_lock(token);
         (conn, identity)
     })
 }

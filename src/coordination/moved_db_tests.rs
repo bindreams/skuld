@@ -507,3 +507,29 @@ fn a_post_commit_panic_unwinds_through_the_registrations_drop() {
         "the registration's Drop must have run during the unwind: {recorded:?}"
     );
 }
+
+/// The split check must also run after the companions are recorded: a
+/// directory replaced wholesale in that window (every file hard-linked so no
+/// identity check trips) would otherwise become the baseline.
+#[test]
+fn open_db_rejects_a_split_landing_after_schema_init() {
+    let outer = tempfile::tempdir().unwrap();
+    let profile = outer.path().join("profile");
+    std::fs::create_dir(&profile).unwrap();
+    let path = profile.join("test-coordination.db");
+    let swap_profile = profile.clone();
+    let root = outer.path().to_owned();
+    let _seam = set_test_seam_hook(Seam::SchemaInit, move || {
+        let aside = root.join("profile-aside");
+        std::fs::rename(&swap_profile, &aside).unwrap();
+        std::fs::create_dir(&swap_profile).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let name = format!("test-coordination.db{suffix}");
+            std::fs::hard_link(aside.join(&name), swap_profile.join(&name)).unwrap();
+        }
+    });
+
+    let msg = panic_message(std::panic::catch_unwind(|| open_db(&path)));
+
+    assert!(msg.contains("was split"), "{msg:?}");
+}
