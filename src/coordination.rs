@@ -9,6 +9,7 @@ mod coordination_tests;
 mod lock;
 #[cfg(test)]
 mod lock_tests;
+mod moved_db;
 #[cfg(all(test, unix))]
 mod moved_db_tests;
 #[cfg(unix)]
@@ -17,6 +18,8 @@ mod publish;
 mod publish_tests;
 
 use crate::label::{Label, LabelFilter};
+
+use moved_db::DbIdentity;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -117,7 +120,7 @@ const SCHEMA_VERSION: i64 = 1;
 /// across more than one operation — [`coordinate`]'s own loop,
 /// [`TestRegistration`]'s cleanup on drop, and [`open_db`]'s own schema
 /// initialization and migration, all the way down to each row a migration
-/// touches — checks [`db_has_moved`] (see [`panic_on_moved_db`])
+/// touches — checks [`DbIdentity::has_moved`] (see [`DbIdentity::panic_if_moved`])
 /// immediately before every write attempt, including every attempt inside
 /// an uncapped retry loop, not just once before entering one, and refuses
 /// to write and panics loudly, naming `path`, the moment that connection's
@@ -314,26 +317,21 @@ fn path_is_absent(path: &std::path::Path) -> bool {
 /// surfaces immediately instead of first blocking inside that internal,
 /// capped handler, and is retried here, uncapped, on the error code alone.
 /// Returns the connection plus the [`DbIdentity`] recorded for it — see
-/// [`record_identity`] (the main file, recorded before schema init) and
-/// [`record_companions`] (`-wal`/`-shm`, recorded after: see its own doc for
+/// [`DbIdentity::record_main`] (the main file, recorded before schema init) and
+/// [`DbIdentity::with_companions`] (`-wal`/`-shm`, recorded after: see its own doc for
 /// why they don't reliably exist before then). Callers that need to keep
 /// checking this connection's identity across more than one later
 /// operation — [`coordinate`], [`TestRegistration`] — use this returned
 /// value directly rather than deriving their own: a *second*, independent
 /// `stat` of `path` done later, even immediately after this call returns,
-/// would reopen exactly the race [`record_identity`]'s own doc explains,
+/// would reopen exactly the race [`DbIdentity::record_main`]'s own doc explains,
 /// just moved to a different call site instead of fixed.
 pub(crate) fn open_db(path: &std::path::Path) -> (rusqlite::Connection, DbIdentity) {
     lock::with_init_lock(path, |token| {
         let conn = connect_locked(path, token);
-        let main = record_identity(&conn, path);
-        ensure_schema_locked(path, &conn, main, token);
-        let identity = DbIdentity {
-            main,
-            #[cfg(unix)]
-            companions: record_companions(path),
-        };
-        (conn, identity)
+        let identity = DbIdentity::record_main(&conn, path);
+        ensure_schema_locked(path, &conn, &identity, token);
+        (conn, identity.with_companions(path))
     })
 }
 
@@ -375,9 +373,9 @@ const INIT_SQL: &str = "PRAGMA journal_mode = WAL;
 /// Idempotent regardless: `CREATE TABLE IF NOT EXISTS` is a same-schema
 /// no-op once any process has run this once (see [`open_db`]'s doc).
 ///
-/// `identity` — [`FileIdentity::of(path)`](FileIdentity::of), recorded by
+/// `identity` — [`DbIdentity`], recorded by
 /// [`open_db`] right after `conn` was opened — is checked (via
-/// [`panic_on_moved_db`]) before every write here, inside
+/// [`DbIdentity::panic_if_moved`]) before every write here, inside
 /// [`retry_busy`]'s retried closure rather than once outside it: this
 /// schema-init write can retry for an uncapped amount of time under
 /// contention, and `.skuld.db` deleted or replaced mid-retry is exactly the
@@ -385,7 +383,7 @@ const INIT_SQL: &str = "PRAGMA journal_mode = WAL;
 fn ensure_schema_locked(
     path: &std::path::Path,
     conn: &rusqlite::Connection,
-    identity: FileIdentity,
+    identity: &DbIdentity,
     init_lock: &lock::InitLockHeld<'_>,
 ) {
     debug_assert_eq!(
@@ -394,12 +392,12 @@ fn ensure_schema_locked(
         "ensure_schema_locked: called with a path different from the one whose init lock is held"
     );
     retry_busy(conn, || {
-        panic_on_moved_db(conn, path, identity);
+        identity.panic_if_moved(conn, path);
         panic_on_split_lock(init_lock);
         conn.execute_batch(INIT_SQL)
     })
     .unwrap_or_else(|e| {
-        if let Some(msg) = moved_db_message_for(conn, &e, path, identity) {
+        if let Some(msg) = identity.io_failure_message(conn, &e, path) {
             panic!("{msg}");
         }
         panic!(
@@ -410,7 +408,7 @@ fn ensure_schema_locked(
     // Defense for the unavoidable window between the last successful write
     // above and this check: a move landing exactly there must still end
     // loud, not slip through because nothing checked again afterward.
-    panic_on_moved_db(conn, path, identity);
+    identity.panic_if_moved(conn, path);
     panic_on_split_lock(init_lock);
     migrate_schema(conn, path, identity);
     panic_on_split_lock(init_lock);
@@ -418,7 +416,7 @@ fn ensure_schema_locked(
 
 /// Panic loudly if `init_lock`'s own target has split (see
 /// [`lock::InitLockHeld::target_has_split`]) — the same "this handle no
-/// longer excludes what a fresh opener would" hazard [`panic_on_moved_db`]
+/// longer excludes what a fresh opener would" hazard [`DbIdentity::panic_if_moved`]
 /// guards against for the DB file itself, applied to the profile directory
 /// the init lock is held on. Checked at the same points as the DB-file
 /// moved check throughout [`ensure_schema_locked`]'s writes: before every
@@ -459,468 +457,6 @@ pub(crate) fn probe_hold_init_lock(path: &std::path::Path, while_held: impl FnOn
 /// can observe contention against the held lock.
 pub(crate) fn probe_try_init_lock(path: &std::path::Path) -> Result<(), std::fs::TryLockError> {
     lock::try_lock_exclusive(&lock::open_lock_target(path))
-}
-
-// Moved-database detection =====
-
-/// A file's identity, following symlinks/reparse points — the same
-/// resolution `stat` (Unix) or opening the path fresh (Windows) performs,
-/// and the same resolution a fresh `connect`/`open_db` call on that path
-/// would follow to reach a file. Skuld's own record, independent of
-/// whatever SQLite's VFS tracks internally (see [`db_has_moved`]'s doc for
-/// why that alone isn't enough): recorded once, right after a successful
-/// open, while still holding `path`'s init lock.
-///
-/// That lock is narrower than it might sound: it only excludes *other
-/// Skuld processes/threads* from creating or publishing at `path` (see
-/// [`lock::with_init_lock`]'s doc) — it says nothing about a symlink or
-/// junction ancestor of `path` being retargeted by something outside Skuld
-/// entirely, which is a real, reachable case on both platforms (confirmed
-/// on Windows by a throwaway CI probe — see [`record_identity`], this
-/// type's only constructor for a live connection's own identity, for how
-/// it's actually made safe against that).
-///
-/// On Unix, device+inode (`stat`). On Windows, volume serial number +
-/// 64-bit file index (`GetFileInformationByHandle` on a *fresh* open of
-/// the path, not the connection's own already-open handle — a held handle,
-/// like a held Unix fd, doesn't observe a later retarget of an ancestor at
-/// all, since the retarget only changes what a *new* path resolution would
-/// reach). `FILE_SHARE_DELETE` being withheld on Windows (see
-/// [`db_has_moved`]'s doc) only rules out the main file *itself* being
-/// deleted or renamed while held open; it does nothing about an ancestor
-/// reparse point, which is a property of the path, not of any open handle
-/// on the file it currently resolves to — this is a real gap
-/// `FILE_SHARE_DELETE` alone cannot close, not a redundant check.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct FileIdentity {
-    #[cfg(unix)]
-    dev: u64,
-    #[cfg(unix)]
-    ino: u64,
-    #[cfg(windows)]
-    volume_serial: u32,
-    #[cfg(windows)]
-    file_index: u64,
-}
-
-impl FileIdentity {
-    /// `None` means nothing this crate can resolve exists at `path` right
-    /// now — that's as much "moved" as a mismatched identity is (see
-    /// [`db_has_moved`]'s use of this).
-    #[cfg(unix)]
-    fn of(path: &std::path::Path) -> Option<Self> {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).ok().map(|m| Self {
-            dev: m.dev(),
-            ino: m.ino(),
-        })
-    }
-
-    /// A fresh `CreateFileW`-equivalent open (via `std::fs::File::open`,
-    /// which follows reparse points, same as SQLite's own `winOpen` and
-    /// Unix's `stat`), not the connection's own handle — see this type's
-    /// own doc for why that distinction is what makes this catch an
-    /// ancestor retarget at all.
-    #[cfg(windows)]
-    fn of(path: &std::path::Path) -> Option<Self> {
-        use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
-
-        let file = std::fs::File::open(path).ok()?;
-        let handle = windows::Win32::Foundation::HANDLE(file.as_raw_handle());
-        let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        // Safety: `handle` is a valid, currently-open handle for as long as
-        // `file` is alive, which outlives this call; `&mut info` is a valid
-        // `*mut BY_HANDLE_FILE_INFORMATION` for the call to write into.
-        unsafe { GetFileInformationByHandle(handle, &mut info) }.ok()?;
-        Some(Self {
-            volume_serial: info.dwVolumeSerialNumber,
-            file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-        })
-    }
-}
-
-/// True once `conn`'s underlying main database file has been deleted,
-/// renamed, or replaced since `recorded` was captured for `path` (see
-/// [`FileIdentity::of`]) — two independent checks, both must pass for this
-/// to answer `false`.
-///
-/// On Unix, the first is `SQLITE_FCNTL_HAS_MOVED`, which compares the
-/// file's current identity against the one *SQLite itself* recorded at open
-/// time by re-`stat`ing the exact path string it was opened with. That
-/// path-string re-stat is also this check's blind spot: it only ever
-/// re-resolves the literal string SQLite recorded, not `path` as this
-/// crate's own caller understands it — a symlink *ancestor* of `path`
-/// retargeted after open (`registration_drop_fails_loudly_when_a_parent_symlink_is_retargeted_mid_run`-shaped:
-/// e.g. a per-run `link -> real1` swapped to `link -> real2` mid-run)
-/// changes what `path` now means without SQLite's own re-stat necessarily
-/// observing it, and the inode-only comparison SQLite does (`sqlite3.c`'s
-/// `fileHasMoved`, comparing only `st_ino`) also never checks
-/// *device* — two files on different filesystems can share an inode
-/// number, a false-negative "not moved" on setups spanning multiple
-/// devices/mounts. The second, independent check closes both: a fresh
-/// `FileIdentity::of(path)`, comparing dev *and* ino against `recorded`.
-/// Either check answering "moved" is enough — this crate does not need both
-/// to agree, only needs to not miss a real one.
-///
-/// What neither check can ever catch, by construction, not a bug: content
-/// overwritten *in place* at the same path, same device, same inode (e.g.
-/// `cp other.db .skuld.db`, or any write that doesn't change the file's
-/// identity) is indistinguishable from this connection's own ordinary
-/// writes without fingerprinting the content itself, which neither check
-/// attempts. "Moved" here means exactly "the path now names a different
-/// file, or nothing" — not "the file changed."
-///
-/// On Windows, SQLite's VFS (`winFileControl`) has no case for
-/// `SQLITE_FCNTL_HAS_MOVED` at all and always answers `SQLITE_NOTFOUND` —
-/// confirmed against the `bundled` `sqlite3.c` this crate compiles, and
-/// empirically by CI (windows/arm64 failed every coordination test with
-/// that exact code once this check started running unconditionally). So on
-/// Windows this function skips the file-control call entirely and relies
-/// on `FileIdentity` alone — which, on Windows, is *not* redundant with
-/// `winOpen`'s withheld `FILE_SHARE_DELETE`: that share mode rules out the
-/// main file *itself* being deleted or renamed while any connection
-/// (ours) holds it open, so the file a held-open connection is writing to
-/// is provably the same *file* it opened
-/// (`windows_open_db_file_blocks_delete_and_rename_while_held` exercises
-/// this directly; if a future SQLite/rusqlite ever changes the share
-/// mode, that test — not a corrupted database — catches it) — but it says
-/// nothing about a symlink or junction *ancestor* of `path` being
-/// retargeted, which changes what the *path* resolves to without
-/// touching the file itself at all. A throwaway CI probe confirmed this
-/// gap is real before `FileIdentity` got a real Windows implementation:
-/// `TestRegistration::drop` succeeded silently after exactly this
-/// retarget.
-///
-/// A single, fast, synchronous file-control call plus one `stat` on Unix;
-/// a fresh handle open plus one `GetFileInformationByHandle` call on
-/// Windows — no blocking, so checking this before every write costs
-/// nothing worth avoiding it for.
-fn db_has_moved(conn: &rusqlite::Connection, path: &std::path::Path, recorded: FileIdentity) -> bool {
-    #[cfg(unix)]
-    if has_moved_via_fcntl(conn) {
-        return true;
-    }
-    FileIdentity::of(path) != Some(recorded)
-}
-
-/// `SQLITE_FCNTL_HAS_MOVED` alone — the first of [`db_has_moved`]'s two
-/// checks, split out so [`record_identity`] can also use it, at record
-/// time, independent of the [`FileIdentity`] comparison it's cross-checking
-/// against.
-#[cfg(unix)]
-fn has_moved_via_fcntl(conn: &rusqlite::Connection) -> bool {
-    let mut has_moved: std::os::raw::c_int = 0;
-    let main = c"main";
-    // Safety: `conn.handle()` is a valid, currently-open `sqlite3*` for as
-    // long as `conn` is borrowed, which outlives this call; `main` is a
-    // NUL-terminated C string naming the (only) attached database Skuld
-    // ever uses; `&mut has_moved` is a valid `*mut c_int` for SQLite to
-    // write its 0-or-1 answer into, matching what `SQLITE_FCNTL_HAS_MOVED`
-    // documents it expects.
-    let rc = unsafe {
-        rusqlite::ffi::sqlite3_file_control(
-            conn.handle(),
-            main.as_ptr(),
-            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
-            (&raw mut has_moved).cast(),
-        )
-    };
-    assert_eq!(
-        rc,
-        rusqlite::ffi::SQLITE_OK,
-        "skuld: SQLITE_FCNTL_HAS_MOVED file-control failed with code {rc} — this unix SQLite VFS \
-         was expected to implement it, which means Skuld can no longer tell a moved database \
-         apart from a live one and must not be trusted to keep writing"
-    );
-    has_moved != 0
-}
-
-/// Record `conn`'s main-file identity, right after a successful open, while
-/// still holding `path`'s init lock.
-///
-/// **Not** derived from a fresh `stat` of `path` — deriving it from
-/// `conn.path()` instead (the path string SQLite itself recorded
-/// synchronously as part of the open that just completed) is the whole
-/// point: a `stat` of `path` done independently, as a *separate* syscall
-/// after the open, has no connection to what `conn` actually opened, and a
-/// symlink ancestor retargeted in the gap between [`connect_locked`]'s open
-/// and this call landing would silently record the *new* target's identity
-/// as if it were this connection's own — with `db_has_moved` then agreeing
-/// "not moved" against that wrong value for the rest of the connection's
-/// life, since both the fcntl check (against SQLite's own, separately
-/// recorded identity) and a fresh comparison against this wrong one would
-/// keep passing.
-///
-/// The init lock held here does not rule this out by itself: it only
-/// excludes *other Skuld processes/threads* from publishing at `path` — it
-/// says nothing about a symlink ancestor of `path` being retargeted by
-/// something outside Skuld entirely, which is exactly the case above.
-///
-/// So this cross-checks instead of merely trusting `conn.path()`: if
-/// [`has_moved_via_fcntl`] already disagrees, or a fresh
-/// [`FileIdentity::of`] of the caller's own `path` (what every later
-/// [`db_has_moved`] call keeps checking against) doesn't match the
-/// identity derived from `conn.path()`, something has already moved in the
-/// open-to-record window — panics immediately, naming `path`, rather than
-/// silently recording a value that would report "not moved" forever
-/// regardless of what actually happened.
-fn record_identity(conn: &rusqlite::Connection, path: &std::path::Path) -> FileIdentity {
-    #[cfg(unix)]
-    {
-        assert!(
-            !has_moved_via_fcntl(conn),
-            "skuld: coordination DB {path:?} was already reported moved immediately after being \
-             opened — something retargeted it in the open-to-record window"
-        );
-        let sqlite_path = conn
-            .path()
-            .unwrap_or_else(|| panic!("skuld: coordination DB connection for {path:?} has no path"));
-        let identity = FileIdentity::of(std::path::Path::new(sqlite_path))
-            .unwrap_or_else(|| panic!("skuld: coordination DB {path:?} vanished immediately after being opened"));
-        assert_eq!(
-            FileIdentity::of(path),
-            Some(identity),
-            "skuld: coordination DB {path:?} disagreed with the connection just opened through \
-             it — something retargeted it in the open-to-record window"
-        );
-        identity
-    }
-    #[cfg(windows)]
-    {
-        // No `SQLITE_FCNTL_HAS_MOVED` equivalent to cross-check against on
-        // Windows (see `db_has_moved`'s doc) — but the same open-to-record
-        // race `record_identity`'s own doc describes for Unix is just as
-        // real here, so this still cross-checks against the connection's
-        // own resolved path rather than merely trusting a single `stat` of
-        // the caller's `path`.
-        let sqlite_path = conn
-            .path()
-            .unwrap_or_else(|| panic!("skuld: coordination DB connection for {path:?} has no path"));
-        let identity = FileIdentity::of(std::path::Path::new(sqlite_path))
-            .unwrap_or_else(|| panic!("skuld: coordination DB {path:?} vanished immediately after being opened"));
-        assert_eq!(
-            FileIdentity::of(path),
-            Some(identity),
-            "skuld: coordination DB {path:?} disagreed with the connection just opened through \
-             it — something retargeted it in the open-to-record window"
-        );
-        identity
-    }
-}
-
-/// `-wal`/`-shm` companions' identities, unix-only — see [`DbIdentity`]'s
-/// doc for why Windows needs neither.
-#[cfg(unix)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct CompanionIdentities {
-    wal: FileIdentity,
-    shm: FileIdentity,
-}
-
-/// `path` with `suffix` appended verbatim to the filename (not
-/// [`std::path::Path::with_extension`], which would replace `.skuld.db`'s
-/// existing `db` extension instead of appending) — `-wal`/`-shm` name
-/// their main file's `-wal`/`-shm` companions exactly this way.
-#[cfg(unix)]
-fn companion_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    std::path::PathBuf::from(name)
-}
-
-/// Record `path`'s `-wal`/`-shm` companions' identities, called by
-/// [`open_db`] right after [`ensure_schema_locked`] completes — not
-/// before, and not merely from opening the connection: a database whose
-/// only prior connection already closed has *neither* file (SQLite deletes
-/// both when the last connection to a database closes —
-/// `crate::probe::probe_coordination_connect`'s own doc already relies on
-/// this), and gets them back only once something re-touches WAL mode.
-/// `ensure_schema_locked`'s `INIT_SQL` runs `PRAGMA journal_mode = WAL`
-/// unconditionally, every `open_db` call, so by the time it returns both
-/// companions are guaranteed to exist — verified empirically (a fresh
-/// connection re-running that exact idempotent PRAGMA, even against a
-/// database whose table already existed, recreated both files) — so their
-/// absence here is a broken precondition, not a normal state to tolerate,
-/// and panics.
-///
-/// Stability once recorded — verified empirically, on both Linux and
-/// macOS, before relying on it — is what makes this the same one-time
-/// recording that [`record_identity`] does for the main file, not
-/// something that needs re-establishing on every check: `-wal`/`-shm` keep
-/// their inode for as long as *any* connection (this one included) keeps
-/// the database open, across checkpoints of every mode (`PASSIVE`, `FULL`,
-/// `RESTART`, `TRUNCATE` — `TRUNCATE` resets the file's *size*, not its
-/// identity), `journal_size_limit`, thousands of ordinary
-/// one-transaction-per-commit writes (this crate's own usage pattern), and
-/// a second, independent connection concurrently writing and checkpointing
-/// the same database. SQLite truncates and rewrites both files in place;
-/// it does not unlink and recreate them while any connection holds the
-/// database open. No case was found where it legitimately does otherwise —
-/// if one is ever found, that is a reason to revisit this function, not a
-/// case to paper over here.
-#[cfg(unix)]
-fn record_companions(path: &std::path::Path) -> CompanionIdentities {
-    let wal = FileIdentity::of(&companion_path(path, "-wal")).unwrap_or_else(|| {
-        panic!(
-            "skuld: coordination DB {path:?}'s -wal companion is missing right after schema \
-             init, where PRAGMA journal_mode=WAL having just run unconditionally should \
-             guarantee it exists"
-        )
-    });
-    let shm = FileIdentity::of(&companion_path(path, "-shm")).unwrap_or_else(|| {
-        panic!(
-            "skuld: coordination DB {path:?}'s -shm companion is missing right after schema \
-             init, where PRAGMA journal_mode=WAL having just run unconditionally should \
-             guarantee it exists"
-        )
-    });
-    CompanionIdentities { wal, shm }
-}
-
-/// Everything [`open_db`] records to keep checking a connection's identity
-/// against for the rest of its life: the main file (see
-/// [`record_identity`]) plus, on Unix, its `-wal`/`-shm` companions (see
-/// [`record_companions`]) — deleting only a companion leaves the main
-/// file's own identity untouched, so [`FileIdentity`] alone has nothing to
-/// catch for that case.
-///
-/// No companion tracking on Windows: SQLite's Windows VFS opens every file
-/// it touches — `-wal`/`-shm` included, through the same `winOpen` — with
-/// the same withheld `FILE_SHARE_DELETE` [`db_has_moved`]'s own doc
-/// explains for the main file, so nothing on Windows can delete or rename
-/// either companion out from under a connection that holds the database
-/// open either. An ancestor retarget affecting them is already covered
-/// transitively: it changes what the main file's own path resolves to
-/// too, which the main file's own (real, on Windows too) [`FileIdentity`]
-/// check catches on its own.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct DbIdentity {
-    main: FileIdentity,
-    #[cfg(unix)]
-    companions: CompanionIdentities,
-}
-
-/// [`db_has_moved`], extended to also check `identity`'s `-wal`/`-shm`
-/// companions (see [`DbIdentity`]) — call this (via
-/// [`panic_on_moved_db_full`]) everywhere past [`open_db`]'s own schema
-/// init, where companions are established: [`coordinate`]'s loop,
-/// [`TestRegistration`]'s cleanup. `ensure_schema_locked`,
-/// `migrate_schema`, and `scrub_serial_filters_v1` keep using
-/// [`db_has_moved`] directly, with just the main file's [`FileIdentity`]:
-/// companions aren't established yet during schema init (see
-/// [`record_companions`]'s doc), and there is nothing companion-related to
-/// protect during that phase.
-fn db_or_companions_have_moved(conn: &rusqlite::Connection, path: &std::path::Path, identity: &DbIdentity) -> bool {
-    if db_has_moved(conn, path, identity.main) {
-        return true;
-    }
-    #[cfg(unix)]
-    {
-        FileIdentity::of(&companion_path(path, "-wal")) != Some(identity.companions.wal)
-            || FileIdentity::of(&companion_path(path, "-shm")) != Some(identity.companions.shm)
-    }
-    #[cfg(windows)]
-    false
-}
-
-/// Panic loudly, naming `path`, if `conn`'s database has moved (see
-/// [`db_has_moved`]) — call this immediately before any write through a
-/// connection [`open_db`]'s own schema initialization and migration has
-/// held open across more than one operation, so a `.skuld.db` deleted or
-/// replaced mid-run is caught here instead of corrupting whatever now
-/// exists at `path`. Main file only — see [`panic_on_moved_db_full`] for
-/// the companion-aware version used past schema init.
-fn panic_on_moved_db(conn: &rusqlite::Connection, path: &std::path::Path, recorded: FileIdentity) {
-    if db_has_moved(conn, path, recorded) {
-        panic!("skuld coordination DB {path:?} was deleted or replaced mid-run");
-    }
-}
-
-/// [`panic_on_moved_db`], extended to also check `identity`'s `-wal`/`-shm`
-/// companions (see [`db_or_companions_have_moved`]) — call this
-/// everywhere past [`open_db`]'s own schema init: [`coordinate`]'s loop,
-/// [`TestRegistration`]'s cleanup.
-fn panic_on_moved_db_full(conn: &rusqlite::Connection, path: &std::path::Path, identity: &DbIdentity) {
-    if db_or_companions_have_moved(conn, path, identity) {
-        panic!("skuld coordination DB {path:?} was deleted or replaced mid-run");
-    }
-}
-
-/// True for SQLite's broad "system I/O failed" family (`SQLITE_IOERR` and
-/// every extended variant, e.g. `SQLITE_IOERR_SHORT_READ` — rusqlite
-/// collapses all of them onto the one primary-code variant this matches).
-/// A write against a connection whose `-wal`/`-shm` companion vanished out
-/// from under it — deleted without touching the main file's own identity,
-/// so [`db_has_moved`] alone has nothing to catch — tends to surface
-/// exactly this way instead: SQLite discovers the missing companion
-/// mid-operation and reports it as an opaque I/O failure, not as "moved."
-/// But *any* I/O failure takes this same opaque shape, `ENOSPC` on a full
-/// filesystem included — this alone is not evidence of a move, only a
-/// reason to check (see [`moved_db_message_for`]/[`moved_db_message_for_full`]).
-fn is_io_error(err: &rusqlite::Error) -> bool {
-    matches!(err.sqlite_error_code(), Some(rusqlite::ErrorCode::SystemIoFailure))
-}
-
-/// The message to panic with for an I/O-class error (see [`is_io_error`])
-/// that isn't a confirmed move: `err` reported as-is, naming `path`,
-/// SQLite's own extended error code, and the OS errno behind it
-/// (`sqlite3_system_errno`) — deliberately *not* the "moved" message,
-/// since nothing here confirmed that.
-fn io_error_message(conn: &rusqlite::Connection, err: &rusqlite::Error, path: &std::path::Path) -> String {
-    let extended = err.sqlite_extended_error_code();
-    // Safety: `conn.handle()` is a valid, currently-open `sqlite3*` for as
-    // long as `conn` is borrowed.
-    let system_errno = unsafe { rusqlite::ffi::sqlite3_system_errno(conn.handle()) };
-    format!(
-        "skuld: coordination DB I/O error at {path:?}: {err} (extended code: {extended:?}, \
-         system errno: {system_errno})"
-    )
-}
-
-/// If `err` is I/O-class (see [`is_io_error`]), the message to panic with —
-/// re-checking, at this exact moment, whether the DB has actually moved
-/// (main file only; call this during schema init, before companions are
-/// established — see [`moved_db_message_for_full`] for the companion-aware
-/// version used past that) and picking accordingly: the same clear "was
-/// deleted or replaced mid-run" message every other moved-DB detection
-/// uses if [`db_has_moved`] confirms it right now, or [`io_error_message`]
-/// if not — an I/O error with no such confirmation must not be mislabelled
-/// as a move. `None` for every non-I/O-class error: this is deliberately
-/// narrow, not a blanket reinterpretation of arbitrary SQLite failures.
-fn moved_db_message_for(
-    conn: &rusqlite::Connection,
-    err: &rusqlite::Error,
-    path: &std::path::Path,
-    recorded: FileIdentity,
-) -> Option<String> {
-    if !is_io_error(err) {
-        return None;
-    }
-    Some(if db_has_moved(conn, path, recorded) {
-        format!("skuld coordination DB {path:?} was deleted or replaced mid-run: {err}")
-    } else {
-        io_error_message(conn, err, path)
-    })
-}
-
-/// [`moved_db_message_for`], extended to also check `identity`'s
-/// `-wal`/`-shm` companions (see [`db_or_companions_have_moved`]) — call
-/// this everywhere past [`open_db`]'s own schema init.
-fn moved_db_message_for_full(
-    conn: &rusqlite::Connection,
-    err: &rusqlite::Error,
-    path: &std::path::Path,
-    identity: &DbIdentity,
-) -> Option<String> {
-    if !is_io_error(err) {
-        return None;
-    }
-    Some(if db_or_companions_have_moved(conn, path, identity) {
-        format!("skuld coordination DB {path:?} was deleted or replaced mid-run: {err}")
-    } else {
-        io_error_message(conn, err, path)
-    })
 }
 
 // Transient error classification =====
@@ -1168,13 +704,13 @@ fn run_test_after_write_hook(site: AfterWriteSite) {
 ///
 /// `identity` — see [`ensure_schema_locked`]'s doc, its only caller, for
 /// where this comes from and why every write step below checks it (via
-/// [`panic_on_moved_db`]) immediately before running, not just once on
+/// [`DbIdentity::panic_if_moved`]) immediately before running, not just once on
 /// entry: this function's two `retry_busy` calls can each retry for an
 /// uncapped amount of time, and every other write here — the scrub, the
 /// version bump, the commit — still runs after them, so a move landing at
 /// any point along the way must still be caught before the next write
 /// trusts a connection that's no longer pointed at `path`.
-fn migrate_schema(conn: &rusqlite::Connection, path: &std::path::Path, identity: FileIdentity) {
+fn migrate_schema(conn: &rusqlite::Connection, path: &std::path::Path, identity: &DbIdentity) {
     // The read below is wrapped in `retry_busy` not because a concurrent
     // `BEGIN EXCLUSIVE` elsewhere would block it — in WAL mode a plain read
     // like this one doesn't contend with another connection's write lock at
@@ -1190,11 +726,11 @@ fn migrate_schema(conn: &rusqlite::Connection, path: &std::path::Path, identity:
     // contending connection alone — so this path relies on code review
     // rather than a regression test.)
     let current: i64 = retry_busy(conn, || {
-        panic_on_moved_db(conn, path, identity);
+        identity.panic_if_moved(conn, path);
         conn.query_row("PRAGMA user_version", [], |row| row.get(0))
     })
     .unwrap_or(0);
-    panic_on_moved_db(conn, path, identity);
+    identity.panic_if_moved(conn, path);
     if current >= SCHEMA_VERSION {
         return;
     }
@@ -1206,16 +742,16 @@ fn migrate_schema(conn: &rusqlite::Connection, path: &std::path::Path, identity:
     // rusqlite's default `busy_timeout` (disabled in `connect_locked`) to
     // paper over it with a capped internal wait.
     if let Err(e) = retry_busy(conn, || {
-        panic_on_moved_db(conn, path, identity);
+        identity.panic_if_moved(conn, path);
         conn.execute_batch("BEGIN IMMEDIATE")
     }) {
-        if let Some(msg) = moved_db_message_for(conn, &e, path, identity) {
+        if let Some(msg) = identity.io_failure_message(conn, &e, path) {
             panic!("{msg}");
         }
         eprintln!("[skuld] warning: failed to acquire migration lock: {e}");
         return;
     }
-    panic_on_moved_db(conn, path, identity);
+    identity.panic_if_moved(conn, path);
     // Re-check inside the transaction in case another process beat us to it.
     let inside_tx: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap_or(0);
     if inside_tx >= SCHEMA_VERSION {
@@ -1223,18 +759,18 @@ fn migrate_schema(conn: &rusqlite::Connection, path: &std::path::Path, identity:
         return;
     }
     if current < 1 {
-        panic_on_moved_db(conn, path, identity);
+        identity.panic_if_moved(conn, path);
         scrub_serial_filters_v1(conn, path, identity);
     }
-    panic_on_moved_db(conn, path, identity);
+    identity.panic_if_moved(conn, path);
     if let Err(e) = conn.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), []) {
         eprintln!("[skuld] warning: failed to bump schema version: {e}");
     }
-    panic_on_moved_db(conn, path, identity);
+    identity.panic_if_moved(conn, path);
     if let Err(e) = conn.execute_batch("COMMIT") {
         eprintln!("[skuld] warning: failed to commit schema migration: {e}");
     }
-    panic_on_moved_db(conn, path, identity);
+    identity.panic_if_moved(conn, path);
 }
 
 /// Migration v0 → v1: rewrite every `serial_filter` to its canonical Display
@@ -1245,11 +781,11 @@ fn migrate_schema(conn: &rusqlite::Connection, path: &std::path::Path, identity:
 /// removes them later.
 ///
 /// `identity` — see [`migrate_schema`]'s doc: checked (via
-/// [`panic_on_moved_db`]) before each row's `UPDATE`, since this can loop
+/// [`DbIdentity::panic_if_moved`]) before each row's `UPDATE`, since this can loop
 /// over an arbitrary number of rows and a move landing partway through must
 /// still be caught before the next one trusts a connection that's no
 /// longer pointed at `path`.
-fn scrub_serial_filters_v1(conn: &rusqlite::Connection, path: &std::path::Path, identity: FileIdentity) {
+fn scrub_serial_filters_v1(conn: &rusqlite::Connection, path: &std::path::Path, identity: &DbIdentity) {
     let mut stmt =
         match conn.prepare("SELECT id, instance_id, serial_filter FROM running WHERE serial_filter NOT IN ('', ?1)") {
             Ok(s) => s,
@@ -1282,12 +818,12 @@ fn scrub_serial_filters_v1(conn: &rusqlite::Connection, path: &std::path::Path, 
                     filter.to_string()
                 };
                 if canonical != raw {
-                    panic_on_moved_db(conn, path, identity);
+                    identity.panic_if_moved(conn, path);
                     if let Err(e) = conn.execute(
                         "UPDATE running SET serial_filter = ?1 WHERE id = ?2",
                         rusqlite::params![canonical, id],
                     ) {
-                        if let Some(msg) = moved_db_message_for(conn, &e, path, identity) {
+                        if let Some(msg) = identity.io_failure_message(conn, &e, path) {
                             panic!("{msg}");
                         }
                         eprintln!("[skuld] warning: schema scrub: update id={id} failed: {e}");
@@ -1559,7 +1095,7 @@ fn register(
 /// and any write at all risks corrupting whatever now lives at the path (a
 /// recreated file's `-wal`/`-shm`, identified by path rather than inode,
 /// getting mixed with this connection's own writes). So `Drop` checks
-/// [`panic_on_moved_db_full`] before every `DELETE` attempt — inside the
+/// [`DbIdentity::panic_if_moved`] before every `DELETE` attempt — inside the
 /// retry loop, not just once outside it, and once more after — and
 /// refuses to write once that's true, panicking loudly instead — Skuld
 /// fails a mid-run `.skuld.db` deletion, it does not silently work around
@@ -1610,11 +1146,11 @@ impl Drop for TestRegistration {
         // loud, not slip through unnoticed.
         let cleanup = || {
             retry_busy(&self.conn, || {
-                panic_on_moved_db_full(&self.conn, &self.path, &self.identity);
+                self.identity.panic_if_moved(&self.conn, &self.path);
                 self.conn.execute("DELETE FROM running WHERE id = ?1", [self.id])
             })
             .unwrap_or_else(|e| {
-                if let Some(msg) = moved_db_message_for_full(&self.conn, &e, &self.path, &self.identity) {
+                if let Some(msg) = self.identity.io_failure_message(&self.conn, &e, &self.path) {
                     panic!("{msg}");
                 }
                 panic!(
@@ -1624,7 +1160,7 @@ impl Drop for TestRegistration {
             });
             #[cfg(test)]
             run_test_after_write_hook(AfterWriteSite::Drop);
-            panic_on_moved_db_full(&self.conn, &self.path, &self.identity);
+            self.identity.panic_if_moved(&self.conn, &self.path);
         };
 
         // `cleanup` can panic on a non-retryable DB error. Ordinarily that
@@ -1728,7 +1264,7 @@ pub(crate) fn coordinate(
         // contention, and `.skuld.db` deleted or replaced mid-retry is just
         // as real a hazard as one deleted before `coordinate` was ever
         // called.
-        panic_on_moved_db_full(&conn, db_path, &identity);
+        identity.panic_if_moved(&conn, db_path);
 
         let txn = || -> Result<Option<i64>, rusqlite::Error> {
             conn.execute_batch("BEGIN EXCLUSIVE")?;
@@ -1756,7 +1292,7 @@ pub(crate) fn coordinate(
                 // makes it a loud failure at the point it happened instead.
                 #[cfg(test)]
                 run_test_after_write_hook(AfterWriteSite::Coordinate);
-                panic_on_moved_db_full(&conn, db_path, &identity);
+                identity.panic_if_moved(&conn, db_path);
                 return TestRegistration {
                     conn,
                     id,
@@ -1816,7 +1352,7 @@ pub(crate) fn coordinate(
                 // companions) rather than assumed from the error's shape
                 // alone, so a genuine I/O error (e.g. `ENOSPC`) still
                 // reports as what it actually is.
-                if let Some(msg) = moved_db_message_for_full(&conn, &e, db_path, &identity) {
+                if let Some(msg) = identity.io_failure_message(&conn, &e, db_path) {
                     panic!("{msg}");
                 }
                 panic!("skuld: coordination DB error: {e}");

@@ -840,7 +840,7 @@ fn moved_db_message_reports_a_system_io_failure_as_is_when_the_db_has_not_moved(
         },
         Some("disk I/O error".to_string()),
     );
-    let msg = super::moved_db_message_for(&conn, &io_err, &path, identity.main);
+    let msg = identity.io_failure_message(&conn, &io_err, &path);
     assert!(
         msg.as_ref().is_some_and(|m| !m.contains("deleted or replaced mid-run")
             && m.contains("I/O error")
@@ -866,7 +866,7 @@ fn moved_db_message_reports_the_clear_moved_message_when_the_db_has_actually_mov
         },
         Some("disk I/O error".to_string()),
     );
-    let msg = super::moved_db_message_for(&conn, &io_err, &path, identity.main);
+    let msg = identity.io_failure_message(&conn, &io_err, &path);
     assert!(
         msg.as_ref().is_some_and(|m| m.contains("deleted or replaced mid-run")),
         "once the DB has actually moved, an I/O-failure-class error must get the clear moved \
@@ -888,7 +888,7 @@ fn moved_db_message_does_not_reclassify_unrelated_errors() {
         None,
     );
     assert!(
-        super::moved_db_message_for(&conn, &busy_err, &path, identity.main).is_none(),
+        identity.io_failure_message(&conn, &busy_err, &path).is_none(),
         "moved_db_message_for must be narrow — only the I/O-failure shape, not every SQLite error"
     );
 }
@@ -912,7 +912,7 @@ fn db_has_moved_detects_a_fresh_file_renamed_over_the_path_while_a_connection_is
     std::fs::rename(&other_path, &path).unwrap();
 
     assert!(
-        super::db_has_moved(&conn, &path, identity.main),
+        identity.has_moved(&conn, &path),
         "db_has_moved must detect a fresh file renamed over path while conn is still open"
     );
 }

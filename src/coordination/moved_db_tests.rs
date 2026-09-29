@@ -3,9 +3,8 @@
 //! else) turns the test red.
 
 use super::coordination_tests::temp_db;
-use super::{
-    coordinate, open_db, set_test_after_write_hook, set_test_retry_hook, AfterWriteSite, FileIdentity, SERIAL_NONE,
-};
+use super::moved_db::{has_moved_via_fcntl, DbIdentity, FileIdentity};
+use super::{coordinate, open_db, set_test_after_write_hook, set_test_retry_hook, AfterWriteSite, SERIAL_NONE};
 
 /// `dir/link` -> `dir/first`, with `dir/first/.skuld.db` opened through it.
 /// Returns the symlink-routed path.
@@ -31,6 +30,11 @@ fn db_has_moved_is_caught_by_the_sqlite_fcntl_alone() {
     let dir = tempfile::tempdir().unwrap();
     let path = open_through_symlink(dir.path());
     let (conn, identity) = open_db(&path);
+    // Main file only: the companions are not what this test isolates.
+    let identity = DbIdentity {
+        companions: None,
+        ..identity
+    };
 
     let second = dir.path().join("second");
     std::fs::create_dir(&second).unwrap();
@@ -47,7 +51,7 @@ fn db_has_moved_is_caught_by_the_sqlite_fcntl_alone() {
         "precondition: the caller's path still resolves to the original inode"
     );
     assert!(
-        super::db_has_moved(&conn, &path, identity.main),
+        identity.has_moved(&conn, &path),
         "SQLITE_FCNTL_HAS_MOVED must report the file at SQLite's own resolved path as replaced"
     );
 }
@@ -60,6 +64,11 @@ fn db_has_moved_is_caught_by_the_file_identity_alone() {
     let dir = tempfile::tempdir().unwrap();
     let path = open_through_symlink(dir.path());
     let (conn, identity) = open_db(&path);
+    // Main file only: the companions are not what this test isolates.
+    let identity = DbIdentity {
+        companions: None,
+        ..identity
+    };
 
     let second = dir.path().join("second");
     std::fs::create_dir(&second).unwrap();
@@ -67,11 +76,11 @@ fn db_has_moved_is_caught_by_the_file_identity_alone() {
     retarget_link(dir.path(), &second);
 
     assert!(
-        !super::has_moved_via_fcntl(&conn),
+        !has_moved_via_fcntl(&conn),
         "precondition: SQLite's own resolved path is untouched"
     );
     assert!(
-        super::db_has_moved(&conn, &path, identity.main),
+        identity.has_moved(&conn, &path),
         "the FileIdentity comparison must catch a retargeted symlink ancestor"
     );
 }
@@ -185,7 +194,7 @@ fn io_err() -> rusqlite::Error {
 fn full_io_message_is_reported_as_is_when_nothing_moved() {
     let (_dir, path) = temp_db();
     let (conn, identity) = open_db(&path);
-    let msg = super::moved_db_message_for_full(&conn, &io_err(), &path, &identity);
+    let msg = identity.io_failure_message(&conn, &io_err(), &path);
     assert!(
         msg.as_ref().is_some_and(|m| !m.contains("deleted or replaced mid-run")
             && m.contains(path.to_str().unwrap())
@@ -203,7 +212,7 @@ fn full_io_message_says_moved_when_only_a_companion_was_lost() {
     let mut wal = path.as_os_str().to_owned();
     wal.push("-wal");
     std::fs::remove_file(&wal).unwrap();
-    let msg = super::moved_db_message_for_full(&conn, &io_err(), &path, &identity);
+    let msg = identity.io_failure_message(&conn, &io_err(), &path);
     assert!(
         msg.as_ref().is_some_and(|m| m.contains("deleted or replaced mid-run")),
         "got {msg:?}"
