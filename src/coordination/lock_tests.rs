@@ -20,7 +20,7 @@ fn lock_path_appends_dot_lock_to_the_full_db_path_verbatim() {
 
 /// `with_init_lock` must be a *mutual exclusion* primitive, not just "don't
 /// panic under concurrency": many threads race to enter the same critical
-/// section at once, lined up on a `Barrier` so they all arrive together —
+/// section at once, lined up on a `rendezvous` so they all arrive together —
 /// maximizing the chance a missing exclusion would show up — and each
 /// checks, via an atomic counter rather than a sleep-widened window, that
 /// it is ever the *only* thread inside. A single overlap anywhere across
