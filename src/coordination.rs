@@ -1184,15 +1184,21 @@ pub(crate) fn coordinate(
 
         match txn() {
             Ok(Some(id)) => {
-                #[cfg(test)]
-                test_hooks::run_seam(test_hooks::Seam::Commit);
-                identity.panic_if_moved(&conn, db_path);
-                return TestRegistration {
+                // The guard exists before the post-COMMIT check, so a panic
+                // there unwinds through its `Drop` (whose own refusal is
+                // recorded, see `violations`) instead of abandoning the row.
+                let registration = TestRegistration {
                     conn,
                     id,
                     path: db_path.to_path_buf(),
                     identity,
                 };
+                #[cfg(test)]
+                test_hooks::run_seam(test_hooks::Seam::Commit);
+                registration
+                    .identity
+                    .panic_if_moved(&registration.conn, &registration.path);
+                return registration;
             }
             Ok(None) => {
                 if !logged_first_wait {

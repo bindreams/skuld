@@ -481,3 +481,29 @@ fn scanning_descriptors_finds_the_same_open_file_as_the_directory_listing() {
 
     assert!(scan_open_file_identities(4096).contains(&id));
 }
+
+// Failures during an unwind =====
+
+/// `coordinate` panics after its COMMIT when the DB moved. The registration
+/// must already exist then, so unwinding runs its `Drop` (which refuses to
+/// write and records that) instead of abandoning the row unnoticed.
+#[test]
+fn a_post_commit_panic_unwinds_through_the_registrations_drop() {
+    let (_dir, path) = temp_db();
+    let path2 = path.clone();
+    let result = std::thread::spawn(move || {
+        let doomed = path2.clone();
+        let _hook = set_test_seam_hook(Seam::Commit, move || std::fs::remove_file(&doomed).unwrap());
+        coordinate(&path2, "a", &[], SERIAL_NONE)
+    })
+    .join();
+
+    assert!(result.is_err());
+    let recorded = crate::coordination::violations::recorded();
+    assert!(
+        recorded
+            .iter()
+            .any(|m| m.contains(&format!("{path:?}")) && m.contains("deleted or replaced mid-run")),
+        "the registration's Drop must have run during the unwind: {recorded:?}"
+    );
+}
