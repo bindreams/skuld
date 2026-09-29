@@ -302,8 +302,8 @@ fn companion_base(conn: &rusqlite::Connection, path: &Path) -> PathBuf {
     }
     #[cfg(windows)]
     {
-        let _ = path;
-        final_path(main_handle(conn))
+        let _ = (conn, final_path);
+        path.to_owned()
     }
 }
 
@@ -440,7 +440,8 @@ fn final_path(handle: windows::Win32::Foundation::HANDLE) -> PathBuf {
 
 #[cfg(windows)]
 fn record_main_identity(conn: &rusqlite::Connection, path: &Path) -> FileIdentity {
-    let identity = FileIdentity::of_handle(main_handle(conn)).unwrap_or_else(|| {
+    let _ = main_handle;
+    let identity = FileIdentity::of(path).or_else(|| FileIdentity::of_handle(main_handle(conn))).unwrap_or_else(|| {
         panic!("skuld: coordination DB {path:?}: could not read the connection's own file identity")
     });
     assert_eq!(

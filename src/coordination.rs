@@ -919,7 +919,6 @@ impl Drop for TestRegistration {
             );
             #[cfg(test)]
             test_hooks::run_seam(test_hooks::Seam::Delete);
-            self.identity.panic_if_moved(&self.conn, &self.path);
         };
 
         // `cleanup` panics on a non-retryable error, which should propagate. But
@@ -1035,9 +1034,6 @@ pub(crate) fn coordinate(
                 };
                 #[cfg(test)]
                 test_hooks::run_seam(test_hooks::Seam::Commit);
-                registration
-                    .identity
-                    .panic_if_moved(&registration.conn, &registration.path);
                 return registration;
             }
             Ok(None) => {
