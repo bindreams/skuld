@@ -4,9 +4,8 @@ use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::Barrier;
 use std::time::Duration;
 
-use crate::coordination::{
-    can_start, coordinate, is_retryable, open_db, register, set_test_retry_hook, SERIAL_ALL, SERIAL_NONE,
-};
+use crate::coordination::test_hooks::{retry_rendezvous, set_test_retry_hook};
+use crate::coordination::{can_start, coordinate, is_retryable, open_db, register, SERIAL_ALL, SERIAL_NONE};
 use crate::label::Label;
 
 /// Hard-link `path` and its `-wal`/`-shm` companions to `<path's
@@ -40,6 +39,15 @@ fn companion_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     name.push(suffix);
     std::path::PathBuf::from(name)
 }
+
+/// Retries a `*_with_no_retry_cap` test lets its worker make against a lock
+/// that stays held, before releasing it. Each is one signal from the worker's
+/// own retry arm, so the count is exact, not inferred from elapsed time. Eight
+/// exceeds any small fixed cap (the usual "retry a few times" shape) and runs
+/// past the 10 ms to 200 ms backoff's doubling phase (10, 20, 40, 80, 160) onto
+/// its 200 ms plateau. No finite count proves "uncapped"; this rules out every
+/// cap below it.
+const NO_CAP_RETRIES: usize = 8;
 
 /// Create a temporary database for testing.
 pub(super) fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -451,22 +459,22 @@ fn registration_drop_fails_loudly_when_the_db_moves_mid_retry() {
     let (foreign_conn, _identity) = open_db(&path);
     foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (worker, retry) = retry_rendezvous();
     let dropper = std::thread::spawn(move || {
-        set_test_retry_hook(tx);
+        let _hook = set_test_retry_hook(worker);
         drop(a);
     });
     // Wait until the dropper has genuinely entered retry_busy's loop at
     // least once — an actual signal from the retry site itself, not a
     // fixed sleep standing in for one.
-    rx.recv()
-        .expect("dropper never retried — test setup is broken, not the fix");
+    retry.wait_for_retry();
 
     // Move the DB out from under the dropper while it's still blocked
     // retrying, then release the foreign lock so the retry can proceed.
     std::fs::remove_file(&path).unwrap();
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
+    retry.release();
 
     let result = dropper.join();
     assert!(
@@ -521,18 +529,18 @@ fn open_db_schema_init_fails_loudly_when_the_db_moves_mid_retry() {
 
     let witness = hard_link_db_and_companions(&path, "witness");
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (worker, retry) = retry_rendezvous();
     let path2 = path.clone();
     let opener = std::thread::spawn(move || {
-        set_test_retry_hook(tx);
+        let _hook = set_test_retry_hook(worker);
         open_db(&path2);
     });
-    rx.recv()
-        .expect("open_db never retried — test setup is broken, not the fix");
+    retry.wait_for_retry();
 
     std::fs::remove_file(&path).unwrap();
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
+    retry.release();
 
     let result = opener.join();
     assert!(
@@ -584,14 +592,13 @@ fn open_db_fails_loudly_when_the_profile_directory_is_replaced_wholesale_mid_ret
         .execute_batch("PRAGMA journal_mode=WAL; BEGIN EXCLUSIVE")
         .unwrap();
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (worker, retry) = retry_rendezvous();
     let path2 = path.clone();
     let opener = std::thread::spawn(move || {
-        set_test_retry_hook(tx);
+        let _hook = set_test_retry_hook(worker);
         open_db(&path2);
     });
-    rx.recv()
-        .expect("open_db never retried — test setup is broken, not the fix");
+    retry.wait_for_retry();
 
     // Replace the profile directory wholesale — rename aside, `mkdir` a
     // fresh one at the same path — while `opener`'s init lock is held and
@@ -602,6 +609,7 @@ fn open_db_fails_loudly_when_the_profile_directory_is_replaced_wholesale_mid_ret
 
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
+    retry.release();
 
     let result = opener.join();
     assert!(
@@ -693,18 +701,18 @@ fn coordinate_fails_loudly_when_the_db_moves_mid_retry() {
 
     let witness = hard_link_db_and_companions(&path, "witness");
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (worker, retry) = retry_rendezvous();
     let path2 = path.clone();
     let waiter = std::thread::spawn(move || {
-        set_test_retry_hook(tx);
+        let _hook = set_test_retry_hook(worker);
         coordinate(&path2, "waiter", &[], SERIAL_NONE)
     });
-    rx.recv()
-        .expect("coordinate never retried — test setup is broken, not the fix");
+    retry.wait_for_retry();
 
     std::fs::remove_file(&path).unwrap();
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
+    retry.release();
 
     let result = waiter.join();
     assert!(
@@ -1084,10 +1092,10 @@ fn open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap()
     let foreign_conn = rusqlite::Connection::open(&path).unwrap();
     foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (worker, retry) = retry_rendezvous();
     let waiter_path = path.clone();
     let waiter = std::thread::spawn(move || {
-        set_test_retry_hook(tx);
+        let _hook = set_test_retry_hook(worker);
         let (conn, _identity) = open_db(&waiter_path);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM running", [], |r| r.get(0))
@@ -1095,11 +1103,12 @@ fn open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap()
         count
     });
 
-    rx.recv()
-        .expect("waiter thread exited without ever hitting a retryable busy error");
+    retry.pass_retries(NO_CAP_RETRIES);
+    retry.wait_for_retry();
 
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
+    retry.release();
 
     let count = waiter
         .join()
@@ -1132,17 +1141,18 @@ fn registration_drop_deletes_past_a_concurrent_held_exclusive_lock_with_no_retry
     let (foreign_conn, _identity) = open_db(&path);
     foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (worker, retry) = retry_rendezvous();
     let dropper = std::thread::spawn(move || {
-        set_test_retry_hook(tx);
+        let _hook = set_test_retry_hook(worker);
         drop(reg);
     });
 
-    rx.recv()
-        .expect("dropper thread exited without ever hitting a retryable busy error");
+    retry.pass_retries(NO_CAP_RETRIES);
+    retry.wait_for_retry();
 
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
+    retry.release();
 
     dropper
         .join()
@@ -1201,18 +1211,19 @@ fn coordinate_retries_a_busy_begin_exclusive_with_no_retry_cap() {
     let (foreign_conn, _identity) = open_db(&path);
     foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (worker, retry) = retry_rendezvous();
     let waiter_path = path.clone();
     let waiter = std::thread::spawn(move || {
-        set_test_retry_hook(tx);
+        let _hook = set_test_retry_hook(worker);
         coordinate(&waiter_path, "busy_retry_test", &[], SERIAL_NONE)
     });
 
-    rx.recv()
-        .expect("coordinate thread exited without ever hitting a retryable busy error");
+    retry.pass_retries(NO_CAP_RETRIES);
+    retry.wait_for_retry();
 
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
+    retry.release();
 
     let _reg = waiter
         .join()
@@ -1376,18 +1387,19 @@ fn migrate_schema_completes_past_a_foreign_held_exclusive_lock_with_no_retry_cap
     let foreign_conn = rusqlite::Connection::open(&path).unwrap();
     foreign_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (worker, retry) = retry_rendezvous();
     let waiter_path = path.clone();
     let waiter = std::thread::spawn(move || {
-        set_test_retry_hook(tx);
+        let _hook = set_test_retry_hook(worker);
         open_db(&waiter_path);
     });
 
-    rx.recv()
-        .expect("waiter thread exited without ever hitting a retryable busy error");
+    retry.pass_retries(NO_CAP_RETRIES);
+    retry.wait_for_retry();
 
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
+    retry.release();
 
     waiter
         .join()

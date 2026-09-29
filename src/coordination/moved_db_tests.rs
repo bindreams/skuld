@@ -4,7 +4,8 @@
 
 use super::coordination_tests::temp_db;
 use super::moved_db::{has_moved_via_fcntl, DbIdentity, FileIdentity};
-use super::{coordinate, open_db, set_test_after_write_hook, set_test_retry_hook, AfterWriteSite, SERIAL_NONE};
+use super::test_hooks::{retry_rendezvous, set_test_after_write_hook, set_test_retry_hook, AfterWriteSite};
+use super::{coordinate, open_db, SERIAL_NONE};
 
 /// `dir/link` -> `dir/first`, with `dir/first/.skuld.db` opened through it.
 /// Returns the symlink-routed path.
@@ -101,14 +102,13 @@ fn open_db_schema_write_is_stopped_by_a_split_lock_alone() {
         .execute_batch("PRAGMA journal_mode=WAL; BEGIN EXCLUSIVE")
         .unwrap();
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (worker, retry) = retry_rendezvous();
     let path2 = path.clone();
     let opener = std::thread::spawn(move || {
-        set_test_retry_hook(tx);
+        let _hook = set_test_retry_hook(worker);
         open_db(&path2);
     });
-    rx.recv()
-        .expect("open_db never retried — test setup is broken, not the fix");
+    retry.wait_for_retry();
 
     let aside = outer.path().join("profile-aside");
     std::fs::rename(&profile, &aside).unwrap();
@@ -117,6 +117,7 @@ fn open_db_schema_write_is_stopped_by_a_split_lock_alone() {
 
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
+    retry.release();
 
     assert!(
         opener.join().is_err(),
@@ -137,6 +138,17 @@ fn open_db_schema_write_is_stopped_by_a_split_lock_alone() {
     );
 }
 
+/// The joined thread panicked with the moved-DB message naming `path`, not for
+/// an unrelated reason (a hook's own `unwrap`, another check, another bug).
+fn assert_moved_panic(result: std::thread::Result<()>, path: &std::path::Path) {
+    let payload = result.expect_err("the thread must have panicked");
+    let msg = crate::coordination::panic_payload_message(payload.as_ref());
+    assert!(
+        msg.contains(&format!("{path:?}")) && msg.contains("deleted or replaced mid-run"),
+        "the panic must be the moved-DB message naming {path:?}: {msg:?}"
+    );
+}
+
 /// A move landing after `coordinate`'s COMMIT succeeded must still end loud,
 /// not hand back a registration in an orphaned file.
 #[test]
@@ -145,7 +157,7 @@ fn coordinate_fails_loudly_when_the_db_moves_right_after_its_commit() {
     let path2 = path.clone();
     let result = std::thread::spawn(move || {
         let doomed = path2.clone();
-        set_test_after_write_hook(AfterWriteSite::Coordinate, move || {
+        let _hook = set_test_after_write_hook(AfterWriteSite::Coordinate, move || {
             std::fs::remove_file(&doomed).unwrap();
         });
         // Forgotten, not dropped: its own Drop would also panic on the
@@ -153,10 +165,7 @@ fn coordinate_fails_loudly_when_the_db_moves_right_after_its_commit() {
         std::mem::forget(coordinate(&path2, "a", &[], SERIAL_NONE));
     })
     .join();
-    assert!(
-        result.is_err(),
-        "coordinate must panic when the DB moved between its COMMIT and its return"
-    );
+    assert_moved_panic(result, &path);
 }
 
 /// Same for `TestRegistration::drop`: a move landing after the DELETE
@@ -167,16 +176,13 @@ fn registration_drop_fails_loudly_when_the_db_moves_right_after_its_delete() {
     let a = coordinate(&path, "a", &[], SERIAL_NONE);
     let path2 = path.clone();
     let result = std::thread::spawn(move || {
-        set_test_after_write_hook(AfterWriteSite::Drop, move || {
+        let _hook = set_test_after_write_hook(AfterWriteSite::Drop, move || {
             std::fs::remove_file(&path2).unwrap();
         });
         drop(a);
     })
     .join();
-    assert!(
-        result.is_err(),
-        "drop must panic when the DB moved between its DELETE and its return"
-    );
+    assert_moved_panic(result, &path);
 }
 
 fn io_err() -> rusqlite::Error {

@@ -16,6 +16,10 @@ mod moved_db_tests;
 mod publish;
 #[cfg(all(test, unix))]
 mod publish_tests;
+#[cfg(test)]
+mod test_hooks;
+#[cfg(test)]
+mod test_hooks_tests;
 
 use crate::label::{Label, LabelFilter};
 
@@ -531,7 +535,7 @@ fn retry_busy<T>(
                     "retry_busy: conn must still be in autocommit mode on a retry — see this function's doc"
                 );
                 #[cfg(test)]
-                signal_test_retry_hook();
+                test_hooks::signal_retry();
                 // Emitted on every retry, not just the first: deduplicating
                 // repeated identical lines is a log handler's job, not this
                 // loop's — collapsing them here would mean carrying state
@@ -563,135 +567,6 @@ fn retry_busy<T>(
                 return other;
             }
         }
-    }
-}
-
-/// Signal [`retry_busy`]'s (or [`coordinate`]'s own retry arm's)
-/// thread-scoped test hook, if the calling thread has activated one via
-/// [`set_test_retry_hook`]. A no-op everywhere else. See [`TEST_RETRY_HOOK`]'s
-/// doc for why this is thread-scoped rather than a process-wide counter.
-#[cfg(test)]
-fn signal_test_retry_hook() {
-    TEST_RETRY_HOOK.with(|c| {
-        if let Some(tx) = c.borrow().as_ref() {
-            // Unbounded channel: never blocks. Dropped receiver (test already
-            // gave up / moved on) just means the send is discarded.
-            let _ = tx.send(());
-        }
-    });
-}
-
-// Test-only, *thread-scoped* retry hook: not a process-wide counter like
-// `lock::EINTR_RETRIES`, because `retry_busy` (and `coordinate`'s own retry
-// arm) isn't only reachable from the one call a test deliberately drives
-// into contention — `retry_busy` also runs inside every `TestRegistration`'s
-// cleanup on drop, for every test in this binary, and libtest runs those
-// concurrently on their own threads by default. A process-wide signal would
-// let an unrelated, concurrently-running test's own incidental contention
-// wake this one up, so a test waiting on it could stop and release its own
-// held lock before its *own* call under test ever actually retried — passing
-// without ever exercising what it claims to. A thread-local avoids that:
-// only the thread that calls `set_test_retry_hook` receives anything on the
-// channel it was given, so a test's own dedicated thread (spawned solely to
-// make the one call under test) can never observe another test's unrelated
-// retries, no matter how many other tests are running concurrently in the
-// same process.
-//
-// An `mpsc::Sender`, not a counter: a test blocks on the paired `Receiver`'s
-// `recv()` — no spin loop, no CPU burned waiting — and `recv()` itself
-// becomes the failure signal, not just the success one: it returns `Err`
-// the moment every `Sender` (here, the one moved whole into the worker
-// thread's closure via `set_test_retry_hook`, never cloned) is dropped
-// without ever sending. That happens on ordinary return from the closure,
-// and on a panic too: `std::thread::spawn`'s own wrapper catches the
-// unwinding panic (to convert it into the `Err` a `JoinHandle::join()`
-// reports) before the thread actually exits, and thread-local destructors —
-// this `Sender` included — run as part of that exit, strictly after the
-// catch, not "during" the unwind itself.
-//
-// That only covers the worker *exiting* without ever retrying: `recv()`
-// fails outright if the worker exits without retrying, but a worker that's
-// merely blocked — stuck retrying forever against a condition that never
-// resolves, or hung on something unrelated, without ever exiting — holds
-// `tx` open the whole time, and `recv()` waits right along with it. A test
-// hung that way has no bound from this mechanism; the CI job's own runner
-// timeout is the only backstop left, same as it always was for a thread
-// that simply never finishes.
-#[cfg(test)]
-thread_local! {
-    static TEST_RETRY_HOOK: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Activate `tx` as [`retry_busy`]'s (and [`coordinate`]'s) retry signal for
-/// the *calling thread only* — see [`TEST_RETRY_HOOK`]'s doc. Meant to be the
-/// first thing a freshly spawned, single-purpose test thread does, before
-/// making the one call it exists to drive into contention: such a thread is
-/// always discarded (joined, never reused for anything else) once that call
-/// returns, so there is nothing to deactivate afterward — the thread exiting
-/// drops `tx` on its own. Panics (via `debug_assert!`) if called twice on the
-/// same thread without an intervening thread exit: every real test spawns a
-/// fresh, single-purpose thread for this, so a non-empty slot here means a
-/// test is reusing a thread or activating two hooks at once — a test bug
-/// this exists to catch, not a scenario to silently overwrite.
-#[cfg(test)]
-pub(crate) fn set_test_retry_hook(tx: std::sync::mpsc::Sender<()>) {
-    TEST_RETRY_HOOK.with(|c| {
-        let mut slot = c.borrow_mut();
-        debug_assert!(
-            slot.is_none(),
-            "set_test_retry_hook: called twice on the same thread without an intervening exit"
-        );
-        *slot = Some(tx);
-    });
-}
-
-// Test-only, thread-scoped seam for the one window no contention can open
-// deterministically: between a write's success and the post-write moved-DB
-// check that follows it. Same discipline as `TEST_RETRY_HOOK` — a
-// single-purpose test thread installs it, and only that thread ever runs it.
-#[cfg(test)]
-#[cfg_attr(not(unix), allow(dead_code))]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum AfterWriteSite {
-    /// `coordinate`, right after its COMMIT succeeded.
-    Coordinate,
-    /// `TestRegistration::drop`, right after its DELETE succeeded.
-    Drop,
-}
-
-#[cfg(test)]
-type AfterWriteHook = (AfterWriteSite, Box<dyn FnOnce()>);
-
-#[cfg(test)]
-thread_local! {
-    static TEST_AFTER_WRITE_HOOK: std::cell::RefCell<Option<AfterWriteHook>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Run `f` on the calling thread once, at the next `site` write.
-#[cfg(test)]
-#[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn set_test_after_write_hook(site: AfterWriteSite, f: impl FnOnce() + 'static) {
-    TEST_AFTER_WRITE_HOOK.with(|c| {
-        let mut slot = c.borrow_mut();
-        debug_assert!(slot.is_none(), "set_test_after_write_hook: already set on this thread");
-        *slot = Some((site, Box::new(f)));
-    });
-}
-
-#[cfg(test)]
-fn run_test_after_write_hook(site: AfterWriteSite) {
-    let hook = TEST_AFTER_WRITE_HOOK.with(|c| {
-        let mut slot = c.borrow_mut();
-        match slot.take() {
-            Some((s, f)) if s == site => Some(f),
-            other => {
-                *slot = other;
-                None
-            }
-        }
-    });
-    if let Some(f) = hook {
-        f();
     }
 }
 
@@ -1159,7 +1034,7 @@ impl Drop for TestRegistration {
                 )
             });
             #[cfg(test)]
-            run_test_after_write_hook(AfterWriteSite::Drop);
+            test_hooks::run_after_write(test_hooks::AfterWriteSite::Drop);
             self.identity.panic_if_moved(&self.conn, &self.path);
         };
 
@@ -1215,7 +1090,7 @@ fn downgraded_warning_message(payload: &Box<dyn std::any::Any + Send>) -> String
 /// warning path above. Panics are conventionally `&'static str` (from
 /// `panic!("literal")`) or `String` (from `panic!("{}", ...)` and friends);
 /// anything else prints as a fixed placeholder rather than guessing.
-fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+pub(crate) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
     if let Some(s) = payload.downcast_ref::<&str>() {
         s
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -1291,7 +1166,7 @@ pub(crate) fn coordinate(
                 // own doc). Catching it here, before any of that, is what
                 // makes it a loud failure at the point it happened instead.
                 #[cfg(test)]
-                run_test_after_write_hook(AfterWriteSite::Coordinate);
+                test_hooks::run_after_write(test_hooks::AfterWriteSite::Coordinate);
                 identity.panic_if_moved(&conn, db_path);
                 return TestRegistration {
                     conn,
@@ -1327,7 +1202,7 @@ pub(crate) fn coordinate(
                 // and re-runs the whole `BEGIN EXCLUSIVE` transaction on each
                 // pass rather than just retrying a single statement.
                 #[cfg(test)]
-                signal_test_retry_hook();
+                test_hooks::signal_retry();
                 skuld_debug_eprintln!(
                     "coordination: {name} is retrying a transient busy error against {:?} — \
                      uncapped, so if this never resolves, something is holding a lock on that \
