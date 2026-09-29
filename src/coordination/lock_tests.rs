@@ -20,7 +20,7 @@ fn lock_path_appends_dot_lock_to_the_full_db_path_verbatim() {
 
 /// `with_init_lock` must be a *mutual exclusion* primitive, not just "don't
 /// panic under concurrency": many threads race to enter the same critical
-/// section at once, lined up on a `rendezvous` so they all arrive together —
+/// section at once, lined up on a rendezvous so they all arrive together —
 /// maximizing the chance a missing exclusion would show up — and each
 /// checks, via an atomic counter rather than a sleep-widened window, that
 /// it is ever the *only* thread inside. A single overlap anywhere across
@@ -38,7 +38,7 @@ fn with_init_lock_serializes_concurrent_callers() {
         let db_path = dir.path().join(".skuld.db");
         let in_critical_section = AtomicI64::new(0);
         let max_seen = AtomicI64::new(0);
-        let (points, coordinator) = rendezvous(THREADS);
+        let points = rendezvous(THREADS);
 
         std::thread::scope(|s| {
             for point in points {
@@ -61,10 +61,6 @@ fn with_init_lock_serializes_concurrent_callers() {
                 });
             }
         });
-
-        coordinator
-            .join()
-            .expect("rendezvous coordinator thread must not itself panic");
 
         assert_eq!(
             max_seen.load(SeqCst),
@@ -100,7 +96,7 @@ fn with_init_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet()
 
     let in_critical_section = AtomicI64::new(0);
     let max_seen = AtomicI64::new(0);
-    let (points, coordinator) = rendezvous(THREADS);
+    let points = rendezvous(THREADS);
 
     std::thread::scope(|s| {
         for point in points {
@@ -114,10 +110,6 @@ fn with_init_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet()
             });
         }
     });
-
-    coordinator
-        .join()
-        .expect("rendezvous coordinator thread must not itself panic");
 
     assert_eq!(
         max_seen.load(SeqCst),

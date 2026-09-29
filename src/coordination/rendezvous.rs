@@ -1,95 +1,126 @@
 //! Panic-safe replacement for [`std::sync::Barrier`], for tests only.
 //!
-//! `std::sync::Barrier::wait()` blocks until every participant arrives, with
-//! no other way out: if one participant's thread panics (or otherwise never
-//! reaches the barrier), every other participant blocks in `wait()` forever.
-//! The coordination tests used to accept that — one of them said so directly
-//! ("the CI job-level timeout is the intended backstop") — but a CI job
-//! timeout killing a hung process is exactly the "expiry as proof of
-//! something" shape this crate's own retry/wait logic is built to avoid
-//! elsewhere; a test relying on the same thing for its own liveness is no
-//! different. [`rendezvous`] replaces `Barrier` with a mechanism that fails
-//! fast instead: every participant either proceeds once all of them arrive,
-//! or panics immediately once any one of them is detected missing — no
-//! timeout, no polling, just a channel closing.
+//! `Barrier::wait()` blocks forever if a participant dies before arriving,
+//! leaving a CI job timeout as the only backstop. With [`rendezvous`] every
+//! participant proceeds once all have arrived, or panics as soon as any
+//! participant's [`RendezvousPoint`] is dropped without having arrived. No
+//! timeout, no polling, no extra thread.
+
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+
+/// Where a rendezvous stands, as seen by one participant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Status {
+    /// Not every participant has arrived, and none has died.
+    Pending,
+    /// Every participant has arrived.
+    Released,
+    /// A participant was dropped without arriving; the rest can never be released.
+    Aborted,
+}
+
+struct State {
+    participants: usize,
+    arrived: usize,
+    aborted: bool,
+}
+
+impl State {
+    fn status(&self) -> Status {
+        if self.arrived == self.participants {
+            Status::Released
+        } else if self.aborted {
+            Status::Aborted
+        } else {
+            Status::Pending
+        }
+    }
+}
+
+struct Shared {
+    state: Mutex<State>,
+    changed: Condvar,
+}
+
+impl Shared {
+    /// Poisoning is irrelevant: no code runs under this lock that can panic.
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// One participant's handle to an `n`-way [`rendezvous`]. Call [`Self::wait`]
 /// exactly once per participant.
 pub(super) struct RendezvousPoint {
-    ready_tx: std::sync::mpsc::Sender<()>,
-    go_rx: std::sync::mpsc::Receiver<()>,
+    shared: Arc<Shared>,
+    arrived: bool,
 }
 
 impl RendezvousPoint {
-    /// Block until every participant in this rendezvous has called `wait`,
-    /// or panic as soon as any one of them is detected to have died first
-    /// (its own `RendezvousPoint` dropped without ever calling `wait`) —
-    /// never hangs waiting on a straggler *that has died* the way
-    /// `Barrier::wait` would. A participant that's merely alive but stuck
-    /// somewhere else (never reaching `wait` at all, without dying either)
-    /// is not distinguishable from "hasn't arrived yet" and still hangs
-    /// every other participant, same as `Barrier` — this only fixes the
-    /// death case.
-    pub(super) fn wait(self) {
-        self.ready_tx
-            .send(())
-            .expect("rendezvous aborted: a fellow participant died");
-        self.go_rx
-            .recv()
-            .expect("rendezvous aborted: a fellow participant died");
+    /// Block until every participant has called `wait`; panic if a
+    /// participant's point was dropped without calling it. A participant that
+    /// is alive but never arrives still blocks everyone, as with `Barrier`.
+    pub(super) fn wait(mut self) {
+        self.arrive();
+        let shared = Arc::clone(&self.shared);
+        let state = shared
+            .changed
+            .wait_while(shared.lock(), |state| state.status() == Status::Pending)
+            .unwrap_or_else(PoisonError::into_inner);
+        let status = state.status();
+        // Release the lock before panicking so it is never poisoned.
+        drop(state);
+        assert!(
+            status == Status::Released,
+            "rendezvous aborted: a participant's point was dropped without calling wait \
+             (its thread ended or panicked first)"
+        );
+    }
+
+    /// The non-blocking half of [`Self::wait`]: record this participant's
+    /// arrival and return the resulting status.
+    pub(super) fn arrive(&mut self) -> Status {
+        debug_assert!(!self.arrived, "RendezvousPoint::arrive called twice");
+        self.arrived = true;
+        let mut state = self.shared.lock();
+        state.arrived += 1;
+        debug_assert!(state.arrived <= state.participants);
+        let status = state.status();
+        drop(state);
+        self.shared.changed.notify_all();
+        status
+    }
+
+    /// The current status, without blocking or arriving.
+    pub(super) fn status(&self) -> Status {
+        self.shared.lock().status()
     }
 }
 
-/// Set up an `n`-participant rendezvous, returning one [`RendezvousPoint`]
-/// per participant (hand each to exactly one thread) and a [`JoinHandle`]
-/// for its coordinator thread — callers must join it themselves (inside or
-/// outside whatever scope hands out the points; the coordinator has no
-/// borrows tying it to one) so a coordinator-side panic is never silently
-/// dropped. The coordinator releases every participant together once all
-/// `n` have called `wait`, or releases no one — leaving every waiting
-/// participant's `go_rx.recv()` to fail once this coordinator's own channel
-/// handles drop — once every earlier participant (in the fixed index order
-/// the coordinator itself waits on `ready_rx`s in) has arrived and the next
-/// one's `ready_tx` is found dropped without sending (i.e. that
-/// participant's thread ended, panic or not, before `wait`). Not "the
-/// moment any one participant dies," which would need polling or a select
-/// over all `n` receivers at once — this coordinator finds out about a
-/// dead participant only once its own sequential scan reaches that
-/// participant's index, after every index before it has already checked in.
-///
-/// Two independent one-shot channels per participant (`ready`/`go`), not one
-/// `Sender` cloned `n` ways: a clone-based design can't tell "one specific
-/// participant died" from "the rest just haven't arrived yet" — the channel
-/// only closes once *every* clone is gone, by which point the others may
-/// already be stuck waiting on a signal that was never coming. A dedicated
-/// pair per participant means that participant's own `ready_rx` closing
-/// (immediately, on `channel()`'s sole `Sender` being dropped) is
-/// unambiguous, specific evidence of that one participant's absence.
-pub(super) fn rendezvous(n: usize) -> (Vec<RendezvousPoint>, std::thread::JoinHandle<()>) {
-    let (ready_txs, ready_rxs): (Vec<_>, Vec<_>) = (0..n).map(|_| std::sync::mpsc::channel::<()>()).unzip();
-    let (go_txs, go_rxs): (Vec<_>, Vec<_>) = (0..n).map(|_| std::sync::mpsc::channel::<()>()).unzip();
+impl Drop for RendezvousPoint {
+    fn drop(&mut self) {
+        if !self.arrived {
+            self.shared.lock().aborted = true;
+            self.shared.changed.notify_all();
+        }
+    }
+}
 
-    let coordinator = std::thread::spawn(move || {
-        for rx in &ready_rxs {
-            if rx.recv().is_err() {
-                // A participant's ready_tx was dropped without sending:
-                // that participant is gone. Don't release anyone — return
-                // without sending on any go_tx, dropping them all, which
-                // fails every already-waiting (or still-arriving) survivor's
-                // go_rx.recv()/ready_tx.send() instead of leaving them
-                // blocked.
-                return;
-            }
-        }
-        for tx in &go_txs {
-            let _ = tx.send(());
-        }
+/// Set up an `n`-participant rendezvous: one [`RendezvousPoint`] per
+/// participant, each to be handed to exactly one thread.
+pub(super) fn rendezvous(n: usize) -> Vec<RendezvousPoint> {
+    let shared = Arc::new(Shared {
+        state: Mutex::new(State {
+            participants: n,
+            arrived: 0,
+            aborted: false,
+        }),
+        changed: Condvar::new(),
     });
-
-    let points = ready_txs
-        .into_iter()
-        .zip(go_rxs)
-        .map(|(ready_tx, go_rx)| RendezvousPoint { ready_tx, go_rx })
-        .collect();
-    (points, coordinator)
+    (0..n)
+        .map(|_| RendezvousPoint {
+            shared: Arc::clone(&shared),
+            arrived: false,
+        })
+        .collect()
 }

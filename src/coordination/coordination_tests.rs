@@ -57,15 +57,25 @@ pub(super) fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
-/// Test helper: run [`register`] inside a transaction, matching its own
-/// documented contract — enforced by a `debug_assert!`, not just
-/// documented, so calling it directly on an autocommit connection panics in
-/// debug builds. Commits and returns the row id.
+/// Run [`register`] in a `BEGIN IMMEDIATE`/`COMMIT` pair (it debug-asserts a
+/// transaction); returns the row id.
 fn register_in_txn(conn: &rusqlite::Connection, name: &str, labels: &[Label], serial_filter: &str) -> i64 {
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     let id = register(conn, name, labels, serial_filter).unwrap();
     conn.execute_batch("COMMIT").unwrap();
     id
+}
+
+/// `register`'s transaction contract is a `debug_assert!`, so it is only
+/// checked in debug builds.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "must be called inside an active transaction")]
+fn register_outside_a_transaction_trips_its_debug_assert() {
+    let (_dir, path) = temp_db();
+    let (conn, _identity) = open_db(&path);
+
+    let _ = register(&conn, "no_transaction", &[], SERIAL_NONE);
 }
 
 // can_start =====
@@ -920,7 +930,7 @@ fn global_serial_prevents_concurrent_execution() {
     let (_dir, path) = temp_db();
 
     let running = AtomicU32::new(0);
-    let (points, coordinator) = rendezvous(THREADS);
+    let points = rendezvous(THREADS);
 
     std::thread::scope(|s| {
         for point in points {
@@ -934,10 +944,6 @@ fn global_serial_prevents_concurrent_execution() {
             });
         }
     });
-
-    coordinator
-        .join()
-        .expect("rendezvous coordinator thread must not panic");
 }
 
 #[test]
@@ -947,20 +953,14 @@ fn non_serial_allows_concurrent_execution() {
     let (_dir, path) = temp_db();
 
     // Two rendezvous points: the first races every thread into coordinate()
-    // together (stressing lock contention); the second holds every thread
-    // past fetch_add before any exits, so peak == THREADS on success
-    // regardless of per-thread coordinate() latency. `rendezvous` only
-    // protects against a participant *dying* before reaching it, not one
-    // that's simply alive but stuck — a live-but-blocked participant (e.g.
-    // a genuine deadlock regression inside `coordinate()` itself) still
-    // hangs every other participant here, same as the `Barrier` pair this
-    // replaced would have; see `non_serial_registrations_do_not_block_can_start_for_another_non_serial_test`
-    // below for a non-blocking counterpart that can't hang at all, for
-    // exactly that reason.
+    // together; the second holds every thread past fetch_add before any exits,
+    // so peak == THREADS regardless of coordinate() latency. A live-but-stuck
+    // participant (a deadlock inside coordinate()) still hangs the rest; see
+    // the non-blocking counterpart below.
     let peak = AtomicU32::new(0);
     let running = AtomicU32::new(0);
-    let (entry_points, entry_coordinator) = rendezvous(THREADS);
-    let (observation_points, observation_coordinator) = rendezvous(THREADS);
+    let entry_points = rendezvous(THREADS);
+    let observation_points = rendezvous(THREADS);
 
     std::thread::scope(|s| {
         for (entry, observation) in entry_points.into_iter().zip(observation_points) {
@@ -975,13 +975,6 @@ fn non_serial_allows_concurrent_execution() {
         }
     });
 
-    entry_coordinator
-        .join()
-        .expect("entry rendezvous coordinator thread must not panic");
-    observation_coordinator
-        .join()
-        .expect("observation rendezvous coordinator thread must not panic");
-
     debug_assert!(peak.load(SeqCst) <= THREADS as u32);
     assert_eq!(
         peak.load(SeqCst) as usize,
@@ -990,28 +983,33 @@ fn non_serial_allows_concurrent_execution() {
     );
 }
 
-/// Non-blocking counterpart to `non_serial_allows_concurrent_execution`,
-/// for the same underlying regression ("non-serial tests wrongly
-/// serialized") but immune to the hang that test's own comment now admits
-/// it can't rule out: no threads at all here, just `can_start`'s own policy
-/// logic, checked directly against `REGISTRATIONS` already-registered
-/// non-serial rows. If a regression made non-serial registrations block
-/// each other, this fails immediately — it cannot hang, since nothing here
-/// ever waits on anything.
+/// Non-blocking counterpart to `non_serial_allows_concurrent_execution`:
+/// checks `can_start` directly against already-registered rows, so a
+/// regression fails instead of hanging. The rows carry labels, and one serial
+/// row holds a filter the candidate does not match: neither may block a
+/// non-serial test, while the same serial row still blocks a matching one.
 #[test]
 fn non_serial_registrations_do_not_block_can_start_for_another_non_serial_test() {
     const REGISTRATIONS: usize = 7;
     let (_dir, path) = temp_db();
     let (conn, _identity) = open_db(&path);
+    let docker = Label::__new("docker");
+    let network = Label::__new("network");
+    let cache = Label::__new("cache");
 
     for i in 0..REGISTRATIONS {
-        register_in_txn(&conn, &format!("parallel_test_{i}"), &[], SERIAL_NONE);
+        register_in_txn(&conn, &format!("parallel_test_{i}"), &[docker, network], SERIAL_NONE);
     }
+    register_in_txn(&conn, "serial_cache", &[], "cache");
 
     assert!(
-        can_start(&conn, &[], SERIAL_NONE).unwrap(),
-        "{REGISTRATIONS} live non-serial registrations must not block another non-serial test \
-         from starting"
+        can_start(&conn, &[docker, network], SERIAL_NONE).unwrap(),
+        "{REGISTRATIONS} labelled non-serial registrations and a serial row with a non-matching \
+         filter must not block another non-serial test from starting"
+    );
+    assert!(
+        !can_start(&conn, &[cache], SERIAL_NONE).unwrap(),
+        "the serial row must still block a test its filter matches"
     );
 }
 
@@ -1644,7 +1642,7 @@ fn connect_survives_many_threads_racing_the_same_absent_path() {
 
     for _ in 0..ROUNDS {
         let (_dir, path) = temp_db();
-        let (points, coordinator) = rendezvous(THREADS);
+        let points = rendezvous(THREADS);
         std::thread::scope(|s| {
             for point in points {
                 s.spawn(|| {
@@ -1661,9 +1659,6 @@ fn connect_survives_many_threads_racing_the_same_absent_path() {
                 });
             }
         });
-        coordinator
-            .join()
-            .expect("rendezvous coordinator thread must not panic");
     }
 }
 
