@@ -1,101 +1,170 @@
 //! Tests for [`super::rendezvous`] itself.
+//!
+//! The status tests drive `arrive`/`status` on one thread, so a broken
+//! `wait` fails them instead of hanging. The threaded tests then check
+//! `wait` end to end. A mutant that stops waking blocked waiters can only be
+//! seen by those tests, and shows up as a hang: only a time bound could
+//! detect it.
 
-use super::rendezvous::rendezvous;
+use super::rendezvous::{rendezvous, Status};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
-/// TDD red/green for [`rendezvous`] itself: a "mutant" participant panics
-/// before ever calling `wait`.
-///
-/// Structured to survive mutations a naive version couldn't: the dying
-/// participant is *last*, not first, and every survivor runs `wait()` in
-/// its own spawned thread — reporting its own `catch_unwind` result back,
-/// rather than being called synchronously on the main test thread after
-/// the coordinator is already known to be done. Both choices exist for the
-/// same reason: they make this test's own verdict independent of the
-/// coordinator's internal iteration order or control flow. Every survivor
-/// runs on its own real, independently scheduled thread, each free to reach
-/// `wait()` and send its own ready signal on its own schedule — not code
-/// deferred until after the outcome is already known. So regardless of
-/// which order the coordinator actually observes those signals in, a
-/// coordinator that iterates in reverse, or that keeps going past a
-/// detected failure (`continue`) instead of stopping immediately
-/// (`return`), still can't produce a false "everyone survived," because
-/// there's no still-unactivated survivor left for it to accidentally
-/// release. An earlier version of this test put the mutant first and called
-/// survivors synchronously after joining the coordinator; targeted
-/// mutations of the coordinator (reversed iteration order; `continue`
-/// instead of `return`) either hung that version or made it pass when it
-/// shouldn't have.
-///
-/// One mutation this can't catch, by construction: swapping the coordinator
-/// for one built on `std::sync::Barrier` itself. `Barrier::wait()` has no
-/// failure path at all — it simply never returns once a participant is
-/// missing, for any participant — so there is no channel to close, no
-/// signal to observe, nothing here to detect. Catching that specific
-/// regression would need a timeout, which this crate's own rules forbid
-/// using as a correctness check; it's instead bounded only by the CI job's
-/// own runner timeout, the same backstop every `Barrier`-based test in this
-/// file relied on before `rendezvous` existed.
-///
-/// The mutant's `RendezvousPoint` is moved bodily into its own spawned
-/// thread (`let _p = mutant_point;`), not just held in this function's own
-/// stack frame: that's what makes its drop — and the coordinator's
-/// detection of it — a genuine consequence of a panicking thread's unwind,
-/// the real mechanism under test, rather than an ordinary drop this test
-/// would trigger on its own regardless of whether panics correctly unwind
-/// through spawned threads at all.
+// Status =====
+
 #[test]
-fn rendezvous_fails_fast_instead_of_hanging_when_a_participant_panics_before_it() {
-    const THREADS: usize = 4;
+fn nobody_is_released_until_the_last_participant_arrives() {
+    let mut points = rendezvous(3);
 
-    let (points, coordinator) = rendezvous(THREADS);
-    let mut points = points.into_iter();
+    assert_eq!(points[0].arrive(), Status::Pending);
+    assert_eq!(points[1].arrive(), Status::Pending);
+    assert_eq!(points[0].status(), Status::Pending);
+    assert_eq!(points[2].arrive(), Status::Released);
+    for point in &points {
+        assert_eq!(point.status(), Status::Released);
+    }
+}
 
-    // Survivors first, each spawned as its own independently scheduled
-    // thread before the mutant is even spawned — see this function's own
-    // doc for why that's what makes the rest of this test independent of
-    // the coordinator's internal iteration order.
-    let survivors: Vec<std::thread::JoinHandle<bool>> = points
-        .by_ref()
-        .take(THREADS - 1)
-        .map(|point| {
-            std::thread::spawn(move || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| point.wait())).is_err())
-        })
-        .collect();
+#[test]
+fn a_single_participant_is_released_on_arrival() {
+    let mut points = rendezvous(1);
 
-    // The mutant is last, not first.
-    let mutant_point = points
-        .next()
-        .expect("test bug: rendezvous(THREADS) must yield THREADS points");
-    assert!(
-        points.next().is_none(),
-        "test bug: rendezvous(THREADS) must yield exactly THREADS points, no more"
-    );
-    let mutant = std::thread::spawn(move || {
-        let _p = mutant_point;
-        panic!("mutant: panicking before the rendezvous");
+    assert_eq!(points[0].arrive(), Status::Released);
+}
+
+#[test]
+fn no_participants_yield_no_points() {
+    assert!(rendezvous(0).is_empty());
+}
+
+/// Dropping a point that never arrived aborts everyone else, whichever index
+/// it holds and whether the others arrived before or after.
+fn aborted_by_death_of(dead: usize) {
+    const PARTICIPANTS: usize = 4;
+
+    let mut points = rendezvous(PARTICIPANTS);
+    let dead_point = points.remove(dead);
+    let (early, late) = points.split_at_mut(1);
+    assert_eq!(early[0].arrive(), Status::Pending);
+
+    drop(dead_point);
+
+    assert_eq!(early[0].status(), Status::Aborted);
+    for point in late.iter_mut() {
+        assert_eq!(point.status(), Status::Aborted);
+        // Arriving after the abort must not read as released.
+        assert_eq!(point.arrive(), Status::Aborted);
+    }
+}
+
+#[test]
+fn death_of_the_first_participant_aborts_the_rest() {
+    aborted_by_death_of(0);
+}
+
+#[test]
+fn death_of_a_middle_participant_aborts_the_rest() {
+    aborted_by_death_of(2);
+}
+
+#[test]
+fn death_of_the_last_participant_aborts_the_rest() {
+    aborted_by_death_of(3);
+}
+
+/// A point that arrived is done; dropping it must not abort the others.
+#[test]
+fn dropping_a_point_that_arrived_does_not_abort_the_rest() {
+    let mut points = rendezvous(2);
+    let mut second = points.pop().unwrap();
+    let mut first = points.pop().unwrap();
+
+    assert_eq!(first.arrive(), Status::Pending);
+    drop(first);
+
+    assert_eq!(second.status(), Status::Pending);
+    assert_eq!(second.arrive(), Status::Released);
+}
+
+// wait =====
+
+fn all_released_together(n: usize) {
+    let bumped = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for point in rendezvous(n) {
+            s.spawn(|| {
+                bumped.fetch_add(1, SeqCst);
+                point.wait();
+                assert_eq!(
+                    bumped.load(SeqCst),
+                    n,
+                    "wait() returned before every participant arrived"
+                );
+            });
+        }
     });
-    // The mutant's own panic isn't itself the thing under test — only that
-    // its point dropped as a result of it. Swallow it here.
-    let _ = mutant.join();
+    assert_eq!(bumped.load(SeqCst), n);
+}
 
-    // The coordinator must have detected the mutant's absence and returned
-    // cleanly (not itself panicked) without releasing anyone.
-    coordinator
-        .join()
-        .expect("rendezvous coordinator thread must not itself panic");
+#[test]
+fn wait_returns_for_everyone_once_all_have_arrived() {
+    all_released_together(8);
+}
 
-    let failures = survivors
-        .into_iter()
-        .map(|h| {
-            h.join()
-                .expect("survivor thread must not panic itself — only point.wait() inside its catch_unwind may")
-        })
-        .filter(|&wait_failed| wait_failed)
-        .count();
+#[test]
+fn wait_returns_immediately_for_a_single_participant() {
+    all_released_together(1);
+}
+
+#[test]
+fn wait_with_no_participants_has_nothing_to_wait_for() {
+    all_released_together(0);
+}
+
+/// `dead` panics in its own thread before waiting; every other participant's
+/// `wait` must panic rather than block.
+fn survivors_panic_when_participant_dies(dead: usize) {
+    const PARTICIPANTS: usize = 4;
+
+    let mut points = rendezvous(PARTICIPANTS);
+    let dead_point = points.remove(dead);
+    let failed = AtomicUsize::new(0);
+
+    std::thread::scope(|s| {
+        for point in points {
+            s.spawn(|| {
+                if catch_unwind(AssertUnwindSafe(|| point.wait())).is_err() {
+                    failed.fetch_add(1, SeqCst);
+                }
+            });
+        }
+        // Moved into a panicking thread, so the drop comes from a real unwind.
+        let mutant = std::thread::spawn(move || {
+            let _point = dead_point;
+            panic!("participant panicking before the rendezvous");
+        });
+        // Its panic is the trigger, not the thing under test.
+        let _ = mutant.join();
+    });
+
     assert_eq!(
-        failures,
-        THREADS - 1,
-        "every survivor's wait() must fail once a fellow participant dies before the \
-         rendezvous, not just some of them"
+        failed.load(SeqCst),
+        PARTICIPANTS - 1,
+        "every survivor's wait() must panic once a participant dies"
     );
+}
+
+#[test]
+fn wait_panics_for_everyone_when_the_first_participant_dies() {
+    survivors_panic_when_participant_dies(0);
+}
+
+#[test]
+fn wait_panics_for_everyone_when_a_middle_participant_dies() {
+    survivors_panic_when_participant_dies(2);
+}
+
+#[test]
+fn wait_panics_for_everyone_when_the_last_participant_dies() {
+    survivors_panic_when_participant_dies(3);
 }
