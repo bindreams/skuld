@@ -22,10 +22,12 @@ mod publish_tests;
 mod test_hooks;
 #[cfg(test)]
 mod test_hooks_tests;
+mod violations;
 
 use crate::label::{Label, LabelFilter};
 
 use moved_db::{DbIdentity, Failure};
+pub(crate) use violations::take as take_violations;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -1076,10 +1078,13 @@ impl Drop for TestRegistration {
             Ok(()) => {}
             Err(payload) => {
                 if std::thread::panicking() {
-                    // Already unwinding from another panic: downgrade to a
-                    // loud warning instead of letting this one escape and
-                    // aborting the process.
-                    eprintln!("{}", downgraded_warning_message(&payload));
+                    // Already unwinding from another panic: a second panic
+                    // would abort the process, so this one is downgraded to a
+                    // warning. It is also recorded process-wide, and the
+                    // runner fails the run with it (see `violations`).
+                    let warning = downgraded_warning_message(&payload);
+                    eprintln!("{warning}");
+                    violations::record(warning);
                 } else {
                     // Normal drop, no concurrent unwind: this is the only
                     // panic in flight, so it's safe to let it through and

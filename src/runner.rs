@@ -550,6 +550,8 @@ impl TestRunner {
         // Clean up process-scoped fixtures (LIFO order).
         cleanup_process_fixtures();
 
+        let conclusion = fail_on_violations(conclusion, crate::coordination::take_violations());
+
         if !unavailable.is_empty() {
             eprintln!("\n--- Unavailable ({}) ---", unavailable.len());
             for (name, reason) in &unavailable {
@@ -681,6 +683,25 @@ impl TestRunner {
             );
         }
     }
+}
+
+/// Fail the run for every coordination cleanup failure that was downgraded to a
+/// warning while a test was unwinding (see `coordination::violations`): a
+/// `#[should_panic]` test, or one whose own failure was reported first, would
+/// otherwise hide a moved or broken coordination database. The runner owns the
+/// process's exit, so this is where it can still fail.
+pub(crate) fn fail_on_violations(
+    mut conclusion: libtest_mimic::Conclusion,
+    violations: Vec<String>,
+) -> libtest_mimic::Conclusion {
+    if !violations.is_empty() {
+        eprintln!("\n--- Coordination failures during unwind ({}) ---", violations.len());
+        for v in &violations {
+            eprintln!("  {v}");
+        }
+        conclusion.num_failed += violations.len() as u64;
+    }
+    conclusion
 }
 
 /// Shorthand: run only inventory-registered tests and exit.

@@ -1480,6 +1480,35 @@ fn drop_panics_loudly_on_a_corrupt_db_when_nothing_else_is_unwinding() {
     );
 }
 
+// Failures recorded during an unwind =====
+
+/// A registration dropped while its thread unwinds cannot panic (that aborts),
+/// so its refusal to write through a broken DB is recorded process-wide for the
+/// runner to fail the run with.
+#[test]
+fn drop_during_an_unwind_records_the_downgraded_failure() {
+    let (_dir, path) = temp_db();
+    let a = coordinate(&path, "a", &[], SERIAL_NONE);
+    let (saboteur, _) = open_db(&path);
+    saboteur.execute_batch("DROP TABLE running").unwrap();
+    drop(saboteur);
+
+    let result = std::thread::spawn(move || {
+        let _held = a;
+        panic!("the test's own failure");
+    })
+    .join();
+
+    assert!(result.is_err());
+    let recorded = crate::coordination::violations::recorded();
+    assert!(
+        recorded
+            .iter()
+            .any(|m| m.contains(&format!("{path:?}")) && m.contains("no such table")),
+        "the downgraded failure must be recorded with its path and cause: {recorded:?}"
+    );
+}
+
 // Init lock file permissions =====
 
 /// Unix locks `db_path`'s parent directory itself, not a sibling `.lock`

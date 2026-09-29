@@ -11,17 +11,14 @@
 //! test binary down with it.
 //!
 //! Runs on every platform: the `Drop::drop` fix it exercises is not
-//! platform-gated, and Skuld's CI has a Windows lane. The probe's
-//! corruption method (dropping the `running` table via a second connection)
-//! fails the registration's own cleanup `DELETE` on both platforms for the
-//! reasons documented on `probe_drop_panic_during_unwind` in `src/lib.rs`.
-//! This test still doesn't assert the exact panic wording — SQLite's own
-//! "no such table: running" is stable across platforms, but pinning it here
-//! would make this test double as a regression guard for that exact string,
-//! which isn't its job — only that the process exits via a single ordinary
-//! panic (not an abort), and that the downgraded warning carries a real
-//! extracted message rather than the `panic_payload_message` fallback
-//! placeholder.
+//! platform-gated, and Skuld's CI has a Windows lane. The probe's corruption
+//! method (dropping the `running` table via a second connection) fails the
+//! registration's own cleanup `DELETE` on both platforms (see
+//! `probe_drop_panic_during_unwind` in `src/lib.rs`). The test asserts that the
+//! process exits via a single ordinary panic (not an abort), and that the
+//! downgraded warning names the database path and SQLite's own cause rather
+//! than the `panic_payload_message` fallback placeholder: during an unwind the
+//! warning is the only signal left of the failure.
 
 use std::process::Command;
 
@@ -65,16 +62,12 @@ fn a_second_panic_during_drop_does_not_abort_the_process() {
         .unwrap_or_else(|| panic!("the downgraded second-panic warning must reach stderr: {stderr}"));
     // The default panic hook prints the second panic's raw message too
     // (before our `catch_unwind` even sees it), so checking `stderr` as a
-    // whole for the fallback placeholder's absence would pass even if the
-    // downgraded warning's own extracted message were wrong — check the
-    // warning line itself. Not asserting the exact wording here — it's
-    // SQLite's own "no such table: running" now, stable across platforms,
-    // but pinning that exact string is `panic_payload_message`'s job
-    // (unit-tested directly in `coordination_tests.rs` against static-str,
-    // runtime-formatted-string, and non-string payloads), not this
-    // end-to-end test's — and `downgraded_warning_message`'s (unit-tested
-    // there against the exact `&payload` call convention
-    // `TestRegistration::drop` uses).
+    // whole would pass even if the downgraded warning's own extracted message
+    // were wrong: check the warning line itself.
+    assert!(
+        warning_line.contains(&format!("{db_path:?}")) && warning_line.contains("no such table: running"),
+        "the downgraded warning must name the database path and the cause: {warning_line:?}"
+    );
     assert!(
         !warning_line.contains("<non-string panic payload>"),
         "the downgraded warning must carry the second panic's actual message, not the \
