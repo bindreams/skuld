@@ -1,0 +1,19 @@
+nextest-version = { required = "0.9.137" }
+
+[profile.default]
+# `tests/integration.rs` (`harness = false`) asserts whole-run side effects after `run_tests`
+# ("every test body ran in this process"), which cannot hold when nextest runs each test in its own
+# process. CI runs it under `cargo test --test integration` instead.
+default-filter = "not binary(=integration)"
+
+# A hang backstop, not a synchronization primitive: no test may depend on it. A participant that is
+# alive but stuck blocks every other rendezvous participant forever, and only a time bound can tell
+# (see `src/coordination/rendezvous.rs`). Generous for the whole run; the override below is tight.
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+# The coordination tests block on rendezvous points, retry-hook acks and SQLite locks. The slowest
+# takes about a second locally, so 10s x 3 leaves ample headroom while a hang fails within 30s,
+# naming the test.
+filter = 'binary(=skuld) & test(/^coordination::/)'
+slow-timeout = { period = "10s", terminate-after = 3 }

@@ -59,7 +59,9 @@ pub(super) struct RendezvousPoint {
 impl RendezvousPoint {
     /// Block until every participant has called `wait`; panic if a
     /// participant's point was dropped without calling it. A participant that
-    /// is alive but never arrives still blocks everyone, as with `Barrier`.
+    /// is alive but never arrives still blocks everyone, as with `Barrier`;
+    /// under `cargo test` nothing bounds that, and under nextest
+    /// `.config/nextest.toml`'s `slow-timeout` fails the test.
     pub(super) fn wait(mut self) {
         self.arrive();
         let shared = Arc::clone(&self.shared);
