@@ -4,7 +4,8 @@
 //! `wait` fails them instead of hanging. The threaded tests then check
 //! `wait` end to end. A mutant that stops waking blocked waiters can only be
 //! seen by those tests, and shows up as a hang: only a time bound could
-//! detect it.
+//! detect it, which under nextest is `.config/nextest.toml`'s `slow-timeout`
+//! (a backstop; no test logic depends on it).
 
 use super::rendezvous::{rendezvous, Status};
 use std::panic::{catch_unwind, AssertUnwindSafe};

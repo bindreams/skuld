@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # `.config/nextest.toml` requires the same nextest.
+  NEXTEST_VERSION: "0.9.137"
 
 jobs:
   lint:
@@ -146,7 +148,7 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 
       # The cross-device moved-DB test needs two filesystems.
       - name: Provision two filesystems
@@ -167,8 +169,20 @@ jobs:
         # host (Linux), and its deps aren't worth cross-compiling to 6 targets.
         run: cargo build --workspace --exclude xtask --target ${{ matrix.target }}
 
+      # nextest fails a hung test by name after `.config/nextest.toml`'s slow-timeout, instead of
+      # stalling the job until `timeout-minutes`. No custom profile: cargo-skuld's tests run nested
+      # `cargo nextest list`s in fixture workspaces, which inherit the profile name.
       - name: Unit tests
-        run: cargo test --workspace --exclude xtask --target ${{ matrix.target }}
+        run: cargo nextest run --workspace --exclude xtask --target ${{ matrix.target }} --no-fail-fast
+
+      # nextest does not run doctests (https://github.com/nextest-rs/nextest/issues/16).
+      - name: Doctests
+        run: cargo test --workspace --exclude xtask --doc --target ${{ matrix.target }}
+
+      # `tests/integration.rs` asserts whole-run side effects, so it needs one process for all its
+      # tests; `.config/nextest.toml` excludes it from the run above.
+      - name: Integration tests
+        run: cargo test -p skuld --test integration --target ${{ matrix.target }}
 
       # xtask is excluded from the matrix above (it is a Linux-side build tool,
       # not a shipped artifact), so without this its tests run nowhere — including
