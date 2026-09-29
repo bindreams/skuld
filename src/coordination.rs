@@ -9,6 +9,8 @@ mod coordination_tests;
 mod lock;
 #[cfg(test)]
 mod lock_tests;
+#[cfg(all(test, unix))]
+mod moved_db_tests;
 #[cfg(unix)]
 mod publish;
 #[cfg(all(test, unix))]
@@ -1107,6 +1109,56 @@ pub(crate) fn set_test_retry_hook(tx: std::sync::mpsc::Sender<()>) {
     });
 }
 
+// Test-only, thread-scoped seam for the one window no contention can open
+// deterministically: between a write's success and the post-write moved-DB
+// check that follows it. Same discipline as `TEST_RETRY_HOOK` — a
+// single-purpose test thread installs it, and only that thread ever runs it.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AfterWriteSite {
+    /// `coordinate`, right after its COMMIT succeeded.
+    Coordinate,
+    /// `TestRegistration::drop`, right after its DELETE succeeded.
+    Drop,
+}
+
+#[cfg(test)]
+type AfterWriteHook = (AfterWriteSite, Box<dyn FnOnce()>);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_AFTER_WRITE_HOOK: std::cell::RefCell<Option<AfterWriteHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` on the calling thread once, at the next `site` write.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn set_test_after_write_hook(site: AfterWriteSite, f: impl FnOnce() + 'static) {
+    TEST_AFTER_WRITE_HOOK.with(|c| {
+        let mut slot = c.borrow_mut();
+        debug_assert!(slot.is_none(), "set_test_after_write_hook: already set on this thread");
+        *slot = Some((site, Box::new(f)));
+    });
+}
+
+#[cfg(test)]
+fn run_test_after_write_hook(site: AfterWriteSite) {
+    let hook = TEST_AFTER_WRITE_HOOK.with(|c| {
+        let mut slot = c.borrow_mut();
+        match slot.take() {
+            Some((s, f)) if s == site => Some(f),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    });
+    if let Some(f) = hook {
+        f();
+    }
+}
+
 // Schema migration =====
 
 /// Run all pending schema migrations. Gated by `PRAGMA user_version` and
@@ -1570,6 +1622,8 @@ impl Drop for TestRegistration {
                     self.path
                 )
             });
+            #[cfg(test)]
+            run_test_after_write_hook(AfterWriteSite::Drop);
             panic_on_moved_db_full(&self.conn, &self.path, &self.identity);
         };
 
@@ -1700,6 +1754,8 @@ pub(crate) fn coordinate(
                 // already panicked by then (see `TestRegistration::drop`'s
                 // own doc). Catching it here, before any of that, is what
                 // makes it a loud failure at the point it happened instead.
+                #[cfg(test)]
+                run_test_after_write_hook(AfterWriteSite::Coordinate);
                 panic_on_moved_db_full(&conn, db_path, &identity);
                 return TestRegistration {
                     conn,

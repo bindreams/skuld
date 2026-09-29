@@ -178,6 +178,24 @@ FILE_SHARE_WRITE` and no `FILE_SHARE_DELETE`, so Windows itself refuses
     no gap on Windows. A failure to open the lock target on either platform
     — a missing parent directory, file-descriptor exhaustion, or anything
     else — panics immediately, naming the path, rather than retrying.
+  - Only creation needs mode and no-replace-rename support: `ensure_published`
+    checks for an existing `.skuld.db` first (`lstat`, so a dangling symlink
+    counts as "already there" too, matching the rename's own `EEXIST`
+    handling below) and returns immediately if so. The first process to see
+    an absent `.skuld.db` creates a private
+    `.skuld-publish-<pid>-<nanos>-<seq>.tmp` (outside the `.skuld.db*`
+    glob), `fchmod`s it 0666, and publishes it with an atomic no-replace
+    rename (`renameat2(..., RENAME_NOREPLACE)` on Linux and Android,
+    `renamex_np(..., RENAME_EXCL)` on macOS) — a lost race silently
+    discards the loser's temp and uses the winner's file as-is, with no
+    further checks. Every later connection, on every process, skips the
+    create/fchmod/rename dance entirely via the existence check instead of
+    repeating it just to hit an `EEXIST` no-op on the rename.
+  - The `-wal`/`-shm` companions are not pre-created or `fchmod`ed by
+    Skuld at all: SQLite's own Unix VFS derives their mode from the main
+    DB file's already-0666 mode, so once `.skuld.db` is published they come
+    out 0666 on their own, umask or not — verified under a restrictive
+    umask in `tests/coordination_publish_cli.rs`.
 - **A `.skuld.db` deleted, renamed, or replaced while a test run is using
   it now fails loudly instead of silently corrupting whatever now exists
   at that path (or, on a connection that never wrote again, doing
@@ -254,24 +272,6 @@ FILE_SHARE_WRITE` and no `FILE_SHARE_DELETE`, so Windows itself refuses
   later tests indefinitely on a serialization constraint that no longer
   reflects reality — worth failing loudly over, not leaving as a warning
   easy to miss in a large test run's output.
-  - Only creation needs mode and no-replace-rename support: `ensure_published`
-    checks for an existing `.skuld.db` first (`lstat`, so a dangling symlink
-    counts as "already there" too, matching the rename's own `EEXIST`
-    handling below) and returns immediately if so. The first process to see
-    an absent `.skuld.db` creates a private
-    `.skuld-publish-<pid>-<nanos>-<seq>.tmp` (outside the `.skuld.db*`
-    glob), `fchmod`s it 0666, and publishes it with an atomic no-replace
-    rename (`renameat2(..., RENAME_NOREPLACE)` on Linux and Android,
-    `renamex_np(..., RENAME_EXCL)` on macOS) — a lost race silently
-    discards the loser's temp and uses the winner's file as-is, with no
-    further checks. Every later connection, on every process, skips the
-    create/fchmod/rename dance entirely via the existence check instead of
-    repeating it just to hit an `EEXIST` no-op on the rename.
-  - The `-wal`/`-shm` companions are not pre-created or `fchmod`ed by
-    Skuld at all: SQLite's own Unix VFS derives their mode from the main
-    DB file's already-0666 mode, so once `.skuld.db` is published they come
-    out 0666 on their own, umask or not — verified under a restrictive
-    umask in `tests/coordination_publish_cli.rs`.
 - **`TestRunner::libtest_names()`**: an opt-in builder method that reports
   each trial under its `<module path minus the crate name>::<test name>`
   instead of the bare test name, matching `cargo test`'s own libtest naming.

@@ -42,7 +42,7 @@ fn companion_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
 }
 
 /// Create a temporary database for testing.
-fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
+pub(super) fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test-coordination.db");
     (dir, path)
