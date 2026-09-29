@@ -15,29 +15,26 @@
 //!
 //! Recording `stat(path)` after the open would adopt whatever a retarget or
 //! swap put there in the meantime, and every later check would then agree with
-//! the wrong value. So an identity is never trusted for being what a path
-//! resolved to; it is validated against what this process actually has open:
+//! the wrong value. So each identity is read from a file SQLite itself holds
+//! open, and the path is then required to name it:
 //!
-//! - **Windows main file:** SQLite exposes its handle
-//!   (`SQLITE_FCNTL_WIN32_GET_HANDLE`), and the identity is taken from that
-//!   handle, then asserted equal to a fresh resolution of the caller's path.
-//!   The companion paths come from the same handle's final path name, which
-//!   contains no reparse point an ancestor retarget could redirect.
-//! - **Unix main file:** SQLite exposes no fd (`unixFileControl` has no such
-//!   opcode). The main identity is `stat(conn.path())`, bracketed around
-//!   `SQLITE_FCNTL_HAS_MOVED` (stat, fcntl, stat must agree), asserted equal to
-//!   a fresh resolution of the caller's path, and required to be one of the
-//!   files this process holds open ([`open_file_identities`]).
-//! - **`-wal` / `-shm`, both platforms:** SQLite exposes no handle for either.
-//!   On Unix each companion's identity must likewise be one of the files this
-//!   process holds open, so a companion unlinked and recreated by another
-//!   opener before recording is rejected, never adopted. Windows withholds
-//!   `FILE_SHARE_DELETE` on both, so neither can be replaced except through a
-//!   reparse-point ancestor, which the handle-derived path already excludes.
-//!
-//! Residual: a Unix file that some *other* connection in this same process holds
-//! open passes the membership test. Nothing in this crate opens the coordination
-//! database outside `open_db`, which holds the init lock while recording.
+//! - **Unix, main, `-wal` and `-shm`:** the fds are read from SQLite's `unixFile`
+//!   structs (see [`unix_fds`]), and the identity is `fstat(fd)`: exact device
+//!   and inode, whatever the path now resolves to. The paths (SQLite's own, the
+//!   caller's, and each companion's) must then resolve to that identity, so a
+//!   file swapped in before recording is rejected, never adopted.
+//! - **Windows main:** SQLite exposes its handle
+//!   (`SQLITE_FCNTL_WIN32_GET_HANDLE`); the identity is taken from it and the
+//!   caller's path must resolve to it. The companion paths come from that
+//!   handle's final path name, which contains no reparse point an ancestor
+//!   retarget could redirect.
+//! - **Windows `-wal` / `-shm`:** SQLite exposes no handle for either. Windows
+//!   withholds `FILE_SHARE_DELETE` on both (pinned by a Windows test), so
+//!   neither can be replaced except through a reparse-point ancestor, which the
+//!   handle-derived path already excludes.
+
+#[cfg(unix)]
+pub(super) mod unix_fds;
 
 use std::path::{Path, PathBuf};
 
@@ -158,30 +155,40 @@ impl DbIdentity {
     /// one recording suffices.
     pub(super) fn with_companions(self, conn: &rusqlite::Connection, path: &Path) -> Self {
         let base = companion_base(conn, path);
-        let track = |suffix: &str| -> Tracked {
+        let track = |suffix: &str, fd_identity: Option<FileIdentity>| -> Tracked {
             let companion = companion_path(&base, suffix);
-            let identity = FileIdentity::of(&companion).unwrap_or_else(|| {
+            let on_disk = FileIdentity::of(&companion).unwrap_or_else(|| {
                 panic!(
                     "skuld: coordination DB {path:?}'s {suffix} companion is missing right after \
                      schema init, where PRAGMA journal_mode=WAL having just run unconditionally \
                      should guarantee it exists"
                 )
             });
-            #[cfg(unix)]
-            assert!(
-                open_file_identities().contains(&identity),
-                "skuld: coordination DB {path:?}'s {suffix} companion at {companion:?} is not a file \
-                 this process has open — it was replaced between the connection opening it and \
-                 being recorded, so the -wal/-shm files at that path are not the ones this \
-                 connection is using"
-            );
+            // Unix: the identity is the connection's own fd, and the file at
+            // the path must be it, or the companion was replaced between the
+            // connection opening it and now.
+            if let Some(own) = fd_identity {
+                assert_eq!(
+                    on_disk, own,
+                    "skuld: coordination DB {path:?}'s {suffix} companion at {companion:?} is not the \
+                     file this connection has open — it was replaced before being recorded, so the \
+                     -wal/-shm files at that path are not the ones this connection is using"
+                );
+            }
             Tracked {
                 path: companion,
-                identity,
+                identity: fd_identity.unwrap_or(on_disk),
             }
         };
-        let wal = track("-wal");
-        let shm = track("-shm");
+        #[cfg(unix)]
+        let (wal_id, shm_id) = (
+            Some(own_fd_identity(unix_fds::wal_fd(conn), path, "-wal")),
+            Some(own_fd_identity(unix_fds::shm_fd(conn), path, "-shm")),
+        );
+        #[cfg(windows)]
+        let (wal_id, shm_id) = (None, None);
+        let wal = track("-wal", wal_id);
+        let shm = track("-shm", shm_id);
         Self {
             main: self.main,
             companions: Some(Companions { wal, shm }),
@@ -328,40 +335,9 @@ pub(super) fn has_moved_via_fcntl(conn: &rusqlite::Connection) -> bool {
     has_moved != 0
 }
 
-/// The identity of every file this process currently holds open.
-///
-/// Listed from `/dev/fd` (macOS, the BSDs with `fdescfs`, Linux) or
-/// `/proc/self/fd`; where neither exists, every descriptor up to the
-/// `RLIMIT_NOFILE` soft limit is tried instead.
-#[cfg(unix)]
-pub(super) fn open_file_identities() -> Vec<FileIdentity> {
-    for dir in ["/dev/fd", "/proc/self/fd"] {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            return entries
-                .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
-                .filter_map(fd_identity)
-                .collect();
-        }
-    }
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // Safety: `&mut limit` is a valid out-pointer.
-    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
-    assert_eq!(rc, 0, "skuld: getrlimit(RLIMIT_NOFILE) failed");
-    scan_open_file_identities(i32::try_from(limit.rlim_cur).unwrap_or(i32::MAX))
-}
-
-/// Every descriptor in `0..limit` that is open, by trying each.
-#[cfg(unix)]
-pub(super) fn scan_open_file_identities(limit: i32) -> Vec<FileIdentity> {
-    (0..limit).filter_map(fd_identity).collect()
-}
-
 /// `None` if `fd` is not open.
 #[cfg(unix)]
-fn fd_identity(fd: i32) -> Option<FileIdentity> {
+pub(super) fn fd_identity(fd: i32) -> Option<FileIdentity> {
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     // Safety: `st` is a valid out-pointer; `fstat` on a closed fd just fails.
     if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
@@ -377,40 +353,36 @@ fn fd_identity(fd: i32) -> Option<FileIdentity> {
     })
 }
 
+/// The identity of `fd`'s file, panicking if it is not open: a companion or
+/// main fd read from SQLite must be.
+#[cfg(unix)]
+fn own_fd_identity(fd: i32, path: &Path, what: &str) -> FileIdentity {
+    fd_identity(fd).unwrap_or_else(|| {
+        panic!("skuld: coordination DB {path:?}: SQLite's {what:?} file descriptor {fd} is not open")
+    })
+}
+
 #[cfg(unix)]
 fn record_main_identity(conn: &rusqlite::Connection, path: &Path) -> FileIdentity {
     let sqlite_path = Path::new(
         conn.path()
             .unwrap_or_else(|| panic!("skuld: coordination DB connection for {path:?} has no path")),
     );
-    // Stat first, then ask SQLite whether its own record still agrees, then stat
-    // again: the fcntl validates that the stat just taken still names the file
-    // SQLite opened, and the second stat that nothing changed around it.
-    let identity = FileIdentity::of(sqlite_path)
-        .unwrap_or_else(|| panic!("skuld: coordination DB {path:?} vanished immediately after being opened"));
-    assert!(
-        !has_moved_via_fcntl(conn),
-        "skuld: coordination DB {path:?} was already reported moved immediately after being \
-         opened — something retargeted it in the open-to-record window"
-    );
+    // The identity is the connection's own fd; the paths must still name it.
+    let identity = own_fd_identity(unix_fds::main_fd(conn), path, "main");
     #[cfg(test)]
-    super::test_hooks::run_seam(super::test_hooks::Seam::Fcntl);
+    super::test_hooks::run_seam(super::test_hooks::Seam::Fd);
     assert_eq!(
         FileIdentity::of(sqlite_path),
         Some(identity),
-        "skuld: coordination DB {path:?} changed while its identity was being recorded — \
-         something replaced it in the open-to-record window"
+        "skuld: coordination DB {path:?}: SQLite's own path {sqlite_path:?} no longer names the file \
+         the connection has open — something replaced it in the open-to-record window"
     );
     assert_eq!(
         FileIdentity::of(path),
         Some(identity),
         "skuld: coordination DB {path:?} disagreed with the connection just opened through it — \
          something retargeted it in the open-to-record window"
-    );
-    assert!(
-        open_file_identities().contains(&identity),
-        "skuld: coordination DB {path:?} resolves to a file this process does not have open — \
-         something replaced it in the open-to-record window"
     );
     identity
 }

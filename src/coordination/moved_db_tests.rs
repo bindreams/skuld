@@ -7,9 +7,7 @@ use super::moved_db::Failure;
 #[cfg(unix)]
 use super::moved_db::FileIdentity;
 #[cfg(unix)]
-use super::moved_db::{
-    companion_path, has_moved_via_fcntl, open_file_identities, scan_open_file_identities, DbIdentity,
-};
+use super::moved_db::{companion_path, fd_identity, has_moved_via_fcntl, DbIdentity};
 #[cfg(unix)]
 use super::test_hooks::{retry_rendezvous, set_test_retry_hook};
 use super::test_hooks::{set_test_seam_hook, Seam};
@@ -424,17 +422,17 @@ fn panic_message<T>(result: std::thread::Result<T>) -> String {
     crate::coordination::panic_payload_message(payload.as_ref()).to_owned()
 }
 
-/// A different file renamed over the path after the `SQLITE_FCNTL_HAS_MOVED`
-/// check passed and before the stat it is validated against. Recording the
-/// stat alone would adopt the replacement as this connection's own identity;
-/// the record must reject it instead, before any write.
+/// A different file renamed over the path after the connection's fd was read
+/// and before the path stats it is validated against. Recording a path stat
+/// would adopt the replacement as this connection's own identity; the record
+/// must reject it instead, before any write.
 #[cfg(unix)]
 #[test]
-fn record_rejects_a_file_swapped_in_between_the_fcntl_check_and_the_stat() {
+fn record_rejects_a_file_swapped_in_between_the_fd_identity_and_the_path_stats() {
     let (dir, path) = temp_db();
     let other = dir.path().join("other.db");
     let swap_path = path.clone();
-    let _seam = set_test_seam_hook(Seam::Fcntl, move || {
+    let _seam = set_test_seam_hook(Seam::Fd, move || {
         std::fs::write(&other, b"a different file").unwrap();
         std::fs::rename(&other, &swap_path).unwrap();
     });
@@ -463,7 +461,7 @@ fn record_rejects_a_file_swapped_in_right_after_the_open() {
     let msg = panic_message(std::panic::catch_unwind(|| open_db(&path)));
 
     assert!(
-        msg.contains(&format!("{path:?}")) && msg.contains("already reported moved"),
+        msg.contains(&format!("{path:?}")) && msg.contains("open-to-record window"),
         "SQLITE_FCNTL_HAS_MOVED must reject the swap at record time: {msg:?}"
     );
 }
@@ -488,16 +486,16 @@ fn record_rejects_an_ancestor_retargeted_right_after_the_open() {
     );
 }
 
-/// SQLite's own path is swapped after the fcntl check passed while the
+/// SQLite's own path is swapped after the connection's fd was read while the
 /// caller's path, through a retargeted ancestor, still resolves to the original
-/// file (hard-linked). Only the second stat of SQLite's path sees it.
+/// file (hard-linked). Only the stat of SQLite's own path sees it.
 #[cfg(unix)]
 #[test]
 fn record_rejects_sqlites_own_path_swapped_while_the_callers_path_still_resolves() {
     let dir = tempfile::tempdir().unwrap();
     let path = open_through_symlink(dir.path());
     let root = dir.path().to_owned();
-    let _seam = set_test_seam_hook(Seam::Fcntl, move || {
+    let _seam = set_test_seam_hook(Seam::Fd, move || {
         let first_db = root.join("first").join(".skuld.db");
         let second = root.join("second");
         std::fs::create_dir(&second).unwrap();
@@ -511,25 +509,23 @@ fn record_rejects_sqlites_own_path_swapped_while_the_callers_path_still_resolves
     let msg = panic_message(std::panic::catch_unwind(|| open_db(&path)));
 
     assert!(
-        msg.contains(&format!("{path:?}")) && msg.contains("while its identity was being recorded"),
+        msg.contains(&format!("{path:?}")) && msg.contains("no longer names the file"),
         "the second stat of SQLite's own path must reject this: {msg:?}"
     );
 }
 
-/// The `-wal`/`-shm` this connection has open are unlinked after schema init
-/// and recreated by another connection before the companions are recorded.
-/// Recording the path's files would adopt the other connection's; the record
-/// must reject them, because a connection writing to an unlinked WAL while
-/// another uses the new one is the split-brain this crate exists to prevent.
+/// Companions this connection has open are replaced by copies on new inodes
+/// after schema init, the way another opener recreating them would, before they
+/// are recorded. Recording the path's files would adopt the other opener's; the
+/// record must reject them, because a connection writing to an unlinked file
+/// while another uses the new one is the split-brain this crate exists to
+/// prevent. Each companion is swapped alone, so each one's check is load-bearing.
 #[cfg(unix)]
-#[test]
-fn record_rejects_companions_swapped_after_schema_init() {
+fn assert_swapped_companions_are_rejected(swapped: &'static [&'static str]) {
     let (_dir, path) = temp_db();
     let swap_path = path.clone();
     let _seam = set_test_seam_hook(Seam::SchemaInit, move || {
-        // Replace each companion with a copy on a new inode, the way another
-        // opener recreating it would, while this connection keeps the old ones.
-        for suffix in ["-wal", "-shm"] {
+        for suffix in swapped {
             let companion = companion_path(&swap_path, suffix);
             let copy = companion_path(&swap_path, &format!("{suffix}.copy"));
             std::fs::copy(&companion, &copy).unwrap();
@@ -541,35 +537,130 @@ fn record_rejects_companions_swapped_after_schema_init() {
 
     assert!(
         msg.contains(&format!("{path:?}")) && msg.contains("-wal/-shm"),
-        "the record must reject swapped companions: {msg:?}"
+        "the record must reject swapped {swapped:?}: {msg:?}"
     );
 }
 
-// Open-file identities =====
-
-/// A file this process holds open is listed, and stops being once closed.
 #[cfg(unix)]
 #[test]
-fn open_file_identities_lists_exactly_the_files_this_process_holds_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = std::fs::File::create(dir.path().join("f")).unwrap();
-    let id = FileIdentity::of(&dir.path().join("f")).unwrap();
-
-    assert!(open_file_identities().contains(&id), "an open file must be listed");
-    drop(file);
-    assert!(!open_file_identities().contains(&id), "a closed file must not be");
+fn record_rejects_a_wal_swapped_after_schema_init() {
+    assert_swapped_companions_are_rejected(&["-wal"]);
 }
 
-/// The fallback that tries every descriptor agrees with the directory listing
-/// for a file this test holds open.
 #[cfg(unix)]
 #[test]
-fn scanning_descriptors_finds_the_same_open_file_as_the_directory_listing() {
-    let dir = tempfile::tempdir().unwrap();
-    let _file = std::fs::File::create(dir.path().join("f")).unwrap();
-    let id = FileIdentity::of(&dir.path().join("f")).unwrap();
+fn record_rejects_a_shm_swapped_after_schema_init() {
+    assert_swapped_companions_are_rejected(&["-shm"]);
+}
 
-    assert!(scan_open_file_identities(4096).contains(&id));
+// The connection's own fds =====
+
+/// The mirrored struct layout is the bundled SQLite's. An upgrade must re-check
+/// `unix_fds.rs` against its `os_unix.c`, then bump this.
+#[cfg(unix)]
+#[test]
+fn bundled_sqlite_is_the_version_whose_unix_layout_is_mirrored() {
+    assert_eq!(
+        rusqlite::version(),
+        "3.53.2",
+        "the bundled SQLite changed: re-verify the unixFile/unixShm/unixShmNode layout mirrored in \
+         moved_db/unix_fds.rs, then update this version"
+    );
+}
+
+/// Pins the layout at run time: each fd read from SQLite is the file SQLite
+/// created at that path, and is open.
+#[cfg(unix)]
+#[test]
+fn the_connections_fds_are_the_files_sqlite_created() {
+    use super::moved_db::unix_fds;
+    let (_dir, path) = temp_db();
+    let (conn, _identity) = open_db(&path);
+    let db = std::path::PathBuf::from(conn.path().unwrap());
+    for (what, fd, file) in [
+        ("main", unix_fds::main_fd(&conn), db.clone()),
+        ("wal", unix_fds::wal_fd(&conn), companion_path(&db, "-wal")),
+        ("shm", unix_fds::shm_fd(&conn), companion_path(&db, "-shm")),
+    ] {
+        assert_eq!(
+            fd_identity(fd),
+            FileIdentity::of(&file),
+            "the {what} fd {fd} must be open and be the file at {file:?}"
+        );
+    }
+}
+
+// Two filesystems =====
+
+/// The two directories `SKULD_TEST_FS_A` / `SKULD_TEST_FS_B` name, on different
+/// filesystems. `SKULD_TEST_TWO_FS=0` opts out explicitly; otherwise missing
+/// provisioning fails the test rather than skipping it.
+///
+/// Provision, in a container or on CI (CI does this in `ci.yaml`), e.g.
+/// `docker run --rm --network none --tmpfs /fs-a --tmpfs /fs-b ...` with
+/// `SKULD_TEST_FS_A=/fs-a SKULD_TEST_FS_B=/fs-b`.
+#[cfg(target_os = "linux")]
+fn two_filesystems() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    if std::env::var("SKULD_TEST_TWO_FS").as_deref() == Ok("0") {
+        eprintln!("SKULD_TEST_TWO_FS=0: skipping the cross-device test by explicit opt-out");
+        return None;
+    }
+    let dir = |var: &str| {
+        std::path::PathBuf::from(std::env::var_os(var).unwrap_or_else(|| {
+            panic!(
+                "{var} is not set: this test needs two directories on different filesystems (see \
+                 `two_filesystems`), or SKULD_TEST_TWO_FS=0 to opt out"
+            )
+        }))
+    };
+    Some((dir("SKULD_TEST_FS_A"), dir("SKULD_TEST_FS_B")))
+}
+
+/// A file on another device with the same inode number replaces the database
+/// (a symlink to it, so SQLite's own inode-only `HAS_MOVED` comparison still
+/// answers "not moved"). Only the connection's own fd, compared with device as
+/// well as inode, tells the two apart: recording `stat(path)` would adopt the
+/// impostor.
+#[cfg(target_os = "linux")]
+#[test]
+fn record_rejects_a_same_inode_file_on_another_device() {
+    use std::os::unix::fs::MetadataExt;
+    let Some((fs_a, fs_b)) = two_filesystems() else { return };
+    let dir_a = tempfile::tempdir_in(&fs_a).unwrap();
+    let dir_b = tempfile::tempdir_in(&fs_b).unwrap();
+    assert_ne!(
+        dir_a.path().metadata().unwrap().dev(),
+        dir_b.path().metadata().unwrap().dev(),
+        "SKULD_TEST_FS_A and SKULD_TEST_FS_B must be different filesystems"
+    );
+    let path = dir_a.path().join(".skuld.db");
+    let (swap_path, b) = (path.clone(), dir_b.path().to_owned());
+    let _seam = set_test_seam_hook(Seam::Open, move || {
+        let ino = std::fs::metadata(&swap_path).unwrap().ino();
+        // Create files on B until one has the database's inode number.
+        for i in 0.. {
+            let filler = b.join(format!("filler-{i}"));
+            std::fs::write(&filler, b"an impostor").unwrap();
+            let got = std::fs::metadata(&filler).unwrap().ino();
+            assert!(
+                got <= ino,
+                "cannot give a file on B inode {ino}: its next inode is already {got}"
+            );
+            if got == ino {
+                std::fs::rename(&filler, b.join(".skuld.db")).unwrap();
+                break;
+            }
+        }
+        std::fs::remove_file(&swap_path).unwrap();
+        std::os::unix::fs::symlink(b.join(".skuld.db"), &swap_path).unwrap();
+    });
+
+    let msg = panic_message(std::panic::catch_unwind(|| open_db(&path)));
+
+    assert!(
+        msg.contains("no longer names the file"),
+        "the record must reject a same-inode file on another device: {msg:?}"
+    );
 }
 
 // Failures during an unwind =====

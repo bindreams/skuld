@@ -148,6 +148,20 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # The cross-device moved-DB test needs two filesystems.
+      - name: Provision two filesystems
+        if: matrix.os == 'linux'
+        run: |
+          set -euo pipefail
+          for fs in a b; do
+            sudo mkdir -p "/mnt/skuld-fs-$fs"
+            sudo mount -t tmpfs -o mode=1777 tmpfs "/mnt/skuld-fs-$fs"
+          done
+          {
+            echo "SKULD_TEST_FS_A=/mnt/skuld-fs-a"
+            echo "SKULD_TEST_FS_B=/mnt/skuld-fs-b"
+          } >> "$GITHUB_ENV"
+
       - name: Build workspace
         # Exclude xtask from the matrix: it's a dev tool run only on the lint
         # host (Linux), and its deps aren't worth cross-compiling to 6 targets.

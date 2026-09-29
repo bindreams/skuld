@@ -208,9 +208,11 @@ FILE_SHARE_WRITE` and no `FILE_SHARE_DELETE`, so Windows itself refuses
     does.
   - A symlink or junction _ancestor_ of the path being retargeted is
     detected, on both platforms.
-  - The recorded identity is checked against the connection's own files,
-    not just a later `stat` of the path, so a file swapped in between the
-    open and the recording is rejected instead of adopted.
+  - The recorded identity is read from the file descriptors SQLite itself
+    holds open (Unix) or its own handle (Windows), not from a `stat` of the
+    path, so a file swapped in between the open and the recording is
+    rejected instead of adopted, even one on another device with the same
+    inode number.
   - The coordination DB's init lock is checked for the same split (a
     replaced profile directory, or a retargeted ancestor of the lock file on
     Windows).

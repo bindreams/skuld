@@ -133,10 +133,10 @@ pub(crate) enum Seam {
     Delete,
     /// `open_db`, right after the connection opened, before identity is recorded.
     Open,
-    /// Recording the main identity, between the `SQLITE_FCNTL_HAS_MOVED` check
-    /// and the stat it is validated against.
+    /// Recording the main identity, between reading the connection's own fd and
+    /// the path stats it is validated against.
     #[cfg(unix)]
-    Fcntl,
+    Fd,
     /// `open_db`, right after schema init, before the companions are recorded.
     SchemaInit,
 }
