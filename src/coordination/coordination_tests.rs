@@ -935,6 +935,12 @@ fn global_serial_prevents_concurrent_execution() {
     std::thread::scope(|s| {
         for point in points {
             s.spawn(|| {
+                // MUTANT: an alive-but-stuck participant that never reaches wait().
+                if std::thread::current().name().is_none() {
+                    loop {
+                        std::thread::park();
+                    }
+                }
                 point.wait();
                 let _reg = coordinate(&path, "serial_test", &[], SERIAL_ALL);
                 running.fetch_add(1, SeqCst);
