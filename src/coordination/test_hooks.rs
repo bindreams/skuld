@@ -149,7 +149,6 @@ thread_local! {
 
 /// Clears the calling thread's after-write hook on drop.
 #[must_use = "the hook is removed when this guard drops"]
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct SeamHookGuard(());
 
 impl Drop for SeamHookGuard {
@@ -159,7 +158,6 @@ impl Drop for SeamHookGuard {
 }
 
 /// Run `f` on the calling thread once, at the next `site` write.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn set_test_seam_hook(site: Seam, f: impl FnOnce() + 'static) -> SeamHookGuard {
     SEAM_HOOK.with(|c| {
         let mut slot = c.borrow_mut();

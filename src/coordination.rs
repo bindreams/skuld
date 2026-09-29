@@ -12,7 +12,7 @@ mod lock_tests;
 #[cfg(test)]
 mod migrate_tests;
 mod moved_db;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod moved_db_tests;
 #[cfg(unix)]
 mod publish;

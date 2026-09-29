@@ -3,32 +3,63 @@
 //! else) turns the test red.
 
 use super::coordination_tests::temp_db;
+use super::moved_db::Failure;
+#[cfg(unix)]
+use super::moved_db::FileIdentity;
+#[cfg(unix)]
 use super::moved_db::{
-    companion_path, has_moved_via_fcntl, open_file_identities, scan_open_file_identities, DbIdentity, Failure,
-    FileIdentity,
+    companion_path, has_moved_via_fcntl, open_file_identities, scan_open_file_identities, DbIdentity,
 };
-use super::test_hooks::{retry_rendezvous, set_test_retry_hook, set_test_seam_hook, Seam};
+#[cfg(unix)]
+use super::test_hooks::{retry_rendezvous, set_test_retry_hook};
+use super::test_hooks::{set_test_seam_hook, Seam};
 use super::{coordinate, open_db, SERIAL_NONE};
+
+fn symlink_dir(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(target, link)
+        .expect("creating a directory symlink must succeed in this CI environment");
+}
 
 /// `dir/link` -> `dir/first`, with `dir/first/.skuld.db` opened through it.
 /// Returns the symlink-routed path.
 fn open_through_symlink(dir: &std::path::Path) -> std::path::PathBuf {
     let first = dir.join("first");
     std::fs::create_dir(&first).unwrap();
-    std::os::unix::fs::symlink(&first, dir.join("link")).unwrap();
+    symlink_dir(&first, &dir.join("link"));
     dir.join("link").join(".skuld.db")
 }
 
-/// Atomically repoint `dir/link` at `target`.
+/// Repoint `dir/link` at `target`: atomically on Unix (a fresh symlink renamed
+/// over the old one), remove-and-recreate on Windows.
 fn retarget_link(dir: &std::path::Path, target: &std::path::Path) {
-    let tmp = dir.join("link.tmp");
-    std::os::unix::fs::symlink(target, &tmp).unwrap();
-    std::fs::rename(&tmp, dir.join("link")).unwrap();
+    #[cfg(unix)]
+    {
+        let tmp = dir.join("link.tmp");
+        symlink_dir(target, &tmp);
+        std::fs::rename(&tmp, dir.join("link")).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        std::fs::remove_dir(dir.join("link")).unwrap();
+        symlink_dir(target, &dir.join("link"));
+    }
+}
+
+/// Repoint `dir/link` at a new, empty directory: the DB no longer exists at
+/// the path, on either platform.
+fn retarget_to_empty_dir(dir: &std::path::Path) {
+    let empty = dir.join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    retarget_link(dir, &empty);
 }
 
 /// Only `SQLITE_FCNTL_HAS_MOVED` sees this: the caller's path still resolves
 /// to the original inode (through a hard link in a retargeted directory), but
 /// the path SQLite resolved at open time now names a different file.
+#[cfg(unix)]
 #[test]
 fn db_has_moved_is_caught_by_the_sqlite_fcntl_alone() {
     let dir = tempfile::tempdir().unwrap();
@@ -63,6 +94,7 @@ fn db_has_moved_is_caught_by_the_sqlite_fcntl_alone() {
 /// Only the independent `FileIdentity` comparison sees this: a symlink
 /// ancestor retargeted to a directory holding a different file leaves
 /// SQLite's own resolved path untouched.
+#[cfg(unix)]
 #[test]
 fn db_has_moved_is_caught_by_the_file_identity_alone() {
     let dir = tempfile::tempdir().unwrap();
@@ -93,6 +125,7 @@ fn db_has_moved_is_caught_by_the_file_identity_alone() {
 /// the DB file keeps its inode (hard-linked into the replacement directory),
 /// so every moved-DB check passes, and only the init lock's directory split.
 /// The witness proves `INIT_SQL` never ran.
+#[cfg(unix)]
 #[test]
 fn open_db_schema_write_is_stopped_by_a_split_lock_alone() {
     let outer = tempfile::tempdir().unwrap();
@@ -156,13 +189,12 @@ fn assert_moved_panic(result: std::thread::Result<()>, path: &std::path::Path) {
 /// not hand back a registration in an orphaned file.
 #[test]
 fn coordinate_fails_loudly_when_the_db_moves_right_after_its_commit() {
-    let (_dir, path) = temp_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = open_through_symlink(dir.path());
     let path2 = path.clone();
+    let root = dir.path().to_owned();
     let result = std::thread::spawn(move || {
-        let doomed = path2.clone();
-        let _hook = set_test_seam_hook(Seam::Commit, move || {
-            std::fs::remove_file(&doomed).unwrap();
-        });
+        let _hook = set_test_seam_hook(Seam::Commit, move || retarget_to_empty_dir(&root));
         // Forgotten, not dropped: its own Drop would also panic on the
         // moved DB and mask a `coordinate` that returned normally.
         std::mem::forget(coordinate(&path2, "a", &[], SERIAL_NONE));
@@ -175,13 +207,12 @@ fn coordinate_fails_loudly_when_the_db_moves_right_after_its_commit() {
 /// succeeded must still panic.
 #[test]
 fn registration_drop_fails_loudly_when_the_db_moves_right_after_its_delete() {
-    let (_dir, path) = temp_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = open_through_symlink(dir.path());
     let a = coordinate(&path, "a", &[], SERIAL_NONE);
-    let path2 = path.clone();
+    let root = dir.path().to_owned();
     let result = std::thread::spawn(move || {
-        let _hook = set_test_seam_hook(Seam::Delete, move || {
-            std::fs::remove_file(&path2).unwrap();
-        });
+        let _hook = set_test_seam_hook(Seam::Delete, move || retarget_to_empty_dir(&root));
         drop(a);
     })
     .join();
@@ -278,9 +309,10 @@ fn failure_message_names_a_full_disk() {
 /// them can be the symptom of a swapped `-wal`/`-shm`.
 #[test]
 fn failure_message_says_moved_for_every_class_when_the_db_moved() {
-    let (_dir, path) = temp_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = open_through_symlink(dir.path());
     let (conn, identity) = open_db(&path);
-    std::fs::remove_file(&path).unwrap();
+    retarget_to_empty_dir(dir.path());
     for f in every_class(&conn) {
         let msg = identity.failure_message(&conn, &f, &path, "ctx");
         assert!(
@@ -292,6 +324,7 @@ fn failure_message_says_moved_for_every_class_when_the_db_moved() {
 }
 
 /// A lost `-wal` alone is a confirmed move.
+#[cfg(unix)]
 #[test]
 fn failure_message_says_moved_when_only_a_companion_was_lost() {
     let (_dir, path) = temp_db();
@@ -329,6 +362,57 @@ fn a_captured_failure_keeps_its_errno_after_a_later_failure_overwrites_it() {
     );
 }
 
+// Companions =====
+
+/// Both platforms record `-wal` and `-shm`, and a fresh open reports nothing moved.
+#[test]
+fn open_db_records_both_companions_and_reports_them_unmoved() {
+    let (_dir, path) = temp_db();
+    let (conn, identity) = open_db(&path);
+
+    assert!(identity.companions.is_some(), "open_db must record the companions");
+    assert!(!identity.has_moved(&conn, &path));
+}
+
+/// A retargeted ancestor is reported through the main identity. The tracked
+/// companions are the connection's own files, found through SQLite's resolved
+/// path (Unix) or the main handle's final path (Windows), so the retarget does
+/// not redirect them and they are not what reports it.
+#[test]
+fn an_ancestor_retarget_is_caught_by_the_main_identity_not_the_companions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = open_through_symlink(dir.path());
+    let (conn, identity) = open_db(&path);
+
+    retarget_to_empty_dir(dir.path());
+
+    assert!(identity.has_moved(&conn, &path), "the retarget must be reported");
+    let companions = identity.companions.as_ref().unwrap();
+    assert!(
+        !companions.wal.has_moved() && !companions.shm.has_moved(),
+        "the companions must still name the connection's own files"
+    );
+}
+
+/// Windows cannot replace a companion out from under an open connection: the
+/// share mode withholds `FILE_SHARE_DELETE`, which is why recording them needs
+/// no cross-check there. If a SQLite upgrade changes that, this fails instead
+/// of a swapped companion going unnoticed.
+#[cfg(windows)]
+#[test]
+fn windows_open_db_companions_block_delete_and_rename_while_held() {
+    let (_dir, path) = temp_db();
+    let (_conn, identity) = open_db(&path);
+    let companions = identity.companions.as_ref().unwrap();
+    for tracked in [&companions.wal, &companions.shm] {
+        let remove_err = std::fs::remove_file(&tracked.path).expect_err("deleting a held companion must fail");
+        assert_eq!(remove_err.raw_os_error(), Some(32), "{remove_err}");
+        let renamed = tracked.path.with_extension("renamed");
+        let rename_err = std::fs::rename(&tracked.path, &renamed).expect_err("renaming a held companion must fail");
+        assert_eq!(rename_err.raw_os_error(), Some(32), "{rename_err}");
+    }
+}
+
 // Record-time identity =====
 
 /// The panic message of a caught `open_db`-style call that must have panicked.
@@ -344,6 +428,7 @@ fn panic_message<T>(result: std::thread::Result<T>) -> String {
 /// check passed and before the stat it is validated against. Recording the
 /// stat alone would adopt the replacement as this connection's own identity;
 /// the record must reject it instead, before any write.
+#[cfg(unix)]
 #[test]
 fn record_rejects_a_file_swapped_in_between_the_fcntl_check_and_the_stat() {
     let (dir, path) = temp_db();
@@ -364,6 +449,7 @@ fn record_rejects_a_file_swapped_in_between_the_fcntl_check_and_the_stat() {
 
 /// A different file renamed over the path right after the open: SQLite's own
 /// record already disagrees with the path, which `SQLITE_FCNTL_HAS_MOVED` reports.
+#[cfg(unix)]
 #[test]
 fn record_rejects_a_file_swapped_in_right_after_the_open() {
     let (dir, path) = temp_db();
@@ -405,6 +491,7 @@ fn record_rejects_an_ancestor_retargeted_right_after_the_open() {
 /// SQLite's own path is swapped after the fcntl check passed while the
 /// caller's path, through a retargeted ancestor, still resolves to the original
 /// file (hard-linked). Only the second stat of SQLite's path sees it.
+#[cfg(unix)]
 #[test]
 fn record_rejects_sqlites_own_path_swapped_while_the_callers_path_still_resolves() {
     let dir = tempfile::tempdir().unwrap();
@@ -434,6 +521,7 @@ fn record_rejects_sqlites_own_path_swapped_while_the_callers_path_still_resolves
 /// Recording the path's files would adopt the other connection's; the record
 /// must reject them, because a connection writing to an unlinked WAL while
 /// another uses the new one is the split-brain this crate exists to prevent.
+#[cfg(unix)]
 #[test]
 fn record_rejects_companions_swapped_after_schema_init() {
     let (_dir, path) = temp_db();
@@ -460,6 +548,7 @@ fn record_rejects_companions_swapped_after_schema_init() {
 // Open-file identities =====
 
 /// A file this process holds open is listed, and stops being once closed.
+#[cfg(unix)]
 #[test]
 fn open_file_identities_lists_exactly_the_files_this_process_holds_open() {
     let dir = tempfile::tempdir().unwrap();
@@ -473,6 +562,7 @@ fn open_file_identities_lists_exactly_the_files_this_process_holds_open() {
 
 /// The fallback that tries every descriptor agrees with the directory listing
 /// for a file this test holds open.
+#[cfg(unix)]
 #[test]
 fn scanning_descriptors_finds_the_same_open_file_as_the_directory_listing() {
     let dir = tempfile::tempdir().unwrap();
@@ -489,11 +579,12 @@ fn scanning_descriptors_finds_the_same_open_file_as_the_directory_listing() {
 /// write and records that) instead of abandoning the row unnoticed.
 #[test]
 fn a_post_commit_panic_unwinds_through_the_registrations_drop() {
-    let (_dir, path) = temp_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = open_through_symlink(dir.path());
     let path2 = path.clone();
+    let root = dir.path().to_owned();
     let result = std::thread::spawn(move || {
-        let doomed = path2.clone();
-        let _hook = set_test_seam_hook(Seam::Commit, move || std::fs::remove_file(&doomed).unwrap());
+        let _hook = set_test_seam_hook(Seam::Commit, move || retarget_to_empty_dir(&root));
         coordinate(&path2, "a", &[], SERIAL_NONE)
     })
     .join();
@@ -511,6 +602,7 @@ fn a_post_commit_panic_unwinds_through_the_registrations_drop() {
 /// The split check must also run after the companions are recorded: a
 /// directory replaced wholesale in that window (every file hard-linked so no
 /// identity check trips) would otherwise become the baseline.
+#[cfg(unix)]
 #[test]
 fn open_db_rejects_a_split_landing_after_schema_init() {
     let outer = tempfile::tempdir().unwrap();

@@ -99,13 +99,13 @@ impl FileIdentity {
 
 /// A companion file and the identity recorded for it.
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct Tracked {
-    path: PathBuf,
+pub(super) struct Tracked {
+    pub(super) path: PathBuf,
     identity: FileIdentity,
 }
 
 impl Tracked {
-    fn has_moved(&self) -> bool {
+    pub(super) fn has_moved(&self) -> bool {
         FileIdentity::of(&self.path) != Some(self.identity)
     }
 }
@@ -114,8 +114,8 @@ impl Tracked {
 /// identity untouched, so the main identity alone cannot catch it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct Companions {
-    wal: Tracked,
-    shm: Tracked,
+    pub(super) wal: Tracked,
+    pub(super) shm: Tracked,
 }
 
 /// `path` with `suffix` appended verbatim (not [`Path::with_extension`], which
