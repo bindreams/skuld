@@ -8,13 +8,9 @@
 //! test — this must run as a genuine subprocess so that abort, if it
 //! happens, doesn't take the driver test binary down with it.
 //!
-//! Portable: `probe_drop_panic_during_unwind` corrupts the DB by dropping
-//! its `running` table via a second connection, which fails the
-//! registration's own `DELETE` on both platforms for the reasons documented
-//! on that function in `src/lib.rs`. The hazard this probe reproduces lives
-//! in `Drop`'s `catch_unwind`/`thread::panicking()` logic, which is not
-//! platform-gated, so this probe runs on every CI lane rather than only
-//! Unix.
+//! Portable: the hazard lives in `Drop`'s `catch_unwind`/`thread::panicking()`
+//! logic, which is not platform-gated; the corruption method is documented on
+//! `probe_drop_panic_during_unwind`.
 //!
 //! Reads `SKULD_DROP_PANIC_PROBE_DB` (required: an isolated coordination DB
 //! path — never the real shared workspace `.skuld.db`). Exits via a single

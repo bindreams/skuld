@@ -247,7 +247,7 @@ fn registration_guard_cleans_up_on_panic() {
 /// has no way to tell the two incarnations apart by id alone, and silently
 /// deletes whichever row currently has that id — `b`'s, not `a`'s, once the
 /// file's been recreated. `a` now fails loudly instead (its connection's
-/// file has moved — see `panic_on_moved_db`), which incidentally also
+/// file has moved — see `DbIdentity::panic_if_moved`), which incidentally also
 /// closes the id-collision hole: a drop that panics before ever reaching
 /// the `DELETE` can't delete the wrong row either.
 ///
@@ -314,7 +314,7 @@ fn registration_drop_fails_loudly_instead_of_deleting_a_different_registration_t
 /// main file — the two halves stop agreeing on the database's actual size
 /// and content. The owner's decision: fail loudly instead of writing
 /// through a connection in that state. `a`'s cleanup now checks
-/// `SQLITE_FCNTL_HAS_MOVED` (see [`panic_on_moved_db`]) before its `DELETE`
+/// `SQLITE_FCNTL_HAS_MOVED` (see `DbIdentity::panic_if_moved`) before its `DELETE`
 /// and refuses to run it once the file it opened is gone, panicking with a
 /// clear message instead — and never risks touching `-wal`/`-shm` at all,
 /// so `b`'s own DB stays intact.
@@ -382,7 +382,7 @@ fn registration_drop_fails_loudly_instead_of_corrupting_when_only_the_main_file_
 ///
 /// **RED, before this fix:** `drop(a)` below succeeded silently even
 /// though its `-wal` companion was deleted. **GREEN, now:**
-/// `db_or_companions_have_moved`'s independent `-wal`/`-shm` identity
+/// `DbIdentity::has_moved`'s independent `-wal`/`-shm` identity
 /// check catches it.
 #[cfg(unix)]
 #[test]
@@ -622,7 +622,7 @@ fn open_db_fails_loudly_when_the_profile_directory_is_replaced_wholesale_mid_ret
 
 /// Finding 4 (round-6 review): the end-to-end test above can't distinguish
 /// "`panic_on_split_lock`'s in-loop call is present" from "it's missing but
-/// `panic_on_moved_db`'s co-located in-loop call still catches the same
+/// `DbIdentity::panic_if_moved`'s co-located in-loop call still catches the same
 /// event" — a wholesale directory replacement necessarily also changes
 /// what `path` resolves to, so the DB-file identity check independently
 /// catches every reachable end-to-end scenario that splits the lock,
@@ -630,7 +630,7 @@ fn open_db_fails_loudly_when_the_profile_directory_is_replaced_wholesale_mid_ret
 /// unobservable there by construction, not by a gap in that test. This
 /// tests `target_has_split` itself directly instead, the same way
 /// `db_has_moved_detects_a_fresh_file_renamed_over_the_path_while_a_connection_is_open`
-/// tests `db_has_moved` directly for the same reason.
+/// tests `DbIdentity::has_moved` directly for the same reason.
 #[cfg(unix)]
 #[test]
 fn init_lock_target_has_split_detects_a_wholesale_directory_replacement() {
@@ -688,7 +688,7 @@ fn init_lock_target_has_split_detects_a_retargeted_symlink_ancestor_windows() {
 
 /// Finding 5 (round-6 review): `coordinate`'s own loop must catch a move
 /// landing mid-retry too, the same way `open_db`'s and `TestRegistration`'s
-/// do — checked (via `panic_on_moved_db_full`) at the top of every
+/// do — checked (via `DbIdentity::panic_if_moved`) at the top of every
 /// iteration, before the transaction closure runs, not just once before
 /// the loop started.
 #[cfg(unix)]
@@ -735,7 +735,7 @@ fn coordinate_fails_loudly_when_the_db_moves_mid_retry() {
 
 /// Finding 4a (round-5 review): `SQLITE_FCNTL_HAS_MOVED` alone doesn't
 /// reliably catch a symlink *ancestor* of `path` being retargeted mid-run —
-/// see `db_has_moved`'s doc for why. `FileIdentity`'s own independent
+/// see `DbIdentity::has_moved`'s doc for why. `FileIdentity`'s own independent
 /// dev+ino check closes this: it always re-resolves the caller's own
 /// `path` fresh, following whatever a symlink in it currently points to
 /// right now, rather than relying solely on what SQLite itself tracks
@@ -828,10 +828,10 @@ fn registration_drop_fails_loudly_when_a_parent_symlink_is_retargeted_mid_run_wi
     );
 }
 
-/// Finding 4 (round-6 review): a direct unit test of `db_has_moved` itself,
+/// Finding 4 (round-6 review): a direct unit test of `DbIdentity::has_moved` itself,
 /// against a fresh file renamed atomically over `path` while `conn` stays
 /// open — not going through `coordinate`/`Drop`, so a mutation that only
-/// breaks one of `db_has_moved`'s two independent checks can't hide behind
+/// breaks one of `DbIdentity::has_moved`'s two independent checks can't hide behind
 /// the other one catching the same higher-level scenario for an unrelated
 /// reason.
 #[cfg(unix)]
@@ -852,14 +852,14 @@ fn db_has_moved_detects_a_fresh_file_renamed_over_the_path_while_a_connection_is
     );
 }
 
-/// `db_has_moved` skips the `SQLITE_FCNTL_HAS_MOVED` file-control on
+/// `DbIdentity::has_moved` skips the `SQLITE_FCNTL_HAS_MOVED` file-control on
 /// Windows entirely (SQLite's `winFileControl` has no case for it — it
 /// always answers `SQLITE_NOTFOUND`, confirmed against the `bundled`
 /// `sqlite3.c` this crate compiles) and instead relies on an invariant:
 /// `winOpen` opens the main database file without `FILE_SHARE_DELETE`, so
 /// while any connection holds it open, nothing else on the system can
 /// delete or rename it. This test exercises that invariant directly,
-/// independent of `db_has_moved`'s own logic — if a future SQLite/rusqlite
+/// independent of `DbIdentity::has_moved`'s own logic — if a future SQLite/rusqlite
 /// upgrade ever changes the share mode, this test starts failing instead of
 /// a moved database silently going unnoticed.
 #[cfg(windows)]
@@ -976,38 +976,14 @@ fn filtered_serial_blocks_only_matching_tests() {
     assert!(!can_start(&conn, &[docker], SERIAL_NONE).unwrap());
 }
 
-/// Reproduces genuine `SQLITE_BUSY` contention on the very first schema
-/// creation — the only shape that write can ever actually see it (see
-/// `open_db`'s own doc): something outside Skuld's own locking discipline
-/// holds a real `BEGIN EXCLUSIVE` on the (empty, schema-less) file while
-/// `open_db` tries to create the tables for the first time. This only
-/// reproduces at all because `connect_locked` disables rusqlite's own
-/// default 5 s `busy_timeout` on every connection it returns — with that
-/// still active, the contention below would resolve (or fail) inside
-/// SQLite's own internal busy handler before `retry_busy` ever saw an error
-/// to retry, taking whatever fraction of that 5 s the holder happened to
-/// occupy instead of the ~0.1 s this test actually takes.
+/// Genuine `SQLITE_BUSY` on the very first schema creation: something outside
+/// Skuld's locking holds a `BEGIN EXCLUSIVE` on the empty file while `open_db`
+/// creates the tables. It reproduces quickly only because `connect_locked`
+/// disables rusqlite's 5 s `busy_timeout`.
 ///
-/// Proven deterministically, the same way `lock_tests.rs`'s
-/// `lock_exclusive_retries_past_eintr_from_a_non_restarting_handler` proves
-/// a real `EINTR` was retried: block on the receiving end of a channel this
-/// test's own waiter thread activates via `set_test_retry_hook` —
-/// `retry_busy` sends on it only from inside its own retryable-error arm,
-/// and only on that one thread — until either it fires (direct evidence a
-/// real `SQLITE_BUSY` was hit and retried by *this* call, not just that the
-/// call eventually returned) or the sender is dropped because the thread
-/// exited without ever retrying, which turns a broken retry path into a
-/// clean test failure via `recv()`'s `Err` instead of a hang. A process-wide
-/// signal would not do for the first part: `retry_busy` also runs inside
-/// every `TestRegistration`'s cleanup on drop, for every test in this
-/// binary, so an unrelated concurrently-running test's own contention could
-/// fire it first — releasing this test's foreign holder before its own
-/// waiter ever actually retried. No sleep, no wall-clock assertion.
-///
-/// On the old, broken code (`busy_timeout(5 s)` plus a single
-/// `execute_batch` attempt): `open_db` panics once that fixed timeout
-/// elapses, regardless of whether the holder ever lets go — the cap this
-/// change removes.
+/// Deterministic: the worker's retry hook is a rendezvous (see `test_hooks`),
+/// and the test lets it retry [`NO_CAP_RETRIES`] times against the held lock
+/// before releasing it, so a cap below that fails. No sleep, no clock.
 #[test]
 fn open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap() {
     let (_dir, path) = temp_db();
@@ -1043,20 +1019,9 @@ fn open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap()
     assert_eq!(count, 0);
 }
 
-/// The same uncapped-retry principle, for [`TestRegistration`]'s cleanup:
-/// its `DELETE` can genuinely contend with a concurrent, already-initialized
-/// connection mid-`BEGIN EXCLUSIVE` — the ordinary shape of a live
-/// [`coordinate`] caller, since that other connection never takes any init
-/// lock either, once its own `open_db` call has returned. (Cleanup itself
-/// doesn't take the init lock at all any more — it deletes through the same
-/// connection `coordinate` registered on, never reconnecting; see
-/// `TestRegistration`'s own doc.) Same deterministic, per-thread proof as
-/// the test above (a channel `retry_busy` sends on, not a spin loop or a
-/// counter); no sleep, no wall-clock assertion.
-///
-/// On the old, broken code (`busy_timeout(5 s)`, warn-and-swallow on
-/// failure): the row could be left behind with only a warning printed, no
-/// panic and no retry past the fixed timeout.
+/// The same uncapped retry for [`TestRegistration`]'s cleanup, whose `DELETE`
+/// can contend with a live `coordinate` caller's `BEGIN EXCLUSIVE`. Same
+/// rendezvous, with [`NO_CAP_RETRIES`] retries before the lock is released.
 #[test]
 fn registration_drop_deletes_past_a_concurrent_held_exclusive_lock_with_no_retry_cap() {
     let (_dir, path) = temp_db();
@@ -1115,18 +1080,9 @@ fn open_db_disables_rusqlites_default_busy_timeout() {
     );
 }
 
-/// `coordinate`'s own retry loop — not `retry_busy` (see the comment at its
-/// call site in `coordination.rs`) — is what retries a transient busy
-/// error from its `BEGIN EXCLUSIVE` attempt, uncapped, gated on the error
-/// code alone. Reproduced and proven the same deterministic way as
-/// `open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap`:
-/// a channel `coordinate`'s retry arm sends on via the same
-/// `set_test_retry_hook`/`signal_test_retry_hook` machinery `retry_busy`
-/// uses. This only reproduces quickly because `connect_locked` disables
-/// rusqlite's own default `busy_timeout`: with that still active, ordinary
-/// short-lived contention between two `coordinate` callers would often
-/// resolve inside SQLite's own internal busy handler before this arm ever
-/// saw an error to retry — see `open_db`'s doc.
+/// `coordinate`'s own retry arm (not `retry_busy`) retries a busy
+/// `BEGIN EXCLUSIVE` uncapped, on the error code alone. Same rendezvous, with
+/// [`NO_CAP_RETRIES`] retries before the lock is released.
 #[test]
 fn coordinate_retries_a_busy_begin_exclusive_with_no_retry_cap() {
     let (_dir, path) = temp_db();
@@ -1287,20 +1243,10 @@ fn migration_skips_already_canonical_rows() {
     assert_eq!(stored_serial_filter(&conn, "already_canonical"), "a");
 }
 
-/// `migrate_schema` runs on `open_db`'s connection, which has rusqlite's
-/// default `busy_timeout` disabled (see `open_db`'s doc). Its `BEGIN
-/// IMMEDIATE` lock acquisition genuinely contends with a concurrent `BEGIN
-/// EXCLUSIVE` elsewhere — its outer `PRAGMA user_version` read does *not*:
-/// in WAL mode a plain read doesn't conflict with another connection's write
-/// lock at all (only `SQLITE_BUSY_RECOVERY`, not reproduced here, would
-/// affect it; see `migrate_schema`'s own doc). So this test's foreign holder
-/// forces contention specifically on `BEGIN IMMEDIATE`. Without `retry_busy`
-/// wrapping that call, disabling `busy_timeout` would have been a
-/// regression — migration would silently skip on the very first
-/// `SQLITE_BUSY` it hit, with none of the grace period rusqlite's own
-/// default `busy_timeout` used to give it incidentally. Same deterministic,
-/// per-thread channel proof as
-/// `open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap`.
+/// `migrate_schema`'s `BEGIN IMMEDIATE` contends with a live `BEGIN EXCLUSIVE`
+/// (its `PRAGMA user_version` read does not: a WAL read never conflicts with a
+/// write lock). It must retry uncapped rather than skip the migration on the
+/// first `SQLITE_BUSY`. Same rendezvous, with [`NO_CAP_RETRIES`] retries.
 #[test]
 fn migrate_schema_completes_past_a_foreign_held_exclusive_lock_with_no_retry_cap() {
     let (_dir, path) = temp_db();

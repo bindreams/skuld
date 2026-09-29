@@ -226,26 +226,14 @@ pub mod __private {
 
     /// Probe hook for Skuld's own test suite: register in the coordination
     /// DB at `path`, corrupt its schema so `_registration`'s own cleanup
-    /// fails later, then panic — while the registration guard is still
-    /// alive, so unwinding drops it. Without a `catch_unwind` guard in
-    /// `Drop`, an uncaught panic during that drop is a panic during a panic
-    /// (this probe's own, already unwinding), which Rust turns into
-    /// `abort()` (`SIGABRT`) — killing the whole process, not just this one
-    /// failing test. Needs a genuine subprocess: aborting the calling
-    /// process is the whole point of the probe.
+    /// fails later, then panic while the guard is still alive, so unwinding
+    /// drops it. Without a `catch_unwind` in `Drop`, its panic during that
+    /// unwind would `abort()` the whole process. Needs a genuine subprocess:
+    /// aborting the caller is the point of the probe.
     ///
-    /// Corruption method: a *second*, independent connection drops the
-    /// `running` table out from under `_registration`'s own connection.
-    /// `TestRegistration` never reconnects (see its own doc for why doing
-    /// so would be a correctness bug, not just redundant), so corrupting the
-    /// file at `path` itself — this probe's previous method, replacing it
-    /// with a directory — no longer reaches `_registration`'s cleanup at
-    /// all: its connection's open file descriptor still points at the
-    /// original, valid inode regardless of what a directory-replacement
-    /// does to the path. Dropping the table instead is a schema change
-    /// SQLite propagates to every connection still open against that same
-    /// file, `_registration`'s included, the next time it prepares a
-    /// statement — exactly what its cleanup's `DELETE` does.
+    /// Corruption: a second connection drops `running`, which SQLite
+    /// propagates to `_registration`'s connection on its next prepare,
+    /// failing its cleanup `DELETE`.
     pub fn probe_drop_panic_during_unwind(path: &std::path::Path) {
         let _registration = crate::coordination::coordinate(path, "probe", &[], "");
         let (saboteur, _identity) = crate::coordination::open_db(path);
@@ -260,20 +248,12 @@ pub mod __private {
         );
     }
 
-    /// Probe hook for Skuld's own test suite: prove that `SQLITE_OPEN_PRIVATE_CACHE`
-    /// (set on every connection Skuld opens — see its own comment at the
-    /// Unix `connect_with_hooks` flags) keeps ordinary contention between
-    /// two of Skuld's own connections reporting as `SQLITE_BUSY`, even when
-    /// something else in the process has turned SQLite's shared-cache mode
-    /// on globally first. `sqlite3_enable_shared_cache` is process-global
-    /// and this process also runs arbitrary user test code Skuld doesn't
-    /// control, so this isn't a hypothetical: without the flag, this exact
-    /// scenario reports `SQLITE_LOCKED` instead (confirmed by hand before
-    /// writing this probe — the `debug_assert!` in `retry_busy` that treats
-    /// `SQLITE_LOCKED` as always a same-connection self-conflict would then
-    /// be wrong, and would fire). Needs a genuine subprocess:
-    /// `sqlite3_enable_shared_cache` has no un-set, so this can't share a
-    /// process with any other test.
+    /// Probe hook for Skuld's own test suite: prove that
+    /// `SQLITE_OPEN_PRIVATE_CACHE` (set on every connection Skuld opens, see
+    /// `connect_with_hooks`) keeps contention between two of Skuld's own
+    /// connections reporting `SQLITE_BUSY` even when something else in the
+    /// process enabled shared-cache mode globally first. Needs a genuine
+    /// subprocess: `sqlite3_enable_shared_cache` has no un-set.
     pub fn probe_shared_cache_still_reports_busy(path: &std::path::Path) {
         // Safety: `sqlite3_enable_shared_cache` has no documented safety
         // precondition beyond "call it before opening the connections you

@@ -9,10 +9,7 @@
 //! those two functions document, not all waiting: SQLite's own locking still
 //! applies to work done *while* this lock is held, against connections that
 //! never take this lock at all (e.g. another process's `BEGIN EXCLUSIVE`
-//! inside `coordinate`) — that residual contention is handled by
-//! `super::retry_busy`'s uncapped, error-code-gated retry, not rusqlite's own
-//! default 5 s `busy_timeout` (every connection [`super::connect_locked`]
-//! returns has that disabled — see its own doc).
+//! inside `coordinate`), which `super::retry_busy` handles.
 //!
 //! The lock itself is `flock` on Unix, `LockFileEx` on Windows — but the two
 //! platforms reach it through different code. Windows goes through
@@ -22,8 +19,7 @@
 //! the Unix targets it otherwise treats as `flock`-capable, and Android is
 //! missing from that subset — calling `std`'s version there panics
 //! `"lock() not supported"` on every `open_db` call instead of ever
-//! acquiring anything (`TestRegistration::drop` no longer takes this lock
-//! at all — see its own doc). `rustix::fs::flock` calls the same underlying
+//! acquiring anything. `rustix::fs::flock` calls the same underlying
 //! syscall directly on every Unix this crate supports, Android included.
 //!
 //! **The lock target can't be deleted or replaced by anything short of
@@ -63,7 +59,7 @@
 //!   is what tells the two groups apart: it records the held directory's
 //!   own `fstat` identity at acquisition and compares it against a fresh
 //!   `stat` of the same path on each check, the same dev+ino comparison
-//!   `super::FileIdentity` does for the DB file itself — a mismatch means
+//!   `super::moved_db::FileIdentity` does for the DB file itself — a mismatch means
 //!   this handle no longer locks what a fresh opener would.
 //! - **Windows** locks a sibling [`lock_path`] file, opened with
 //!   `share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)` and, deliberately, no
@@ -107,27 +103,11 @@ pub(super) fn lock_path(db_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Compile-time proof that the calling stack frame currently holds *some*
-/// init lock, obtained only from inside [`with_init_lock`]'s own closure —
-/// carrying the [`Path`] that lock was acquired for, so callers can check
-/// (via [`InitLockHeld::path`]) that it's actually *their* path's lock, not
-/// merely a token proving some unspecified lock is held. That check is a
-/// `debug_assert_eq!` at each real call site (`super::connect_locked`,
-/// `super::ensure_schema_locked`), not something this type enforces by
-/// construction: nothing here stops a caller from holding path A's lock and
-/// passing its token alongside path B — the type system only proves *a*
-/// lock is held, never *which* one matches the path in hand. Exists so
-/// functions that must only ever run while the right lock is held don't
-/// rely purely on a doc comment and callers remembering to nest correctly:
-/// a caller with no lock at all has no `&InitLockHeld` to pass, which is a
-/// compile error; a caller holding the *wrong* path's lock still compiles,
-/// but fails loudly in debug builds instead of silently. Not constructible
-/// outside this module, and carries no data beyond the path — it's a
-/// marker, not a capability that could itself be smuggled out and reused
-/// after the lock releases (there's nothing about holding a `&InitLockHeld`
-/// past `with_init_lock`'s call that the borrow checker doesn't already
-/// rule out, since the reference can't outlive the closure it was handed
-/// into).
+/// Proof that some init lock is held, carrying the path it was taken for.
+/// Obtainable only inside [`with_init_lock`]'s closure. Call sites
+/// `debug_assert_eq!` that the path matches; the type cannot enforce it, so a
+/// caller holding the wrong path's lock still compiles and fails loudly in debug
+/// builds.
 pub(super) struct InitLockHeld<'a> {
     path: &'a Path,
     /// `fstat`-derived dev+ino (Unix) or `GetFileInformationByHandle`-derived
@@ -146,15 +126,12 @@ impl<'a> InitLockHeld<'a> {
         self.path
     }
 
-    /// True once the directory this token's lock is actually held on (its
-    /// own `fstat`, recorded at acquisition) no longer matches what
-    /// [`Self::path`]'s parent directory currently resolves to on disk —
-    /// the lock has been "split": something replaced the lock target
-    /// wholesale (rename-aside + fresh `mkdir`, or equivalent) while this
-    /// lock was held, so a *new* opener now locks the fresh directory while
-    /// this handle still only excludes callers of the old, now-detached
-    /// one. See the module doc's "Wholesale replacement" bullet.
-    ///
+    /// True once the lock target this token holds no longer matches what
+    /// [`Self::path`] resolves to on disk: the lock has been "split", so a new
+    /// opener locks the replacement while this handle only excludes callers of
+    /// the detached original. Unix compares the parent directory's identity
+    /// (recorded at acquisition) against a fresh `stat`; see the module doc's
+    /// "Wholesale replacement" bullet.
     #[cfg(unix)]
     pub(super) fn target_has_split(&self) -> bool {
         use std::os::unix::fs::MetadataExt;
@@ -169,16 +146,11 @@ impl<'a> InitLockHeld<'a> {
         }
     }
 
-    /// `FILE_SHARE_DELETE` being withheld (see the module doc's Windows
-    /// bullet) rules out the lock *file itself* being deleted or renamed
-    /// while held — it says nothing about an ancestor directory of `path`
-    /// being retargeted via a symlink or junction, which changes what
-    /// [`lock_path`] resolves to for a *new* opener without touching the
-    /// held file at all (the same gap `FileIdentity`'s own doc describes
-    /// for the main DB file — confirmed real on Windows by a throwaway CI
-    /// probe before that type had a real Windows implementation). So this
-    /// checks for real here too: a fresh open of [`lock_path`] plus
-    /// `GetFileInformationByHandle`, compared against the identity
+    /// Windows: withholding `FILE_SHARE_DELETE` stops the lock file itself
+    /// being deleted or renamed while held, but not a symlink or junction
+    /// ancestor of `db_path` being retargeted, which changes what [`lock_path`]
+    /// resolves to for a new opener. So this compares a fresh open of
+    /// [`lock_path`], via `GetFileInformationByHandle`, against the identity
     /// recorded at acquisition.
     #[cfg(windows)]
     pub(super) fn target_has_split(&self) -> bool {

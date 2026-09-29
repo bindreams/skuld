@@ -198,73 +198,41 @@ FILE_SHARE_WRITE` and no `FILE_SHARE_DELETE`, so Windows itself refuses
     umask in `tests/coordination_publish_cli.rs`.
 - **A `.skuld.db` deleted, renamed, or replaced while a test run is using
   it now fails loudly instead of silently corrupting whatever now exists
-  at that path (or, on a connection that never wrote again, doing
-  nothing).** Every write through a connection `coordinate()` or its
-  cleanup on drop has held open across more than one operation — including
-  `open_db`'s own schema initialization and migration, all the way down to
-  each row a migration touches — checks the connection's file identity
-  immediately beforehand and panics, naming the path, rather than writing
-  through a connection whose file has moved out from under it. The check
-  runs inside every retry loop, before each attempt, not just once
-  beforehand or once after, so a move landing mid-retry under contention
-  is still caught before the retried write runs, not merely reported
-  sometime after an already-unguarded write already happened.
-  - On Unix: `SQLITE_FCNTL_HAS_MOVED` plus an independent device+inode
-    comparison against the identity recorded at open — recorded from the
-    connection's own path (as SQLite itself resolved it at open time), not
-    a second, independent `stat` of the caller's path done later, which
-    would itself be racing the exact symlink retarget it's trying to
-    detect. That combination also catches a symlink _ancestor_ of the path
-    being retargeted mid-run, which `SQLITE_FCNTL_HAS_MOVED` alone cannot:
-    it re-`stat`s the path string SQLite itself recorded, not a fresh
-    resolution of the path as this crate's own caller understands it.
-  - Also on Unix: the `-wal`/`-shm` companions' identities are tracked the
-    same way. Losing either one out from under a live connection — while
-    the main file's own identity stays untouched — silently splits the
-    database's serialization state exactly as a full deletion does (a
-    fresh connection can end up not seeing rows the losing connection's
-    still-uncheckpointed writes held), so it now fails loudly too.
-  - On Windows: `winOpen`'s withheld `FILE_SHARE_DELETE` already blocks
-    another handle from deleting or renaming the main file itself out from
-    under a held-open connection, but that says nothing about a symlink or
-    junction _ancestor_ of the path being retargeted, which changes what
-    the path resolves to without touching the file itself — a real gap,
-    confirmed before this fix by a throwaway CI probe (a retargeted
-    ancestor let a registration's own `drop` succeed silently). Detected
-    the same way as Unix, using `GetFileInformationByHandle`'s volume
-    serial number + file index instead of device+inode, via a fresh open
-    on each check.
-  - The coordination DB's own init lock can be split the same way a DB
-    file can move: a wholesale replacement of its profile directory
-    (Unix) or a retargeted ancestor of the sibling lock file's path
-    (Windows) while the lock is held leaves the holder excluding callers
-    of the old, now-detached target while a fresh opener excludes
-    nothing. This is now detected too, on both platforms, the same
-    identity-comparison technique applied to the lock's own target.
-  - What none of this can detect, by design: content overwritten _in
-    place_ at the same path (same device, same inode) — that's
-    indistinguishable from this crate's own ordinary writes without
-    fingerprinting content, which nothing here attempts.
-- **An I/O error while writing to the coordination DB now names the path,
-  SQLite's own extended error code, and the OS errno behind it
-  (`sqlite3_system_errno`), instead of relaying SQLite's own text
-  unexplained** — unless a fresh check at the moment of the failure
-  confirms the DB has actually moved (see above), in which case it gets
-  the same clear "deleted or replaced mid-run" message every other
-  moved-DB detection uses. The two are not conflated: an unconfirmed I/O
-  failure (`ENOSPC` on a full filesystem, e.g.) is reported as what it
-  actually is, not mislabelled as a move that didn't happen.
-- **`open_db` no longer silently blocks for up to 5 seconds inside
-  SQLite's own internal busy handler before reporting contention as a
-  failure.** Every connection this crate opens now explicitly disables
-  rusqlite's default `sqlite3_busy_timeout(db, 5000)`; schema
-  creation/migration and ordinary lock contention are instead retried by
-  this crate's own uncapped, error-code-gated loop, the same one that
-  already governed `coordinate()`'s own polling. Previously, contention
-  during schema initialization could silently wait out that fixed 5 s
-  window and still end in a panic once it expired — now it waits as long
-  as the actual contention takes, however long that is, rather than
-  treating a fixed timeout's expiry as proof of failure.
+  at that path.** Every write through a connection held open across more
+  than one operation (`coordinate()`, the cleanup on drop, and `open_db`'s
+  own schema initialization and migration) checks the connection's file
+  identity before and after, inside every retry loop, and panics naming the
+  path.
+  - The `-wal`/`-shm` companions are tracked too: losing either while the
+    main file is untouched splits the database's state just as a deletion
+    does.
+  - A symlink or junction _ancestor_ of the path being retargeted is
+    detected, on both platforms.
+  - The recorded identity is checked against the connection's own files,
+    not just a later `stat` of the path, so a file swapped in between the
+    open and the recording is rejected instead of adopted.
+  - The coordination DB's init lock is checked for the same split (a
+    replaced profile directory, or a retargeted ancestor of the lock file on
+    Windows).
+  - Not detected: content overwritten _in place_ at the same path, device
+    and inode, which looks like this crate's own writes.
+- **Coordination DB failures now name the path, SQLite's extended error
+  code and the OS errno, instead of relaying SQLite's text alone**, and say
+  "deleted or replaced mid-run" instead when a check at that moment
+  confirms the DB moved. An unrelated failure (`ENOSPC` on a full
+  filesystem, e.g.) is reported as what it is.
+- **A failure while migrating the coordination DB's schema now panics
+  naming the path**, where it previously printed a warning and continued
+  (or read a failed version query as version 0).
+- **A `TestRegistration` cleanup failure while a test is already unwinding
+  now fails the run.** It cannot panic then (a second panic aborts the
+  process), so it is still printed as a warning, but the runner now also
+  counts it as a failure and exits non-zero.
+- **`open_db` no longer blocks for up to 5 seconds inside SQLite's own
+  busy handler before reporting contention as a failure.** Every connection
+  this crate opens disables rusqlite's default `sqlite3_busy_timeout`, and
+  contention during schema initialization is retried until it clears
+  instead of panicking after 5 s.
 - **`TestRegistration::drop`'s cleanup now panics on a failure to
   unregister a test, where it previously printed a warning and continued.**
   A failed `DELETE` there means the coordination DB's `running` table can
