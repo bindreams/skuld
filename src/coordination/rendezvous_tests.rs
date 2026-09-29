@@ -1,11 +1,12 @@
 //! Tests for [`super::rendezvous`] itself.
 //!
-//! The status tests drive `arrive`/`status` on one thread, so a broken
-//! `wait` fails them instead of hanging. The threaded tests then check
-//! `wait` end to end. A mutant that stops waking blocked waiters can only be
-//! seen by those tests, and shows up as a hang: only a time bound could
-//! detect it, which under nextest is `.config/nextest.toml`'s `slow-timeout`
-//! (a backstop; no test logic depends on it).
+//! The status tests drive `arrive`/`status` on one thread, so state-machine
+//! bugs such as early release or an ignored abort fail them without hanging.
+//! `wait`'s blocking is covered by the threaded tests, which check it end to
+//! end. A mutant that stops waking blocked waiters can only be seen by
+//! those tests, and shows up as a hang: only a time bound could detect it,
+//! which under nextest is `.config/nextest.toml`'s `slow-timeout` (a
+//! backstop; no test logic depends on it).
 
 use super::rendezvous::{rendezvous, Status};
 use std::panic::{catch_unwind, AssertUnwindSafe};

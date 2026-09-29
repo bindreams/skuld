@@ -43,7 +43,8 @@ struct Shared {
 }
 
 impl Shared {
-    /// Poisoning is irrelevant: no code runs under this lock that can panic.
+    /// Poisoning is irrelevant: nothing under this lock can panic (the
+    /// `arrive` contract assert runs after the guard is dropped).
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -57,7 +58,7 @@ pub(super) struct RendezvousPoint {
 }
 
 impl RendezvousPoint {
-    /// Block until every participant has called `wait`; panic if a
+    /// Block until every participant has arrived; panic if a
     /// participant's point was dropped without calling it. A participant that
     /// is alive but never arrives still blocks everyone, as with `Barrier`;
     /// under `cargo test` nothing bounds that, and under nextest
@@ -74,7 +75,7 @@ impl RendezvousPoint {
         drop(state);
         assert!(
             status == Status::Released,
-            "rendezvous aborted: a participant's point was dropped without calling wait \
+            "rendezvous aborted: a participant's point was dropped without arriving \
              (its thread ended or panicked first)"
         );
     }
@@ -86,9 +87,10 @@ impl RendezvousPoint {
         self.arrived = true;
         let mut state = self.shared.lock();
         state.arrived += 1;
-        debug_assert!(state.arrived <= state.participants);
+        let (arrived, participants) = (state.arrived, state.participants);
         let status = state.status();
         drop(state);
+        debug_assert!(arrived <= participants);
         self.shared.changed.notify_all();
         status
     }
