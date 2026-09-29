@@ -475,6 +475,7 @@ fn registration_drop_fails_loudly_when_the_db_moves_mid_retry() {
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
     retry.release();
+    retry.expect_no_more_retries();
 
     let result = dropper.join();
     assert!(
@@ -541,6 +542,7 @@ fn open_db_schema_init_fails_loudly_when_the_db_moves_mid_retry() {
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
     retry.release();
+    retry.expect_no_more_retries();
 
     let result = opener.join();
     assert!(
@@ -610,6 +612,7 @@ fn open_db_fails_loudly_when_the_profile_directory_is_replaced_wholesale_mid_ret
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
     retry.release();
+    retry.expect_no_more_retries();
 
     let result = opener.join();
     assert!(
@@ -713,6 +716,7 @@ fn coordinate_fails_loudly_when_the_db_moves_mid_retry() {
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
     retry.release();
+    retry.expect_no_more_retries();
 
     let result = waiter.join();
     assert!(
@@ -1012,6 +1016,7 @@ fn open_db_creates_schema_past_a_foreign_held_exclusive_lock_with_no_retry_cap()
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
     retry.release();
+    retry.expect_no_more_retries();
 
     let count = waiter
         .join()
@@ -1045,6 +1050,7 @@ fn registration_drop_deletes_past_a_concurrent_held_exclusive_lock_with_no_retry
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
     retry.release();
+    retry.expect_no_more_retries();
 
     dropper
         .join()
@@ -1107,6 +1113,7 @@ fn coordinate_retries_a_busy_begin_exclusive_with_no_retry_cap() {
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
     retry.release();
+    retry.expect_no_more_retries();
 
     let _reg = waiter
         .join()
@@ -1273,6 +1280,7 @@ fn migrate_schema_completes_past_a_foreign_held_exclusive_lock_with_no_retry_cap
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
     retry.release();
+    retry.expect_no_more_retries();
 
     waiter
         .join()

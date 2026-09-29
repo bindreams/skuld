@@ -52,6 +52,17 @@ impl RetryTest {
             .expect("the worker exited without hitting a retryable busy error — test setup is broken");
     }
 
+    /// Call after the final [`Self::release`], before joining the worker: the
+    /// worker must exit without retrying again. Without it, one more retry
+    /// blocks the worker on an ack while the test blocks in `join`. Panicking
+    /// here drops `self`, which unblocks the worker.
+    pub(crate) fn expect_no_more_retries(&self) {
+        // `Err`: the worker's hook guard dropped when it exited.
+        if self.signal.recv().is_ok() {
+            panic!("worker retried again after the final release");
+        }
+    }
+
     /// Let the worker proceed past the retry it last signalled.
     pub(crate) fn release(&self) {
         // Never blocks: the worker consumed the previous ack before it sent

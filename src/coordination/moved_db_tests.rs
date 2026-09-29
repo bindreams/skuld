@@ -152,6 +152,7 @@ fn open_db_schema_write_is_stopped_by_a_split_lock_alone() {
     foreign_conn.execute_batch("COMMIT").unwrap();
     drop(foreign_conn);
     retry.release();
+    retry.expect_no_more_retries();
 
     assert!(
         opener.join().is_err(),

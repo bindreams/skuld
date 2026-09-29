@@ -43,3 +43,33 @@ fn dropping_the_guard_allows_reinstalling() {
     let (worker, _test) = retry_rendezvous();
     let _again = set_test_retry_hook(worker);
 }
+
+/// A worker that retries once more after the final release fails the test
+/// instead of hanging it in `join`.
+#[test]
+#[should_panic(expected = "retried again after the final release")]
+fn expect_no_more_retries_panics_on_an_extra_retry() {
+    let (worker, test) = retry_rendezvous();
+    std::thread::spawn(move || {
+        let _hook = set_test_retry_hook(worker);
+        signal_retry();
+        signal_retry();
+    });
+    test.wait_for_retry();
+    test.release();
+    test.expect_no_more_retries();
+}
+
+/// A worker that exits after the final release passes.
+#[test]
+fn expect_no_more_retries_returns_once_the_worker_exits() {
+    let (worker, test) = retry_rendezvous();
+    let worker_thread = std::thread::spawn(move || {
+        let _hook = set_test_retry_hook(worker);
+        signal_retry();
+    });
+    test.wait_for_retry();
+    test.release();
+    test.expect_no_more_retries();
+    worker_thread.join().unwrap();
+}

@@ -18,11 +18,20 @@ struct Action<'a> {
 
 type Deny<'a> = Box<dyn Fn(&Action) -> bool + 'a>;
 
-/// Denies every statement `deny` matches on `conn` until dropped.
+/// What the authorizer callback needs: the closure, and a slot for its panic.
+struct AuthorizerState<'c> {
+    deny: Deny<'c>,
+    panic: std::cell::RefCell<Option<Box<dyn std::any::Any + Send>>>,
+}
+
+/// Denies every statement `deny` matches on `conn` until dropped. A panic in
+/// `deny` is caught (unwinding out of the `extern "C"` callback would abort the
+/// whole test binary), denies the statement, and is re-raised when the
+/// `Authorizer` drops.
 struct Authorizer<'c> {
     conn: &'c rusqlite::Connection,
-    // Boxed twice so the pointer handed to SQLite stays put.
-    _deny: Box<Deny<'c>>,
+    // Boxed so the pointer handed to SQLite stays put.
+    state: Box<AuthorizerState<'c>>,
 }
 
 unsafe extern "C" fn authorize(
@@ -33,38 +42,48 @@ unsafe extern "C" fn authorize(
     _db: *const c_char,
     _trigger: *const c_char,
 ) -> c_int {
-    // Safety: `user` is the `Box<Deny>` owned by the live `Authorizer`.
-    let deny = unsafe { &*(user as *const Deny) };
-    let text = |p: *const c_char| {
-        // Safety: SQLite passes NUL-terminated strings or NULL.
-        (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_str().unwrap())
-    };
-    let action = Action {
-        code,
-        arg1: text(arg1),
-        arg2: text(arg2),
-    };
-    if deny(&action) {
-        rusqlite::ffi::SQLITE_DENY
-    } else {
-        rusqlite::ffi::SQLITE_OK
+    // Safety: `user` is the `Box<AuthorizerState>` owned by the live `Authorizer`.
+    let state = unsafe { &*(user as *const AuthorizerState) };
+    let denied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let text = |p: *const c_char| {
+            // Safety: SQLite passes NUL-terminated strings or NULL.
+            (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_str().unwrap())
+        };
+        let action = Action {
+            code,
+            arg1: text(arg1),
+            arg2: text(arg2),
+        };
+        (state.deny)(&action)
+    }));
+    match denied {
+        Ok(false) => rusqlite::ffi::SQLITE_OK,
+        Ok(true) => rusqlite::ffi::SQLITE_DENY,
+        Err(payload) => {
+            // Keep the first panic; a later one is a consequence of it.
+            state.panic.borrow_mut().get_or_insert(payload);
+            rusqlite::ffi::SQLITE_DENY
+        }
     }
 }
 
 impl<'c> Authorizer<'c> {
     fn install(conn: &'c rusqlite::Connection, deny: impl Fn(&Action) -> bool + 'c) -> Self {
-        let deny: Box<Deny<'c>> = Box::new(Box::new(deny));
+        let state = Box::new(AuthorizerState {
+            deny: Box::new(deny),
+            panic: std::cell::RefCell::new(None),
+        });
         // Safety: `conn.handle()` is valid while `conn` is borrowed; the boxed
-        // closure outlives the registration because `Drop` removes it first.
+        // state outlives the registration because `Drop` removes it first.
         let rc = unsafe {
             rusqlite::ffi::sqlite3_set_authorizer(
                 conn.handle(),
                 Some(authorize),
-                (&*deny as *const Deny).cast_mut().cast(),
+                (&*state as *const AuthorizerState).cast_mut().cast(),
             )
         };
         assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
-        Self { conn, _deny: deny }
+        Self { conn, state }
     }
 }
 
@@ -72,6 +91,11 @@ impl Drop for Authorizer<'_> {
     fn drop(&mut self) {
         // Safety: as in `install`.
         unsafe { rusqlite::ffi::sqlite3_set_authorizer(self.conn.handle(), None, std::ptr::null_mut()) };
+        if !std::thread::panicking() {
+            if let Some(payload) = self.state.panic.borrow_mut().take() {
+                std::panic::resume_unwind(payload);
+            }
+        }
     }
 }
 
@@ -232,4 +256,22 @@ fn migrate_schema_completes_when_nothing_is_denied() {
 
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
     assert_eq!(version, SCHEMA_VERSION);
+}
+
+/// A deny closure that panics must fail its own test, not abort the process:
+/// unwinding out of an `extern "C"` callback aborts. The panic is denied at the
+/// SQLite level and re-raised on the test thread.
+#[test]
+fn a_panicking_deny_closure_is_reraised_on_the_test_thread() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _deny = Authorizer::install(&conn, |_| panic!("deny closure blew up"));
+        let _ = conn.execute_batch("SELECT 1");
+    }));
+
+    let payload = result.expect_err("the deny closure's panic must reach the test thread");
+    assert_eq!(
+        crate::coordination::panic_payload_message(payload.as_ref()),
+        "deny closure blew up"
+    );
 }

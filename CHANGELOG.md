@@ -174,9 +174,10 @@ All notable changes to this project are documented in this file.
     the path, rather than falling back to a weaker lock. On Windows, the
     lock is a sibling `.skuld.db.lock` file opened with `FILE_SHARE_READ |
 FILE_SHARE_WRITE` and no `FILE_SHARE_DELETE`, so Windows itself refuses
-    to delete or rename it while any handle holds it — that guarantee has
-    no gap on Windows. A failure to open the lock target on either platform
-    — a missing parent directory, file-descriptor exhaustion, or anything
+    to delete or rename the lock file while any handle holds it. A symlink
+    or junction ancestor of the lock file can still be retargeted, which
+    splits the lock; that split is detected (see the entry below). A failure
+    to open the lock target on either platform — a missing parent directory, file-descriptor exhaustion, or anything
     else — panics immediately, naming the path, rather than retrying.
   - Only creation needs mode and no-replace-rename support: `ensure_published`
     checks for an existing `.skuld.db` first (`lstat`, so a dangling symlink
