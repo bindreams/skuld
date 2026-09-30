@@ -41,12 +41,17 @@ use windows::Win32::System::IO::IO_STATUS_BLOCK;
 /// Fail unless `dir` is a directory a file can be created in. Listing it is not checked: nothing
 /// on Windows lists the coordination directory.
 pub(super) fn check_usable(dir: &Path) -> io::Result<()> {
+    probe(dir, probe_names())
+}
+
+/// This process's probe names: `.skuld-probe-<pid>-<n>` for n = 1, 2, ...
+pub(super) fn probe_names() -> impl FnMut() -> String {
     let pid = std::process::id();
     let mut n = 0u64;
-    probe(dir, || {
+    move || {
         n += 1;
         format!(".skuld-probe-{pid}-{n}")
-    })
+    }
 }
 
 /// [`check_usable`] with the probe names drawn from `next_name`, which is called only after `dir`
@@ -80,7 +85,7 @@ pub(super) fn probe(dir: &Path, mut next_name: impl FnMut() -> String) -> io::Re
 }
 
 /// Open the directory `dir`, relative to its parent so that the status of the open is available.
-fn open_dir(dir: &Path) -> io::Result<File> {
+pub(super) fn open_dir(dir: &Path) -> io::Result<File> {
     let full = std::path::absolute(dir)?;
     let (Some(parent), Some(name)) = (full.parent(), full.file_name()) else {
         // A root has no parent to open relative to, and cannot be deleted.
