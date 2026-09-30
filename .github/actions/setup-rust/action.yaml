@@ -1,6 +1,10 @@
 name: Set up Rust build environment
 description: Installs stable Rust, caches cargo registry, configures sccache.
 inputs:
+  toolchain:
+    description: "Toolchain for dtolnay/rust-toolchain: 'stable' or an exact X.Y.Z"
+    required: false
+    default: "stable"
   components:
     description: "Extra rustup components (e.g. 'clippy, rustfmt')"
     required: false
@@ -16,6 +20,7 @@ runs:
       id: rust-toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
+        toolchain: ${{ inputs.toolchain }}
         components: ${{ inputs.components }}
         targets: ${{ inputs.targets }}
 
