@@ -267,12 +267,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # GitHub's list-releases endpoint is eventually consistent after a
-          # create: right after the POST above, the listing may not include
-          # this run's own draft yet (run 36648825456 counted 0 and deleted
-          # its own good draft as a "duplicate"). The script therefore waits
-          # until the listing contains RELEASE_ID before counting, fails
-          # with the draft kept if it never does, and deletes the draft only
-          # for a real duplicate. See its header. Tested by
-          # .github/scripts/tests/verify-sole-release.test.sh in Lint.
           .github/scripts/verify-sole-release.sh

@@ -53,7 +53,9 @@ while :; do
 	delay=$(awk -v d="$delay" -v m="$max_delay" 'BEGIN { d *= 2; print (d > m ? m : d) }')
 done
 
-count=$(printf '%s' "$releases_json" | jq -er --arg t "$TAG" '[.[][] | select(.tag_name == $t)] | length') || {
+# unique_by(.id): offset pagination can list one release on two pages if the
+# list shifts mid-walk, and our own id counted twice is not a duplicate.
+count=$(printf '%s' "$releases_json" | jq -er --arg t "$TAG" '[.[][] | select(.tag_name == $t)] | unique_by(.id) | length') || {
 	echo "::error::Draft release $TAG (id $RELEASE_ID) was created, but GitHub's releases list could not be parsed to confirm it's the only one with this tag. Check https://github.com/${GH_REPO}/releases by hand."
 	exit 1
 }
