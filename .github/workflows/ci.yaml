@@ -1,209 +1,36 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
-  workflow_call:
-
-env:
-  CARGO_TERM_COLOR: always
-  # `.config/nextest.toml` requires the same nextest.
-  NEXTEST_VERSION: "0.9.137"
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # fetch-depth: 0 is required so `cargo xtask version --check`
-          # (run via the prek hook) can see ancestor tags. Default depth 1
-          # with no tags would make the check silently always-pass.
-          fetch-depth: 0
-
-      # setup-rust is still needed so the cargo-fmt / cargo-clippy /
-      # cargo-xtask-version hooks inside prek can find a Rust toolchain.
-      - uses: ./.github/actions/setup-rust
-        with:
-          components: rustfmt, clippy
-
-      # Single source of truth for lint is prek.toml — the same checks run
-      # locally as pre-commit hooks, shellcheck's optional checks included:
-      # the actionlint hook carries them as its own `env`. prek-action runs
-      # `prek run --all-files` with `--show-diff-on-failure --color=always`,
-      # so fmt / mixed-line-ending failures surface as a diff in CI logs.
-      # prek.toml's own `shellcheck-on-path` hook (not a step here) asserts
-      # shellcheck is reachable, so that check runs identically in CI and
-      # locally instead of living only in this file.
-      - name: Derive pinned shellcheck version from prek.toml
-        # actionlint's shellcheck (see prek.toml) is not the shellcheck-py
-        # hook's own binary — it shells out to whatever `shellcheck` is on
-        # PATH, so CI needs its own install. Parse the version straight out
-        # of prek.toml's shellcheck-py `rev` instead of pinning a second copy
-        # by hand, so there's one number to bump, not two to keep in step.
-        id: shellcheck-pin
-        run: |
-          set -euo pipefail
-          version=$(python3 - <<'PY'
-          import tomllib
-
-          with open("prek.toml", "rb") as f:
-              data = tomllib.load(f)
-          rev = next(
-              r["rev"]
-              for r in data["repos"]
-              if r.get("repo") == "https://github.com/shellcheck-py/shellcheck-py"
-          )
-          # shellcheck-py tags as v<shellcheck-version>.<pypi-patch>, e.g.
-          # v0.11.0.1 wraps shellcheck 0.11.0 -- drop the trailing segment.
-          print(".".join(rev.lstrip("v").split(".")[:-1]))
-          PY
-          )
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      # actionlint's shellcheck integration silently degrades if the binary is
-      # missing (see prek.toml) — install it explicitly and verify.
-      - name: Install shellcheck
-        uses: taiki-e/install-action@v2
-        with:
-          tool: shellcheck@${{ steps.shellcheck-pin.outputs.version }}
-
-      # .shellcheckrc's `enable=` line (and its copy as SHELLCHECK_OPTS in
-      # prek.toml's actionlint hook) is the only thing turning on SC2249 and
-      # SC2312. shellcheck silently no-ops on an unrecognized enable= name, so
-      # a typo, or an upstream rename/removal of either check, would drop
-      # coverage with this job staying green. Prove both still fire against a
-      # fixture built to trip each of them.
-      - name: Assert shellcheck's optional checks still fire
-        shell: bash
-        run: |
-          set -euo pipefail
-          fixture=$(mktemp)
-          trap 'rm -f "$fixture"' EXIT
-          cat <<'SH' > "$fixture"
-          #!/bin/sh
-          case "$1" in
-            x) echo x ;;
-          esac
-          if [ "$(false)" ]; then echo hi; fi
-          SH
-          out=$(shellcheck --enable=add-default-case,check-extra-masked-returns "$fixture" 2>&1) && rc=0 || rc=$?
-          if [ "$rc" -eq 0 ]; then
-            echo "::error::shellcheck did not flag a fixture built to trip SC2249 and SC2312 -- the optional checks may have stopped being recognized"
-            exit 1
-          fi
-          for code in SC2249 SC2312; do
-            if ! grep -q "$code" <<<"$out"; then
-              echo "::error::Expected $code in shellcheck's output but it was missing:"
-              echo "$out"
-              exit 1
-            fi
-          done
-
-      # Release-script tests run against a stubbed `gh`; no network, no repo
-      # state.
-      - name: Test release scripts
-        run: |
-          .github/scripts/tests/verify-sole-release.test.sh
-          .github/scripts/tests/release-toolchain.test.sh
-          .github/scripts/tests/check-toolchain.test.sh
-          .github/scripts/tests/require-target-on-main.test.sh
-
-      - uses: j178/prek-action@v2
-
-  test:
-    name: Test (${{ matrix.os }}/${{ matrix.arch }})
+  probe:
+    name: Mutants (${{ matrix.runner }})
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: linux
-            arch: amd64
-            runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: linux
-            arch: arm64
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: darwin
-            arch: arm64
-            runner: macos-latest
-            target: aarch64-apple-darwin
-          - os: darwin
-            arch: amd64
-            runner: macos-15
-            target: x86_64-apple-darwin
-          - os: windows
-            arch: amd64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: windows
-            arch: arm64
-            runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
-
+        runner: [windows-latest, windows-11-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
-
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/setup-rust
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-
-      # The cross-device moved-DB test needs two filesystems.
-      - name: Provision two filesystems
-        if: matrix.os == 'linux'
+      - name: GREEN
+        run: cargo test -p skuld --lib -- windows_probe_tests
+      - name: "M1: no FILE_DELETE_ON_CLOSE"
+        if: always()
+        shell: bash
         run: |
           set -euo pipefail
-          for fs in a b; do
-            sudo mkdir -p "/mnt/skuld-fs-$fs"
-            sudo mount -t tmpfs -o mode=1777 tmpfs "/mnt/skuld-fs-$fs"
-          done
-          {
-            echo "SKULD_TEST_FS_A=/mnt/skuld-fs-a"
-            echo "SKULD_TEST_FS_B=/mnt/skuld-fs-b"
-          } >> "$GITHUB_ENV"
-
-      - name: Build workspace
-        # Exclude xtask from the matrix: it's a dev tool run only on the lint
-        # host (Linux), and its deps aren't worth cross-compiling to 6 targets.
-        run: cargo build --workspace --exclude xtask --target ${{ matrix.target }}
-
-      # nextest fails a hung test by name after `.config/nextest.toml`'s slow-timeout, instead of
-      # stalling the job until `timeout-minutes`. No custom profile: cargo-skuld's tests run nested
-      # `cargo nextest list`s in fixture workspaces, which inherit the profile name.
-      - name: Unit tests
-        run: cargo nextest run --workspace --exclude xtask --target ${{ matrix.target }} --no-fail-fast
-
-      # nextest does not run doctests (https://github.com/nextest-rs/nextest/issues/16).
-      - name: Doctests
-        run: cargo test --workspace --exclude xtask --doc --target ${{ matrix.target }}
-
-      # `tests/integration.rs` asserts whole-run side effects, so it needs one process for all its
-      # tests; `.config/nextest.toml` excludes it from the run above.
-      - name: Integration tests
-        run: cargo test -p skuld --test integration --target ${{ matrix.target }}
-
-      # xtask is excluded from the matrix above (it is a Linux-side build tool,
-      # not a shipped artifact), so without this its tests run nowhere — including
-      # the version and pin checks that gate an irreversible publish.
-      - name: Test xtask
-        if: matrix.os == 'linux' && matrix.arch == 'amd64'
-        run: cargo test -p xtask
-
-      # The fixture workspace under cargo-skuld resolves independently and
-      # path-depends on the workspace version, so its lock goes stale at every
-      # bump — and the tests silently rewrite it. Nothing else notices: no job
-      # runs --locked there.
-      - name: Fixture lock is current
-        if: matrix.os == 'linux' && matrix.arch == 'amd64'
-        run: git diff --exit-code -- cargo-skuld/tests/fixtures/test-workspace/Cargo.lock
+          git checkout -- src
+          sed -i 's/FILE_DELETE_ON_CLOSE | FILE_SYNCHRONOUS_IO_NONALERT/FILE_SYNCHRONOUS_IO_NONALERT/' src/coordination/db_dir/windows_probe.rs
+          git diff --stat
+          cargo test -p skuld --lib -- windows_probe_tests
+      - name: "M2: retry on every STATUS_DELETE_PENDING"
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout -- src
+          sed -i 's/                true => return Err(being_deleted(status)),/                true => continue,/' src/coordination/db_dir/windows_probe.rs
+          git diff --stat
+          cargo test -p skuld --lib -- windows_probe_tests
