@@ -140,6 +140,26 @@ pub struct TestDef {
 
 inventory::collect!(TestDef);
 
+/// A macro (not a fn) so the no-`tokio` variant can emit `compile_error!`.
+#[cfg(feature = "tokio")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __build_runtime_with {
+    ($builder:expr) => {
+        $crate::__private::build_runtime_with($builder)
+    };
+}
+
+/// Without the `tokio` feature, `runtime = ...` expands to this compile error.
+#[cfg(not(feature = "tokio"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __build_runtime_with {
+    ($builder:expr) => {
+        ::core::compile_error!("`#[skuld::test(runtime = ...)]` requires skuld's `tokio` feature")
+    };
+}
+
 // Private helpers for macro-generated code ============================================================
 
 #[doc(hidden)]
@@ -155,6 +175,12 @@ pub mod __private {
             .enable_all()
             .build()
             .expect("failed to build tokio runtime for async test")
+    }
+
+    /// Taking `fn() -> Runtime` makes the emitted call type-check the builder's signature.
+    #[cfg(feature = "tokio")]
+    pub fn build_runtime_with(builder: fn() -> ::tokio::runtime::Runtime) -> ::tokio::runtime::Runtime {
+        builder()
     }
 
     /// Trait for converting test return values into `()`.

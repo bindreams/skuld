@@ -1,0 +1,11 @@
+error: duplicate argument `runtime`
+ --> tests/compile_fail/runtime_duplicate.rs:9:28
+  |
+9 | #[skuld::test(runtime = a, runtime = b)]
+  |                            ^^^^^^^
+
+error: duplicate argument `runtime`
+  --> tests/compile_fail/runtime_duplicate.rs:12:42
+   |
+12 | #[skuld::test(runtime = a, should_panic, runtime = b)]
+   |                                          ^^^^^^^

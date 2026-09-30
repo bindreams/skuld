@@ -28,6 +28,7 @@ struct TestArgs {
     serial: Option<String>,
     serial_labels: Vec<Ident>,
     should_panic: ShouldPanicArg,
+    runtime: Option<Path>,
 }
 
 #[derive(Default)]
@@ -101,6 +102,10 @@ impl Parse for TestArgs {
                         args.serial = Some("*".to_string());
                     }
                 }
+                "runtime" => {
+                    let _eq: Token![=] = input.parse()?;
+                    args.runtime = Some(input.parse()?);
+                }
                 "should_panic" => {
                     if input.peek(Token![=]) {
                         let _eq: Token![=] = input.parse()?;
@@ -113,7 +118,7 @@ impl Parse for TestArgs {
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
-                        format!("unknown argument `{other}`; expected requires, name, labels, ignore, serial, or should_panic"),
+                        format!("unknown argument `{other}`; expected requires, name, labels, ignore, serial, should_panic, or runtime"),
                     ));
                 }
             }
@@ -404,6 +409,10 @@ fn binding_to_name(pat: &syn::Pat) -> String {
 /// accepted and behave identically to their macro-argument equivalents.
 /// These must appear **after** `#[skuld::test]`, not before it.
 ///
+/// `runtime = path::to::builder` (async fns only, `tokio` feature) runs the
+/// test on the `tokio::runtime::Runtime` returned by `builder: fn() -> Runtime`
+/// instead of the default current-thread runtime.
+///
 /// ```ignore
 /// #[skuld::test(requires = [preconditions::valgrind], labels = [SLOW])]
 /// fn my_test(#[fixture(temp_dir)] dir: &Path) { /* ... */ }
@@ -605,6 +614,17 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
     let call_args: Vec<_> = fixture_params.iter().map(|fp| &fp.binding).collect();
 
     let is_async = func.sig.asyncness.is_some();
+    if args.runtime.is_some() && !is_async {
+        return syn::Error::new_spanned(
+            &func.sig.ident,
+            format!(
+                "`runtime = ...` is only valid on an `async fn`, but `{}` is not async",
+                func.sig.ident
+            ),
+        )
+        .to_compile_error()
+        .into();
+    }
     let await_suffix = if is_async { quote!(.await) } else { quote!() };
 
     // Setup: enter scope and inject fixtures. For the plain (non-should_panic)
@@ -647,9 +667,13 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
     // no reactor running": `#setup_core` runs before `#call_expr`'s `block_on`, and
     // teardown runs after `block_on` returns, so neither is otherwise covered by the
     // runtime context `block_on` only holds for the async block itself.
+    let build_runtime = match &args.runtime {
+        Some(builder) => quote! { ::skuld::__build_runtime_with!(#builder) },
+        None => quote! { ::skuld::__private::build_async_runtime() },
+    };
     let runtime_preamble = if is_async {
         quote! {
-            let __rt = ::skuld::__private::build_async_runtime();
+            let __rt = #build_runtime;
             let __rt_guard = __rt.enter();
         }
     } else {
