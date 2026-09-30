@@ -31,7 +31,50 @@ fn env_remove_works(#[fixture] env: &EnvGuard) {
     ENV_REMOVE_RAN.fetch_add(1, Ordering::Relaxed);
 }
 
+// A prior value that is not valid UTF-8 must be restored byte-for-byte.
+#[cfg(unix)]
+mod non_utf8 {
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt;
+
+    pub const SET_VAR: &str = "SKULD_ENV_TEST_NON_UTF8_SET";
+    pub const REMOVE_VAR: &str = "SKULD_ENV_TEST_NON_UTF8_REMOVE";
+    pub const BYTES: &[u8] = b"a\xFFb";
+    pub static RAN: AtomicU32 = AtomicU32::new(0);
+
+    #[skuld::test]
+    fn env_restores_a_non_utf8_prior_value(#[fixture] env: &EnvGuard) {
+        // SAFETY: the `env` fixture is serial, so no other test touches the environment.
+        unsafe {
+            std::env::set_var(SET_VAR, OsStr::from_bytes(BYTES));
+            std::env::set_var(REMOVE_VAR, OsStr::from_bytes(BYTES));
+        }
+        env.set(SET_VAR, "utf8");
+        env.remove(REMOVE_VAR);
+        assert_eq!(std::env::var(SET_VAR).unwrap(), "utf8");
+        assert!(std::env::var_os(REMOVE_VAR).is_none());
+        RAN.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn assert_restored() {
+        assert_eq!(RAN.load(Ordering::Relaxed), 1, "the non-UTF-8 env test should have run");
+        for var in [SET_VAR, REMOVE_VAR] {
+            let restored: Option<OsString> = std::env::var_os(var);
+            assert_eq!(
+                restored.as_deref().map(OsStr::as_bytes),
+                Some(BYTES),
+                "EnvGuard must restore a non-UTF-8 prior value of {var} byte-identically"
+            );
+            // SAFETY: the run is over; nothing else reads these variables.
+            unsafe { std::env::remove_var(var) };
+        }
+    }
+}
+
 pub fn assert_all_ran_and_reverted() {
+    #[cfg(unix)]
+    non_utf8::assert_restored();
     assert_eq!(
         ENV_SET_RAN.load(Ordering::Relaxed),
         1,

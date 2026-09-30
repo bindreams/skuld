@@ -31,12 +31,12 @@ use crate::{Ignore, TestDef};
 /// enabling debug output.
 pub(crate) fn skuld_debug() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("SKULD_DEBUG") {
-        Ok(v) => {
+    *ENABLED.get_or_init(|| match crate::skuld_env::read("SKULD_DEBUG") {
+        Some(v) => {
             let t = v.trim().to_ascii_lowercase();
             !t.is_empty() && t != "0" && t != "false" && t != "no" && t != "off"
         }
-        Err(_) => false,
+        None => false,
     })
 }
 
@@ -80,19 +80,11 @@ pub(crate) fn write_nextest_metadata(path: &std::path::Path, tests: Vec<NextestT
     std::fs::write(path, json).unwrap_or_else(|e| panic!("skuld: failed to write nextest metadata to {path:?}: {e}"));
 }
 
-/// Write `tests` to the path named by [`SKULD_NEXTEST_METADATA_PATH_ENV`],
-/// if that env var is set and valid Unicode. Distinguishes "unset" (silent
-/// no-op — the common case) from "set but not valid UTF-8" (a genuine
-/// misconfiguration — warned, not silently dropped).
+/// Write `tests` to the path named by [`SKULD_NEXTEST_METADATA_PATH_ENV`], if set.
+/// Read as an `OsStr`: a path need not be valid UTF-8.
 fn dump_nextest_metadata_if_requested(tests: Vec<NextestTestMetadata>) {
-    match std::env::var(SKULD_NEXTEST_METADATA_PATH_ENV) {
-        Ok(path) => write_nextest_metadata(std::path::Path::new(&path), tests),
-        Err(std::env::VarError::NotPresent) => {}
-        Err(std::env::VarError::NotUnicode(raw)) => {
-            eprintln!(
-                "[skuld] warning: {SKULD_NEXTEST_METADATA_PATH_ENV} is set but not valid UTF-8 ({raw:?}); skipping nextest metadata dump"
-            );
-        }
+    if let Some(path) = std::env::var_os(SKULD_NEXTEST_METADATA_PATH_ENV) {
+        write_nextest_metadata(std::path::Path::new(&path), tests);
     }
 }
 
