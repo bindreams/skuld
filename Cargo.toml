@@ -69,6 +69,14 @@ windows = { version = "0.62", features = [
     # Windows init lock file: opened without FILE_SHARE_DELETE so it can
     # never be deleted or renamed out from under a holder.
     "Win32_Storage_FileSystem",
+    # src/coordination/db_dir/windows_probe.rs creates its probe file with
+    # NtCreateFile, which reports STATUS_DELETE_PENDING where CreateFileW
+    # reports only ERROR_ACCESS_DENIED.
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
 ] }
 
 [dev-dependencies]

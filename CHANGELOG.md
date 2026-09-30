@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **On Windows, a writable coordination directory no longer fails the
+  up-front usability check at random** with `Access is denied`. The probe
+  file's name could be held by a deleted file still open elsewhere, which
+  Windows reports as access denied. Probe names now include the process id,
+  and a name held that way is skipped. The error for a genuinely denied
+  directory now includes the NTSTATUS.
+
 ## [0.5.0] - 2026-09-30
 
 ### Breaking
