@@ -110,9 +110,11 @@ fn a_directory_deleted_mid_probe_is_an_error_not_a_retry(posix: bool) {
     let marker = RefCell::new(None);
     let mut next = names(&["p"], &asked);
     let err = probe(&dir, || {
-        let handle = mark_for_deletion(&dir, posix);
-        if !posix {
-            *marker.borrow_mut() = Some(handle);
+        if asked.get() == 0 {
+            let handle = mark_for_deletion(&dir, posix);
+            if !posix {
+                *marker.borrow_mut() = Some(handle);
+            }
         }
         next()
     })
