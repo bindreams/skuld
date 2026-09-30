@@ -26,13 +26,16 @@ All notable changes to this project are documented in this file.
   being deleted now reports that instead of `Access is denied`.
 - **The `temp_dir` fixture no longer fails at random on Windows with
   `Access is denied`.** A test name containing `/`, `\`, `:` or control
-  characters, or a very long one, no longer breaks it either.
+  characters, a DOS device name, or a very long one no longer breaks it
+  either.
 
 ### Changed
 
 - **On Unix, `temp_dir` directories are now mode 0700**, private to their
   owner; they used to get the umask default. They are now named
-  `<test name>-<pid>-<random>`.
+  `<test name>-<pid>-<random>`, with the test name made file-name-safe:
+  characters Windows forbids become `_`, a DOS device name such as `nul.json`
+  gets a leading `_`, and a long name is shortened.
 
 ### Added
 
