@@ -33,7 +33,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
-use crate::Requirement;
+use crate::label::push_unique;
+use crate::{Label, Requirement};
 
 // Scope =======================================================================================
 
@@ -128,6 +129,9 @@ pub struct FixtureDef {
     pub requires: &'static [Requirement],
     /// Names of fixtures this one depends on (from `#[fixture]` params).
     pub deps: &'static [&'static str],
+    /// Labels inherited by any test that uses this fixture, directly or
+    /// through another fixture's `deps` (from `labels = [...]`).
+    pub labels: &'static [Label],
     /// Factory: create a new instance boxed as `dyn Any`.
     pub setup: fn() -> Result<Box<dyn Any + Send + Sync>, String>,
     /// Cast a stored value to a target TypeId. Returns `None` if the target type
@@ -515,35 +519,76 @@ pub fn cleanup_process_fixtures() {
     }
 }
 
-// Requirement collection ======================================================================
+// Fixture-graph walking =======================================================================
+
+/// Visit each fixture reachable from `names` once, in first-visit (pre-order)
+/// order. A name in `names` that is not registered is skipped; a registered
+/// fixture's dependency that is not registered is a contract breach.
+pub fn walk_fixture_deps<'r>(names: &[&str], visit: impl FnMut(&'r FixtureDef))
+where
+    'static: 'r,
+{
+    walk_fixture_deps_in(fixture_registry(), names, visit);
+}
+
+fn walk_fixture_deps_in<'r>(
+    registry: &HashMap<&str, &'r FixtureDef>,
+    names: &[&str],
+    mut visit: impl FnMut(&'r FixtureDef),
+) {
+    fn walk<'r>(
+        registry: &HashMap<&str, &'r FixtureDef>,
+        name: &str,
+        dependent: Option<&str>,
+        visited: &mut HashSet<String>,
+        visit: &mut impl FnMut(&'r FixtureDef),
+    ) {
+        if !visited.insert(name.to_string()) {
+            return;
+        }
+        let Some(&def) = registry.get(name) else {
+            debug_assert!(
+                dependent.is_none(),
+                "fixture {:?} depends on unregistered fixture {name:?}",
+                dependent.unwrap_or_default()
+            );
+            return;
+        };
+        visit(def);
+        for &dep in def.deps {
+            walk(registry, dep, Some(def.name), visited, visit);
+        }
+    }
+
+    let mut visited = HashSet::new();
+    for &name in names {
+        walk(registry, name, None, &mut visited, &mut visit);
+    }
+}
 
 /// Transitively collect all [`Requirement`]s from a set of fixture names and
 /// their dependencies. Used for precondition checks before running tests.
 pub fn collect_fixture_requires(names: &[&str]) -> Vec<&'static Requirement> {
-    let registry = fixture_registry();
     let mut result = Vec::new();
-    let mut visited = HashSet::new();
-    for &name in names {
-        collect_requires_recursive(name, registry, &mut result, &mut visited);
-    }
+    walk_fixture_deps(names, |def| result.extend(def.requires.iter()));
     result
 }
 
-fn collect_requires_recursive(
-    name: &str,
-    registry: &HashMap<&str, &FixtureDef>,
-    result: &mut Vec<&'static Requirement>,
-    visited: &mut HashSet<String>,
-) {
-    if !visited.insert(name.to_string()) {
-        return;
+/// Labels of `names` and their transitive deps, deduplicated, in first-visit order.
+pub fn collect_fixture_labels(names: &[&str]) -> Vec<Label> {
+    let mut result = Vec::new();
+    walk_fixture_deps(names, |def| push_unique(&mut result, def.labels));
+    result
+}
+
+/// What a test inherits by using `def`: its own labels, then its dependencies'.
+pub(crate) fn fixture_labels_of(def: &FixtureDef) -> Vec<Label> {
+    let mut result = Vec::new();
+    push_unique(&mut result, def.labels);
+    for label in collect_fixture_labels(def.deps) {
+        push_unique(&mut result, &[label]);
     }
-    if let Some(def) = registry.get(name) {
-        result.extend(def.requires.iter());
-        for &dep in def.deps {
-            collect_requires_recursive(dep, registry, result, visited);
-        }
-    }
+    result
 }
 
 /// Collect the merged serial filter from the transitive closure of fixture `names`.
@@ -551,32 +596,13 @@ fn collect_requires_recursive(
 /// Returns an empty string if no fixture is serial, `"*"` if any fixture is
 /// globally serial, or an OR-combination of individual fixture filters.
 pub fn collect_fixture_serial(names: &[&str]) -> String {
-    let registry = fixture_registry();
-    let mut visited = HashSet::new();
     let mut merged = String::new();
-    for &name in names {
-        collect_serial_recursive(name, registry, &mut visited, &mut merged);
-    }
-    merged
-}
-
-fn collect_serial_recursive(
-    name: &str,
-    registry: &HashMap<&str, &FixtureDef>,
-    visited: &mut HashSet<String>,
-    merged: &mut String,
-) {
-    if !visited.insert(name.to_string()) {
-        return;
-    }
-    if let Some(def) = registry.get(name) {
+    walk_fixture_deps(names, |def| {
         if !def.serial.is_empty() {
-            *merged = merge_serial_filters(merged, def.serial);
+            merged = merge_serial_filters(&merged, def.serial);
         }
-        for &dep in def.deps {
-            collect_serial_recursive(dep, registry, visited, merged);
-        }
-    }
+    });
+    merged
 }
 
 /// Merge two serial filter strings.

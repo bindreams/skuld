@@ -46,3 +46,88 @@ fn merge_never_emits_star_from_non_star_inputs() {
         }
     }
 }
+
+// Fixture-graph walking and label collection =====
+
+fn labeled_def(name: &'static str, deps: &'static [&'static str], labels: &'static [Label]) -> FixtureDef {
+    FixtureDef {
+        name,
+        scope: FixtureScope::Variable,
+        requires: &[],
+        deps,
+        labels,
+        setup: || Ok(Box::new(())),
+        cast: |_, _| None,
+        type_name: "()",
+        serial: "",
+    }
+}
+
+fn registry_of(defs: &[FixtureDef]) -> HashMap<&str, &FixtureDef> {
+    defs.iter().map(|d| (d.name, d)).collect()
+}
+
+fn visited_names(registry: &HashMap<&str, &FixtureDef>, roots: &[&str]) -> Vec<&'static str> {
+    let mut seen = Vec::new();
+    walk_fixture_deps_in(registry, roots, |def| seen.push(def.name));
+    seen
+}
+
+#[test]
+fn walk_visits_each_fixture_once_in_first_visit_order() {
+    let defs = [
+        labeled_def("top", &["left", "right"], &[]),
+        labeled_def("left", &["base"], &[]),
+        labeled_def("right", &["base"], &[]),
+        labeled_def("base", &[], &[]),
+    ];
+    assert_eq!(
+        visited_names(&registry_of(&defs), &["top", "right"]),
+        ["top", "left", "base", "right"]
+    );
+}
+
+#[test]
+fn walk_terminates_on_a_cycle() {
+    let defs = [labeled_def("a", &["b"], &[]), labeled_def("b", &["a"], &[])];
+    assert_eq!(visited_names(&registry_of(&defs), &["a"]), ["a", "b"]);
+}
+
+#[test]
+fn walk_skips_an_unregistered_root() {
+    let defs = [labeled_def("a", &[], &[])];
+    assert_eq!(visited_names(&registry_of(&defs), &["missing", "a"]), ["a"]);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "depends on unregistered fixture")]
+fn walk_rejects_an_unregistered_dependency() {
+    let defs = [labeled_def("a", &["missing"], &[])];
+    visited_names(&registry_of(&defs), &["a"]);
+}
+
+#[test]
+fn labels_collected_during_a_walk_are_deduplicated() {
+    let a = Label::__new("la");
+    let b = Label::__new("lb");
+    let labels_a: &'static [Label] = Box::leak(Box::new([a, b, a]));
+    let labels_b: &'static [Label] = Box::leak(Box::new([b]));
+    let defs = [
+        labeled_def("top", &["x", "y"], labels_a),
+        labeled_def("x", &[], labels_b),
+        labeled_def("y", &["x"], &[]),
+    ];
+    let registry = registry_of(&defs);
+    let mut labels = Vec::new();
+    walk_fixture_deps_in(&registry, &["top"], |def| push_unique(&mut labels, def.labels));
+    assert_eq!(labels, [a, b]);
+}
+
+#[test]
+fn fixture_labels_of_a_def_do_not_need_the_registry() {
+    let a = Label::__new("la");
+    let own: &'static [Label] = Box::leak(Box::new([a]));
+    let def = labeled_def("not_registered_anywhere", &[], own);
+    assert_eq!(fixture_labels_of(&def), [a]);
+}

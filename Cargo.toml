@@ -179,6 +179,17 @@ path = "tests/support_bins/no_labels_fixture/main.rs"
 test = false
 doc = false
 
+# Spawns `fixture_labels_fixture` to test fixture-carried labels.
+[[test]]
+name = "fixture_labels_cli"
+path = "tests/fixture_labels_cli.rs"
+
+[[bin]]
+name = "fixture_labels_fixture"
+path = "tests/support_bins/fixture_labels_fixture/main.rs"
+test = false
+doc = false
+
 # End-to-end tests for SKULD_LABELS filtering. Spawns the
 # `label_filter_fixture` binary with various SKULD_LABELS values and
 # verifies which tests collect/run via marker files and --format json

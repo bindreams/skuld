@@ -102,10 +102,26 @@ fn test_a() { /* ... */ }
 #[skuld::test(labels = [SLOW])]     // gets [SLOW], NOT [SMOKE, UNIT, SLOW]
 fn test_b() { /* ... */ }
 
-#[skuld::test(labels = [])]         // gets nothing (explicit opt-out)
+#[skuld::test(labels = [])]         // drops the module default (fixture labels still apply)
 fn test_c() { /* ... */ }
 ```
 
-Explicit `labels = [...]` (including empty) **fully replaces** the module defaults — there is no merging.
+Explicit `labels = [...]` (including empty) **fully replaces** the module defaults — there is no merging. Labels carried by the test's fixtures still apply (see below).
 
-Default labels are matched by module path prefix, so a `default_labels!` in a parent module applies to all children unless overridden.
+Default labels apply to the module and its child modules (a sibling whose name merely starts with the same characters is not a child), unless overridden.
+
+## Fixture labels
+
+A fixture can carry labels:
+
+```rust
+#[skuld::fixture(labels = [DOCKER])]
+fn container() -> Result<Container, String> { /* ... */ }
+
+#[skuld::test]                      // gets [DOCKER] from the fixture
+fn uses_container(#[fixture(container)] c: &Container) { /* ... */ }
+```
+
+A test gets, in order, its own labels (explicit, or the module default), then the labels of each fixture it declares as a `#[fixture]` parameter, then those fixtures' own `#[fixture]` dependencies, each label once. The combined set drives `SKULD_LABELS`, serial filters and nextest metadata.
+
+Only statically declared `#[fixture]` parameters count. Runtime `skuld::fixture()` / `fixture_get()` calls and dynamic `TestRunner::add` tests do not inherit labels.

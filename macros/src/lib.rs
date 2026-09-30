@@ -203,6 +203,7 @@ fn absorb_should_panic_attr(attr: &syn::Attribute) -> syn::Result<ShouldPanicArg
 #[derive(Default)]
 struct FixtureArgs {
     requires: Vec<Path>,
+    labels: Vec<Path>,
     scope: Option<Ident>,
     name: Option<String>,
     deref: bool,
@@ -228,6 +229,14 @@ impl Parse for FixtureArgs {
                     let content;
                     bracketed!(content in input);
                     args.requires = Punctuated::<Path, Token![,]>::parse_terminated(&content)?
+                        .into_iter()
+                        .collect();
+                }
+                "labels" => {
+                    let _eq: Token![=] = input.parse()?;
+                    let content;
+                    bracketed!(content in input);
+                    args.labels = Punctuated::<Path, Token![,]>::parse_terminated(&content)?
                         .into_iter()
                         .collect();
                 }
@@ -264,7 +273,7 @@ impl Parse for FixtureArgs {
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
-                        format!("unknown argument `{other}`; expected requires, scope, name, deref, or serial"),
+                        format!("unknown argument `{other}`; expected requires, labels, scope, name, deref, or serial"),
                     ));
                 }
             }
@@ -830,6 +839,9 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
 /// The function must return `Result<T, String>`. The fixture name defaults to
 /// the function name, overridable with `name = "..."`.
 ///
+/// `labels = [L, ...]` adds those labels to every test that uses the fixture,
+/// directly or through another fixture's dependencies.
+///
 /// ```ignore
 /// #[skuld::fixture(scope = process, requires = [docker_available])]
 /// fn corpus_image() -> Result<CorpusImage, String> { ... }
@@ -980,6 +992,7 @@ fn expand_fixture_def(args: FixtureArgs, func: &mut ItemFn) -> TokenStream {
     };
 
     let fixture_ty_str = quote!(#fixture_ty).to_string();
+    let label_paths = &args.labels;
     let serial_str = match &args.serial {
         None => String::new(),
         Some(s) => s.clone(),
@@ -1022,6 +1035,7 @@ fn expand_fixture_def(args: FixtureArgs, func: &mut ItemFn) -> TokenStream {
             scope: #scope_expr,
             requires: &[#(#req_exprs),*],
             deps: &[#(#dep_name_strs),*],
+            labels: &[#(#label_paths),*],
             setup: || -> ::core::result::Result<
                 ::std::boxed::Box<dyn ::std::any::Any + ::core::marker::Send + ::core::marker::Sync>,
                 ::std::string::String,

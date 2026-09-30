@@ -17,8 +17,8 @@ use crate::fixture::{
     cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope, merge_serial_filters,
 };
 use crate::label::{
-    read_label_selection, resolve_labels, validate_known_labels, validate_labels, validate_serial_filters, Label,
-    LabelFilter, ModuleLabels,
+    read_label_selection, resolve_labels_for, validate_known_labels, validate_labels, validate_serial_filters, Label,
+    LabelFilter,
 };
 use crate::{Ignore, TestDef};
 
@@ -547,12 +547,8 @@ impl TestRunner {
         let mut unavailable: Vec<(String, String)> = Vec::new();
         let mut nextest_metadata: Vec<NextestTestMetadata> = Vec::new();
 
-        // Collect module-level default labels.
-        let module_defaults: Vec<&ModuleLabels> = inventory::iter::<ModuleLabels>.into_iter().collect();
-
         self.collect_inventory_tests(
             label_filter.as_ref(),
-            &module_defaults,
             capture,
             &mut trials,
             &mut unavailable,
@@ -584,14 +580,13 @@ impl TestRunner {
     pub(crate) fn collect_inventory_tests(
         &self,
         label_filter: Option<&LabelFilter>,
-        module_defaults: &[&ModuleLabels],
         capture: bool,
         trials: &mut Vec<Trial>,
         unavailable: &mut Vec<(String, String)>,
         metadata: &mut Vec<NextestTestMetadata>,
     ) {
         for def in inventory::iter::<TestDef> {
-            let resolved = resolve_labels(def, module_defaults);
+            let resolved = resolve_labels_for(def);
 
             // Label filtering — skip entirely (not ignored, just absent).
             if let Some(filter) = label_filter {
