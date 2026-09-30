@@ -66,8 +66,9 @@ jobs:
       # separate directory. Scripts run *after* the pinned checkout still come
       # from the release tree, matching the manifests they read.
       #
-      # The pinned checkout below does `git clean -ffdx` on the workspace and
-      # deletes this directory; nothing after the version step may use it.
+      # The pinned checkout below finds no repository at the workspace root,
+      # so it empties the workspace whatever `clean:` says, deleting this
+      # directory; nothing after the version step may use it.
       - name: Check out the release scripts from the workflow ref
         uses: actions/checkout@v4
         timeout-minutes: 5
