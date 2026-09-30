@@ -1,3 +1,4 @@
+use super::resolve;
 use super::windows_probe::probe;
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
@@ -87,6 +88,11 @@ fn a_name_held_by_a_delete_pending_file_is_skipped() {
     let asked = Cell::new(0);
     probe(tmp.path(), names(&["held", "fresh"], &asked)).unwrap();
     assert_eq!(asked.get(), 2);
+    assert_eq!(
+        listing(tmp.path()),
+        ["held"],
+        "the probe file must be gone once the probe returns"
+    );
 }
 
 #[test]
@@ -98,6 +104,29 @@ fn a_name_held_by_an_existing_file_is_skipped() {
     probe(tmp.path(), names(&["taken", "fresh"], &asked)).unwrap();
     assert_eq!(asked.get(), 2);
     assert_eq!(std::fs::read(tmp.path().join("taken")).unwrap(), b"keep");
+    assert_eq!(
+        listing(tmp.path()),
+        ["taken"],
+        "the probe file must be gone once the probe returns"
+    );
+}
+
+#[test]
+fn a_name_held_by_a_directory_is_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+
+    let asked = Cell::new(0);
+    probe(tmp.path(), names(&["sub", "fresh"], &asked)).unwrap();
+    assert_eq!(asked.get(), 2);
+    assert_eq!(listing(tmp.path()), ["sub"]);
+}
+
+fn assert_says_being_deleted(err: &str) {
+    assert!(
+        err.contains("being deleted") && !err.contains("Access is denied"),
+        "the error must name the deletion, not an access denial: {err}"
+    );
 }
 
 /// Every name fails in a delete-pending directory, so retrying on its status would never end.
@@ -120,6 +149,7 @@ fn a_directory_deleted_mid_probe_is_an_error_not_a_retry(posix: bool) {
     })
     .unwrap_err();
     assert_eq!(asked.get(), 1, "{err}");
+    assert_says_being_deleted(&err.to_string());
 }
 
 #[test]
@@ -130,6 +160,18 @@ fn a_delete_pending_directory_is_an_error_not_a_retry() {
 #[test]
 fn a_posix_deleted_directory_is_an_error_not_a_retry() {
     a_directory_deleted_mid_probe_is_an_error_not_a_retry(true);
+}
+
+#[test]
+fn a_directory_already_being_deleted_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("d");
+    std::fs::create_dir(&dir).unwrap();
+    let _pending = mark_for_deletion(&dir, false);
+
+    let err = resolve(Some(dir.as_os_str()), || panic!("SKULD_DB_DIR is set")).unwrap_err();
+    assert!(err.contains("SKULD_DB_DIR"), "{err}");
+    assert_says_being_deleted(&err);
 }
 
 /// Denies file and subdirectory creation to Everyone; the deny ACE is removed on drop.
