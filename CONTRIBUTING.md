@@ -167,3 +167,7 @@ gh release view vX.Y.Z
 # tag by hand during recovery — it would delete it.
 gh release delete vX.Y.Z --yes --cleanup-tag
 ```
+
+## Workflow conventions
+
+- **Each job's first step is the checkout that provides what its steps run.** A step that runs a `.github/scripts/` script or a local `./` action needs the repo on disk. Any further checkout (sparse, into a subfolder, or at another ref) goes directly after the first, before any step that uses it. Remember that a later full-workspace checkout wipes an earlier subfolder checkout. The release workflows cannot be exercised end to end without publishing, so a step that runs before its checkout only fails during a real release, as publish run 36659127833 did. This is a convention, deliberately not a CI check.
