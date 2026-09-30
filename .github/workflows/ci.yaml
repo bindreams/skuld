@@ -19,6 +19,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
       - name: Token privileges
+        continue-on-error: true
+        shell: cmd
         run: whoami /priv
       - name: Baseline
         run: |
