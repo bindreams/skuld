@@ -13,6 +13,11 @@ All notable changes to this project are documented in this file.
   one (`#[fixture(a, b)]`, `#[fixture = "a"]`, `#[fixture("a")]`), which
   silently fell back to the parameter's own name.
 
+### Fixed
+
+- **A `SKULD_LABELS` that is not valid UTF-8 now panics at startup**, naming the
+  variable. It was treated as unset, so every test ran.
+
 ## [0.5.0] - 2026-09-30
 
 ### Breaking
