@@ -118,7 +118,7 @@ fn read_signal(child: &mut std::process::Child, expected: u8, what: &str) {
 /// scenario could affect, so there's no fourth companion to check here.
 #[test]
 fn publish_creates_three_0666_files_despite_umask() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = skuld::TempDir::new().unwrap();
     let db_path = dir.path().join(".skuld.db");
 
     let mut cmd = probe(&db_path, Some("077"));
@@ -159,7 +159,7 @@ fn publish_creates_three_0666_files_despite_umask() {
 #[test]
 fn concurrent_publishers_all_converge_on_one_0666_file() {
     const PUBLISHERS: usize = 8;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = skuld::TempDir::new().unwrap();
     let db_path = dir.path().join(".skuld.db");
 
     // Every publisher starts against the same empty directory, each

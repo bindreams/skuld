@@ -43,7 +43,7 @@ fn collect_metadata_with_timeout(
 ) -> anyhow::Result<Vec<TestMetadata>> {
     let mut all = Vec::new();
     for binary in binaries {
-        let dir = tempfile::tempdir()?;
+        let dir = skuld::TempDir::new()?;
         let dump_path = dir.path().join("meta.json");
         // stderr goes to a real file, not a pipe: a piped stream that isn't
         // drained until after wait_timeout() returns can deadlock if the

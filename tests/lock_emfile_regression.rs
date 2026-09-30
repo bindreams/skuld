@@ -26,7 +26,7 @@ use std::process::Command;
 
 #[test]
 fn open_lock_target_panics_immediately_on_emfile_instead_of_spinning() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = skuld::TempDir::new().unwrap();
     let db_path = dir.path().join(".skuld.db");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_lock_emfile_probe"));

@@ -34,7 +34,7 @@ fn with_init_lock_serializes_concurrent_callers() {
     const ROUNDS: usize = 20;
 
     for _ in 0..ROUNDS {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::TempDir::new().unwrap();
         let db_path = dir.path().join(".skuld.db");
         let in_critical_section = AtomicI64::new(0);
         let max_seen = AtomicI64::new(0);
@@ -87,7 +87,7 @@ fn with_init_lock_serializes_concurrent_callers() {
 fn with_init_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet() {
     const THREADS: usize = 32;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let db_path = dir.path().join(".skuld.db");
     assert!(
         !lock_path(&db_path).exists(),
@@ -129,7 +129,7 @@ fn with_init_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet()
 /// only ever runs while `with_init_lock`'s own lock is provably still held.
 #[test]
 fn a_fresh_try_lock_reports_would_block_while_with_init_lock_holds_the_lock() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let db_path = dir.path().join(".skuld.db");
 
     with_init_lock(&db_path, |_token| {
@@ -150,7 +150,7 @@ fn a_fresh_try_lock_reports_would_block_while_with_init_lock_holds_the_lock() {
 /// resolve itself by trying the open again.
 #[test]
 fn with_init_lock_panics_immediately_when_the_profile_directory_does_not_exist_instead_of_spinning() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let db_path = dir.path().join("nonexistent-subdir").join(".skuld.db");
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| with_init_lock(&db_path, |_token| {})));
@@ -206,7 +206,7 @@ fn lock_exclusive_retries_past_eintr_from_a_non_restarting_handler() {
         );
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let db_path = dir.path().join(".skuld.db");
 
     let holder = open_lock_target(&db_path);
@@ -265,7 +265,7 @@ fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
 #[cfg(unix)]
 #[test]
 fn open_lock_target_failure_names_the_override() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let file = tmp.path().join("file");
     std::fs::write(&file, b"").unwrap();
     let msg = panic_message(|| {
@@ -284,7 +284,7 @@ fn open_lock_target_rejects_a_relative_path() {
 #[cfg(unix)]
 #[test]
 fn a_failed_stat_of_the_lock_target_is_reported_not_swallowed() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let dir = tmp.path().join("d");
     std::fs::create_dir(&dir).unwrap();
     with_init_lock(&dir.join(".skuld.db"), |held| {

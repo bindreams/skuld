@@ -128,7 +128,7 @@ fn collect_dynamic_tests_populates_metadata_excluding_ignored() {
 
 #[test]
 fn write_nextest_metadata_produces_expected_json() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let path = dir.path().join("meta.json");
     crate::runner::write_nextest_metadata(
         &path,
@@ -147,7 +147,7 @@ fn write_nextest_metadata_produces_expected_json() {
 
 #[test]
 fn write_nextest_metadata_handles_empty_list() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let path = dir.path().join("meta.json");
     crate::runner::write_nextest_metadata(&path, vec![]);
     let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

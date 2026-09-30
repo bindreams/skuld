@@ -152,7 +152,7 @@ fn executable_without_a_parent_has_no_layout_dir() {
 
 #[test]
 fn cargo_marker_is_a_fingerprint_dir_or_a_cachedir_tag_one_level_up() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let profile = tmp.path().join("debug");
     std::fs::create_dir(&profile).unwrap();
     assert!(!has_cargo_marker(&profile));
@@ -165,7 +165,7 @@ fn cargo_marker_is_a_fingerprint_dir_or_a_cachedir_tag_one_level_up() {
 
 #[test]
 fn an_unmarked_unhashed_deps_directory_resolves_to_itself() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let deps = tmp.path().join("opt/app/deps");
     std::fs::create_dir_all(&deps).unwrap();
     std::fs::write(deps.join("t"), b"").unwrap();
@@ -181,7 +181,7 @@ fn never() -> io::Result<PathBuf> {
 
 #[test]
 fn override_wins_without_consulting_the_executable_and_is_created() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let want = tmp.path().join("a").join("b");
     assert_eq!(resolve(Some(want.as_os_str()), never).unwrap(), want);
     assert!(want.is_dir());
@@ -189,7 +189,7 @@ fn override_wins_without_consulting_the_executable_and_is_created() {
 
 #[test]
 fn override_works_when_current_exe_fails() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let got = resolve(Some(tmp.path().as_os_str()), || Err(io::Error::other("no /proc"))).unwrap();
     assert_eq!(got, tmp.path());
 }
@@ -214,7 +214,7 @@ fn empty_override_is_rejected() {
 
 #[test]
 fn uncreatable_override_is_an_error_naming_the_path_and_cause() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let file = tmp.path().join("file");
     std::fs::write(&file, b"").unwrap();
     let want = file.join("sub");
@@ -224,7 +224,7 @@ fn uncreatable_override_is_an_error_naming_the_path_and_cause() {
 
 #[test]
 fn missing_exe_directory_is_an_error_naming_the_variable() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let exe = tmp.path().join("gone/deps/t");
     let err = resolve(None, || Ok(exe)).unwrap_err();
     assert!(err.contains("SKULD_DB_DIR"), "{err}");
@@ -236,7 +236,7 @@ fn missing_exe_directory_is_an_error_naming_the_variable() {
 #[test]
 fn deleted_executable_is_resolved_through_its_parent() {
     // Linux reports a replaced binary as "<path> (deleted)".
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let profile = tmp.path().join("debug");
     std::fs::create_dir_all(profile.join("deps")).unwrap();
     let exe = profile.join("deps").join(format!("t-{H} (deleted)"));
@@ -247,7 +247,7 @@ fn deleted_executable_is_resolved_through_its_parent() {
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn deleted_suffix_is_not_special_off_linux() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     std::fs::create_dir_all(tmp.path().join("debug/deps")).unwrap();
     let exe = tmp.path().join("debug/deps/t (deleted)");
     let err = resolve(None, || Ok(exe)).unwrap_err();
@@ -256,7 +256,7 @@ fn deleted_suffix_is_not_special_off_linux() {
 
 #[test]
 fn a_missing_executable_without_the_deleted_suffix_is_an_error_naming_the_variable() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     std::fs::create_dir_all(tmp.path().join("debug/deps")).unwrap();
     let err = resolve(None, || Ok(tmp.path().join("debug/deps/gone"))).unwrap_err();
     assert!(err.contains("SKULD_DB_DIR"), "{err}");
@@ -265,7 +265,7 @@ fn a_missing_executable_without_the_deleted_suffix_is_an_error_naming_the_variab
 #[cfg(unix)]
 #[test]
 fn dangling_symlinked_executable_is_an_error_not_the_symlinks_directory() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let real = tmp.path().join("real/debug/deps");
     std::fs::create_dir_all(&real).unwrap();
     let target = real.join("t");
@@ -282,7 +282,7 @@ fn dangling_symlinked_executable_is_an_error_not_the_symlinks_directory() {
 #[cfg(unix)]
 #[test]
 fn symlinked_executable_resolves_to_the_real_profile_dir() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let real = tmp.path().join("real/debug/deps");
     std::fs::create_dir_all(&real).unwrap();
     std::fs::write(real.join(format!("t-{H}")), b"").unwrap();
@@ -296,7 +296,7 @@ fn symlinked_executable_resolves_to_the_real_profile_dir() {
 
 #[test]
 fn override_naming_an_existing_file_is_rejected_as_not_a_directory() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let file = tmp.path().join("file");
     std::fs::write(&file, b"").unwrap();
     #[cfg(unix)]
@@ -321,7 +321,7 @@ mod creation {
 
     #[test]
     fn a_level_is_never_visible_at_its_final_path_before_it_is_world_writable() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::TempDir::new().unwrap();
         let target = tmp.path().join("made");
         let mut calls = 0;
         create_dir_all_open_with(&target, |temp, published| {
@@ -338,7 +338,7 @@ mod creation {
 
     #[test]
     fn losing_the_publish_race_leaves_the_winners_directory_untouched_and_no_temp() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::TempDir::new().unwrap();
         let target = tmp.path().join("made");
         create_dir_all_open_with(&target, |_, published| {
             std::fs::create_dir(published).unwrap();
@@ -355,7 +355,7 @@ mod creation {
 
     #[test]
     fn a_pre_existing_directory_is_left_untouched() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::TempDir::new().unwrap();
         let dir = tmp.path().join("there");
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -365,7 +365,7 @@ mod creation {
 
     #[test]
     fn only_the_missing_levels_of_a_partial_chain_are_created_world_writable() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::TempDir::new().unwrap();
         let existing = tmp.path().join("existing");
         std::fs::create_dir(&existing).unwrap();
         std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();

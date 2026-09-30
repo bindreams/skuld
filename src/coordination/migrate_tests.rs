@@ -117,7 +117,7 @@ fn transaction(a: &Action, verb: &str) -> bool {
 }
 
 /// A database at schema version 0 with one legacy row the scrub rewrites.
-fn v0_db() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection, DbIdentity) {
+fn v0_db() -> (crate::TempDir, std::path::PathBuf, rusqlite::Connection, DbIdentity) {
     let (dir, path) = temp_db();
     let (conn, identity) = open_db(&path);
     conn.execute("PRAGMA user_version = 0", []).unwrap();

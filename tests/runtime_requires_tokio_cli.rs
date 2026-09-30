@@ -7,7 +7,7 @@ use std::process::Command;
 #[test]
 fn runtime_arg_requires_the_tokio_feature() {
     let skuld_dir = env!("CARGO_MANIFEST_DIR");
-    let dir = tempfile::tempdir().expect("scratch crate dir");
+    let dir = skuld::TempDir::new().expect("scratch crate dir");
     std::fs::create_dir(dir.path().join("src")).unwrap();
     let table = |entries: &[(&str, toml::Value)]| -> toml::Table {
         entries.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()

@@ -43,7 +43,7 @@ fn stderr(out: &Output) -> String {
 
 #[test]
 fn binary_moved_into_a_deps_dir_elsewhere_uses_that_profile_dir() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = skuld::TempDir::new().unwrap();
     let profile = tmp.path().join("extracted").join("debug");
     let exe = copy_fixture_to(&profile.join("deps"), &hashed("capture_fixture"));
     let out = run(&exe, None);
@@ -53,7 +53,7 @@ fn binary_moved_into_a_deps_dir_elsewhere_uses_that_profile_dir() {
 
 #[test]
 fn binary_moved_next_to_no_deps_dir_uses_its_own_directory() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = skuld::TempDir::new().unwrap();
     let profile = tmp.path().join("bin");
     let exe = copy_fixture_to(&profile, &plain("capture_fixture"));
     let out = run(&exe, None);
@@ -64,7 +64,7 @@ fn binary_moved_next_to_no_deps_dir_uses_its_own_directory() {
 /// Without a cargo marker, a directory named `deps` is just a directory.
 #[test]
 fn unhashed_binary_in_a_deps_dir_uses_that_directory() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = skuld::TempDir::new().unwrap();
     let deps = tmp.path().join("opt/app/deps");
     let exe = copy_fixture_to(&deps, &plain("capture_fixture"));
     let out = run(&exe, None);
@@ -75,7 +75,7 @@ fn unhashed_binary_in_a_deps_dir_uses_that_directory() {
 
 #[test]
 fn override_env_var_picks_the_directory_and_creates_it() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = skuld::TempDir::new().unwrap();
     let exe = copy_fixture_to(&tmp.path().join("debug").join("deps"), &hashed("capture_fixture"));
     let db_dir = tmp.path().join("elsewhere").join("nested");
     let out = run(&exe, Some(&db_dir));
@@ -89,7 +89,7 @@ fn override_env_var_picks_the_directory_and_creates_it() {
 
 #[test]
 fn relative_override_fails_loudly() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = skuld::TempDir::new().unwrap();
     let exe = copy_fixture_to(&tmp.path().join("debug").join("deps"), &hashed("capture_fixture"));
     let out = run(&exe, Some(Path::new("relative/dir")));
     assert!(!out.status.success(), "{out:?}");
@@ -101,7 +101,7 @@ fn relative_override_fails_loudly() {
 
 #[test]
 fn new_build_dir_layout_resolves_to_the_profile_dir() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = skuld::TempDir::new().unwrap();
     let profile = tmp.path().join("debug");
     let out = profile.join("build/toy2/3d3289c4a1b2c3d4/out");
     let exe = copy_fixture_to(&out, &hashed("a"));
@@ -114,7 +114,7 @@ fn new_build_dir_layout_resolves_to_the_profile_dir() {
 /// A trial that changes `SKULD_DB_DIR` mid-run must not move later trials to another DB.
 #[test]
 fn db_path_is_resolved_once_per_process() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = skuld::TempDir::new().unwrap();
     let profile = tmp.path().join("debug");
     let exe = copy_bin_to(
         env!("CARGO_BIN_EXE_db_dir_env_probe"),
@@ -141,7 +141,7 @@ fn db_path_is_resolved_once_per_process() {
 fn created_override_dirs_are_world_writable_despite_umask() {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = skuld::TempDir::new().unwrap();
     let exe = copy_fixture_to(&tmp.path().join("debug/deps"), &hashed("capture_fixture"));
     let db_dir = tmp.path().join("made/nested");
     let parent_before = std::fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
@@ -173,7 +173,7 @@ fn created_override_dirs_are_world_writable_despite_umask() {
 #[test]
 fn symlinked_binary_uses_the_real_profile_dir() {
     use std::os::unix::fs::symlink;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = skuld::TempDir::new().unwrap();
     let real_profile = tmp.path().join("real/debug");
     let real_deps = real_profile.join("deps");
     let exe = copy_fixture_to(&real_deps, &hashed("fx"));
@@ -233,7 +233,7 @@ mod read_only {
     #[test]
     fn read_only_profile_dir_fails_loudly_naming_the_directory() {
         assert_not_root();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = skuld::TempDir::new().unwrap();
         let profile = tmp.path().join("debug");
         let exe = copy_fixture_to(&profile.join("deps"), &hashed("capture_fixture"));
         let _ro = Mode::set(&profile, 0o555);
@@ -250,7 +250,7 @@ mod read_only {
     #[test]
     fn read_only_profile_dir_with_an_existing_db_fails_loudly_naming_the_override() {
         assert_not_root();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = skuld::TempDir::new().unwrap();
         let profile = tmp.path().join("debug");
         let exe = copy_fixture_to(&profile.join("deps"), &hashed("capture_fixture"));
         let first = run(&exe, None);
@@ -269,7 +269,7 @@ mod read_only {
     #[test]
     fn unreadable_override_dir_fails_loudly_naming_the_override() {
         assert_not_root();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = skuld::TempDir::new().unwrap();
         let exe = copy_fixture_to(&tmp.path().join("debug/deps"), &hashed("capture_fixture"));
         let dir = tmp.path().join("wx");
         std::fs::create_dir(&dir).unwrap();
@@ -286,7 +286,7 @@ mod read_only {
     #[test]
     fn read_only_profile_dir_works_with_a_writable_override() {
         assert_not_root();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = skuld::TempDir::new().unwrap();
         let profile = tmp.path().join("debug");
         let exe = copy_fixture_to(&profile.join("deps"), &hashed("capture_fixture"));
         let _ro = Mode::set(&profile, 0o555);
@@ -326,7 +326,7 @@ mod read_only_windows {
 
     #[test]
     fn write_denied_directory_fails_loudly_naming_the_override() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = skuld::TempDir::new().unwrap();
         let exe = copy_fixture_to(&tmp.path().join("debug").join("deps"), &hashed("capture_fixture"));
         let dir = tmp.path().join("denied");
         std::fs::create_dir(&dir).unwrap();

@@ -6,7 +6,7 @@ use std::{fs, process::Command};
 
 #[test]
 fn each_trial_runs_on_its_own_thread() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = skuld::TempDir::new().expect("tempdir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_thread_per_trial"));
     cmd.arg("--test-threads=1");
     cmd.env("THREAD_PER_TRIAL_MARKERS", dir.path());

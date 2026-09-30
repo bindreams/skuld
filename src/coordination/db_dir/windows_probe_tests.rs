@@ -89,7 +89,7 @@ fn names<'a>(names: &'a [&'a str], asked: &'a Cell<usize>) -> impl FnMut() -> St
 
 #[test]
 fn a_name_held_by_a_delete_pending_file_is_skipped() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let held = tmp.path().join("held");
     std::fs::write(&held, b"").unwrap();
     let _pending = mark_for_deletion(&held, false);
@@ -103,7 +103,7 @@ fn a_name_held_by_a_delete_pending_file_is_skipped() {
 
 #[test]
 fn a_name_held_by_an_existing_file_is_skipped() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     std::fs::write(tmp.path().join("taken"), b"keep").unwrap();
 
     let asked = Cell::new(0);
@@ -115,7 +115,7 @@ fn a_name_held_by_an_existing_file_is_skipped() {
 
 #[test]
 fn a_name_held_by_a_directory_is_skipped() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     std::fs::create_dir(tmp.path().join("sub")).unwrap();
 
     let asked = Cell::new(0);
@@ -134,7 +134,7 @@ fn assert_says_being_deleted(err: &str) {
 
 /// Every name fails in a delete-pending directory, so retrying on its status would never end.
 fn a_directory_deleted_mid_probe_is_an_error_not_a_retry(posix: bool) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let dir = tmp.path().join("d");
     std::fs::create_dir(&dir).unwrap();
 
@@ -167,7 +167,7 @@ fn a_posix_deleted_directory_is_an_error_not_a_retry() {
 
 #[test]
 fn a_directory_already_being_deleted_says_so() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let dir = tmp.path().join("d");
     std::fs::create_dir(&dir).unwrap();
     let _pending = mark_for_deletion(&dir, false);
@@ -210,7 +210,7 @@ impl Drop for DenyWrite {
 
 #[test]
 fn a_write_denied_directory_is_an_error_not_a_retry() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let dir = tmp.path().join("d");
     std::fs::create_dir(&dir).unwrap();
     let _deny = DenyWrite::new(&dir);
@@ -223,7 +223,7 @@ fn a_write_denied_directory_is_an_error_not_a_retry() {
 
 #[test]
 fn a_write_denied_directory_fails_resolve_naming_the_variable() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let dir = tmp.path().join("d");
     std::fs::create_dir(&dir).unwrap();
     let _deny = DenyWrite::new(&dir);
@@ -248,14 +248,14 @@ fn probe_names_are_pid_scoped_and_advance() {
 
 #[test]
 fn check_usable_succeeds_and_its_probe_is_gone() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     check_usable(tmp.path()).unwrap();
     assert_gone(&tmp.path().join(format!(".skuld-probe-{}-1", std::process::id())));
 }
 
 #[test]
 fn check_usable_skips_a_leftover_probe_name() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let pid = std::process::id();
     let leftover = tmp.path().join(format!(".skuld-probe-{pid}-1"));
     std::fs::write(&leftover, b"keep").unwrap();
@@ -274,14 +274,14 @@ fn a_relative_path_opens_against_the_working_directory() {
 
 #[test]
 fn a_drive_root_opens_as_a_directory() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let root = tmp.path().ancestors().last().unwrap();
     open_dir(root).unwrap();
 }
 
 #[test]
 fn a_path_ending_in_parent_dir_probes_the_parent() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     std::fs::create_dir(tmp.path().join("a")).unwrap();
 
     let asked = Cell::new(0);
@@ -292,7 +292,7 @@ fn a_path_ending_in_parent_dir_probes_the_parent() {
 
 #[test]
 fn a_trailing_separator_is_accepted() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let mut dir = tmp.path().as_os_str().to_owned();
     dir.push("\\");
 
@@ -303,7 +303,7 @@ fn a_trailing_separator_is_accepted() {
 
 #[test]
 fn a_verbatim_path_with_a_slash_in_a_component_is_invalid_input() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let dir = PathBuf::from(format!(r"\\?\{}\a/b", tmp.path().display()));
 
     let err = check_usable(&dir).unwrap_err();
@@ -313,7 +313,7 @@ fn a_verbatim_path_with_a_slash_in_a_component_is_invalid_input() {
 
 #[test]
 fn a_missing_directory_is_not_found_naming_it() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let dir = tmp.path().join("missing");
 
     let err = check_usable(&dir).unwrap_err();
@@ -331,7 +331,7 @@ fn a_device_is_not_a_usable_directory() {
 
 #[test]
 fn a_directory_inside_one_being_deleted_says_so() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let parent = tmp.path().join("d");
     std::fs::create_dir(&parent).unwrap();
     let _pending = mark_for_deletion(&parent, false);

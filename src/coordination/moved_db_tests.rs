@@ -60,7 +60,7 @@ fn retarget_to_empty_dir(dir: &std::path::Path) {
 #[cfg(unix)]
 #[test]
 fn db_has_moved_is_caught_by_the_sqlite_fcntl_alone() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let path = open_through_symlink(dir.path());
     let (conn, identity) = open_db(&path);
     // Main file only: the companions are not what this test isolates.
@@ -95,7 +95,7 @@ fn db_has_moved_is_caught_by_the_sqlite_fcntl_alone() {
 #[cfg(unix)]
 #[test]
 fn db_has_moved_is_caught_by_the_file_identity_alone() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let path = open_through_symlink(dir.path());
     let (conn, identity) = open_db(&path);
     // Main file only: the companions are not what this test isolates.
@@ -126,7 +126,7 @@ fn db_has_moved_is_caught_by_the_file_identity_alone() {
 #[cfg(unix)]
 #[test]
 fn open_db_schema_write_is_stopped_by_a_split_lock_alone() {
-    let outer = tempfile::tempdir().unwrap();
+    let outer = crate::TempDir::new().unwrap();
     let profile = outer.path().join("profile");
     std::fs::create_dir(&profile).unwrap();
     let path = profile.join("test-coordination.db");
@@ -188,7 +188,7 @@ fn assert_moved_panic(result: std::thread::Result<()>, path: &std::path::Path) {
 /// not hand back a registration in an orphaned file.
 #[test]
 fn coordinate_fails_loudly_when_the_db_moves_right_after_its_commit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let path = open_through_symlink(dir.path());
     let path2 = path.clone();
     let root = dir.path().to_owned();
@@ -206,7 +206,7 @@ fn coordinate_fails_loudly_when_the_db_moves_right_after_its_commit() {
 /// succeeded must still panic.
 #[test]
 fn registration_drop_fails_loudly_when_the_db_moves_right_after_its_delete() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let path = open_through_symlink(dir.path());
     let a = coordinate(&path, "a", &[], SERIAL_NONE);
     let root = dir.path().to_owned();
@@ -308,7 +308,7 @@ fn failure_message_names_a_full_disk() {
 /// them can be the symptom of a swapped `-wal`/`-shm`.
 #[test]
 fn failure_message_says_moved_for_every_class_when_the_db_moved() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let path = open_through_symlink(dir.path());
     let (conn, identity) = open_db(&path);
     retarget_to_empty_dir(dir.path());
@@ -340,7 +340,7 @@ fn failure_message_says_moved_when_only_a_companion_was_lost() {
 #[cfg(unix)]
 #[test]
 fn a_captured_failure_keeps_its_errno_after_a_later_failure_overwrites_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let (_db_dir, path) = temp_db();
     let (conn, identity) = open_db(&path);
     let attach = |target: &std::path::Path| {
@@ -379,7 +379,7 @@ fn open_db_records_both_companions_and_reports_them_unmoved() {
 /// not redirect them and they are not what reports it.
 #[test]
 fn an_ancestor_retarget_is_caught_by_the_main_identity_not_the_companions() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let path = open_through_symlink(dir.path());
     let (conn, identity) = open_db(&path);
 
@@ -471,7 +471,7 @@ fn record_rejects_a_file_swapped_in_right_after_the_open() {
 /// and what `path` now resolves to disagree, so nothing may be recorded.
 #[test]
 fn record_rejects_an_ancestor_retargeted_right_after_the_open() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let path = open_through_symlink(dir.path());
     let second = dir.path().join("second");
     std::fs::create_dir(&second).unwrap();
@@ -493,7 +493,7 @@ fn record_rejects_an_ancestor_retargeted_right_after_the_open() {
 #[cfg(unix)]
 #[test]
 fn record_rejects_sqlites_own_path_swapped_while_the_callers_path_still_resolves() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let path = open_through_symlink(dir.path());
     let root = dir.path().to_owned();
     let _seam = set_test_seam_hook(Seam::Fd, move || {
@@ -627,8 +627,8 @@ fn two_filesystems() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
 fn record_rejects_a_same_inode_file_on_another_device() {
     use std::os::unix::fs::MetadataExt;
     let Some((fs_a, fs_b)) = two_filesystems() else { return };
-    let dir_a = tempfile::tempdir_in(&fs_a).unwrap();
-    let dir_b = tempfile::tempdir_in(&fs_b).unwrap();
+    let dir_a = crate::TempDir::new_in(&fs_a).unwrap();
+    let dir_b = crate::TempDir::new_in(&fs_b).unwrap();
     assert_ne!(
         dir_a.path().metadata().unwrap().dev(),
         dir_b.path().metadata().unwrap().dev(),
@@ -671,7 +671,7 @@ fn record_rejects_a_same_inode_file_on_another_device() {
 /// write and records that) instead of abandoning the row unnoticed.
 #[test]
 fn a_post_commit_panic_unwinds_through_the_registrations_drop() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let path = open_through_symlink(dir.path());
     let path2 = path.clone();
     let root = dir.path().to_owned();
@@ -697,7 +697,7 @@ fn a_post_commit_panic_unwinds_through_the_registrations_drop() {
 #[cfg(unix)]
 #[test]
 fn open_db_rejects_a_split_landing_after_schema_init() {
-    let outer = tempfile::tempdir().unwrap();
+    let outer = crate::TempDir::new().unwrap();
     let profile = outer.path().join("profile");
     std::fs::create_dir(&profile).unwrap();
     let path = profile.join("test-coordination.db");

@@ -76,7 +76,7 @@ fn non_utf8_skuld_debug_is_a_startup_error() {
 fn non_utf8_nextest_metadata_path_is_honored() {
     use std::os::unix::ffi::OsStringExt;
 
-    let root = tempfile::tempdir().expect("tempdir");
+    let root = skuld::TempDir::new().expect("tempdir");
     let dir = root.path().join(OsString::from_vec(b"d\xFFir".to_vec()));
     std::fs::create_dir(&dir).expect("create non-UTF-8 directory");
     let path = dir.join("meta.json");

@@ -24,7 +24,7 @@ use std::process::Command;
 
 #[test]
 fn a_second_panic_during_drop_does_not_abort_the_process() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = skuld::TempDir::new().unwrap();
     let db_path = dir.path().join(".skuld.db");
 
     let out = Command::new(env!("CARGO_BIN_EXE_drop_panic_during_unwind_probe"))

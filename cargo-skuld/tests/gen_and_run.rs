@@ -15,7 +15,7 @@ fn cargo_shaped_argv_strips_the_subcommand_name() {
     // running `cargo-skuld` directly does not. main() strips the former and
     // must leave the latter alone. Nesting the commands is what made that
     // strip necessary, and nothing else here covers it.
-    let out_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = skuld::TempDir::new().expect("tempdir");
     let output = out_dir.path().join("skuld-nextest.toml");
 
     let status = Command::new(bin())
@@ -30,7 +30,7 @@ fn cargo_shaped_argv_strips_the_subcommand_name() {
 
 #[test]
 fn gen_writes_groups_for_the_shared_resource_and_weird_name_conflicts() {
-    let out_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = skuld::TempDir::new().expect("tempdir");
     let output = out_dir.path().join("skuld-nextest.toml");
 
     let status = Command::new(bin())
@@ -60,7 +60,7 @@ fn gen_writes_groups_for_the_shared_resource_and_weird_name_conflicts() {
 
 #[test]
 fn gen_check_matches_after_gen() {
-    let out_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = skuld::TempDir::new().expect("tempdir");
     let output = out_dir.path().join("skuld-nextest.toml");
     let gen_status = Command::new(bin())
         .current_dir(fixture_root())
@@ -83,7 +83,7 @@ fn gen_check_matches_after_gen() {
 
 #[test]
 fn gen_check_fails_on_stale_file() {
-    let out_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = skuld::TempDir::new().expect("tempdir");
     let output = out_dir.path().join("skuld-nextest.toml");
     std::fs::write(&output, "# stale, does not match current test set\n").unwrap();
     let check_status = Command::new(bin())
@@ -101,9 +101,9 @@ fn gen_check_fails_on_stale_file() {
 
 #[test]
 fn gen_on_a_workspace_with_no_skuld_binaries_is_a_harmless_noop() {
-    let empty_ws = tempfile::tempdir().expect("tempdir");
+    let empty_ws = skuld::TempDir::new().expect("tempdir");
     std::fs::write(empty_ws.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
-    let out_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = skuld::TempDir::new().expect("tempdir");
     let output = out_dir.path().join("skuld-nextest.toml");
     let status = Command::new(bin())
         .current_dir(empty_ws.path())
@@ -144,7 +144,7 @@ fn negative_control_two_directly_spawned_processes_overlap() {
     // (process-lifetime windows correctly detect two simultaneously-alive
     // processes); the positive case below validates nextest's own
     // scheduling behavior separately.
-    let timing_dir = tempfile::tempdir().expect("tempdir");
+    let timing_dir = skuld::TempDir::new().expect("tempdir");
     let binaries = cargo_skuld::discovery::discover_binaries(&fixture_root()).expect("discovery");
     let bin_a = &binaries
         .iter()
@@ -183,8 +183,8 @@ fn negative_control_two_directly_spawned_processes_overlap() {
 fn run_serializes_the_cross_binary_conflict_via_generated_tool_config() {
     // Positive case: with the generated tool-config, nextest must not
     // launch the second process until the first has fully exited.
-    let real_dir = tempfile::tempdir().expect("tempdir");
-    let output_dir = tempfile::tempdir().expect("tempdir");
+    let real_dir = skuld::TempDir::new().expect("tempdir");
+    let output_dir = skuld::TempDir::new().expect("tempdir");
     let status = Command::new(bin())
         .current_dir(fixture_root())
         .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", real_dir.path())
@@ -210,8 +210,8 @@ fn run_serializes_the_cross_binary_conflict_via_generated_tool_config() {
 /// tests must actually execute.
 #[test]
 fn run_correctly_selects_tests_with_special_characters_in_their_names() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let output_dir = tempfile::tempdir().expect("tempdir");
+    let dir = skuld::TempDir::new().expect("tempdir");
+    let output_dir = skuld::TempDir::new().expect("tempdir");
     let status = Command::new(bin())
         .current_dir(fixture_root())
         .env("SKULD_NEXTEST_FIXTURE_TIMING_DIR", dir.path())
