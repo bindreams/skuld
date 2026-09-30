@@ -26,7 +26,11 @@ inventory = "0.3"
 libtest-mimic = "0.8"
 # Needed for clap::Parser trait (Arguments::parse_from); libtest-mimic doesn't re-export it.
 clap = { version = "4", features = ["derive"] }
-tempfile = "3"
+# TempDir needs Builder::disable_cleanup, an absolute make_in base and getrandom re-seeding
+# (all in 3.20 or earlier; 3.27 is the tested floor).
+tempfile = "3.27"
+# HFS+ counts a name's length after canonical decomposition, so TempDir budgets names in NFD.
+unicode-normalization = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_yml = "0.0.13"
 serde_json = "1"
@@ -69,7 +73,7 @@ windows = { version = "0.62", features = [
     # Windows init lock file: opened without FILE_SHARE_DELETE so it can
     # never be deleted or renamed out from under a holder.
     "Win32_Storage_FileSystem",
-    # NtCreateFile (windows_probe) reports STATUS_DELETE_PENDING, which
+    # NtCreateFile (src/win_nt.rs) reports STATUS_DELETE_PENDING, which
     # CreateFileW folds into ERROR_ACCESS_DENIED.
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",

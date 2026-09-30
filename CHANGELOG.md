@@ -30,9 +30,21 @@ All notable changes to this project are documented in this file.
 - **On Windows, a writable coordination directory no longer fails the
   up-front usability check at random** with `Access is denied`. A directory
   being deleted now reports that instead of `Access is denied`.
+- **The `temp_dir` fixture no longer fails at random on Windows with
+  `Access is denied`**, nor on test names with forbidden characters, DOS
+  device names, or excessive length.
+
+### Changed
+
+- **On Unix, `temp_dir` directories are now mode 0700**, private to their
+  owner; they used to get the umask default. They are now named
+  `<test name>-<pid>-<random>`, with the test name made file-name-safe.
 
 ### Added
 
+- **`TempDir::new()`, `TempDir::new_in(parent)`, `TempDir::path()` and
+  `TempDir::close()`**, plus `AsRef<Path>` and `Debug` for `TempDir`, create
+  and remove temporary directories outside the fixture.
 - **`#[skuld::test(runtime = <path>)]`** runs an `async fn` test on the runtime
   returned by `path: fn() -> tokio::runtime::Runtime`.
 - **`TestRunner::require_known_labels()`.** Opt-in: a `SKULD_LABELS` name that
