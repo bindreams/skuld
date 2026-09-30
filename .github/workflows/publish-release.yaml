@@ -258,8 +258,8 @@ jobs:
     # config, so the OIDC token minted below is only accepted from a run that
     # declares it.
     #
-    # It deliberately has no protection rules or deployment branch policy, so it
-    # is not an authorization control. See CONTRIBUTING.md.
+    # Its deployment branch policy allows only `main`, so a run dispatched on any
+    # other ref cannot mint the token. It has no reviewer rule. See CONTRIBUTING.md.
     #
     # Real preflight (version validation, CI matrix, cargo publish dry-run)
     # happens in draft-release.yaml before a draft can exist. This workflow
