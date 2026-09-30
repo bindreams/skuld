@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-30
+
 ### Fixed
 
 - **A test binary run from anywhere other than where it was built no longer
