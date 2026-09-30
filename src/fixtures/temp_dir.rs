@@ -81,7 +81,7 @@ const NAME_MAX: usize = 255;
 
 /// `prefix` with path separators, `:`, the other characters Windows forbids in names, and control
 /// characters replaced by `_`, cut short enough that `<prefix>-<pid>-<random>` fits [`NAME_MAX`].
-fn file_name_safe(prefix: &str) -> String {
+pub(crate) fn file_name_safe(prefix: &str) -> String {
     const RESERVED_PID_AND_RANDOM: usize = "-4294967295-".len() + RANDOM_LEN;
     let budget = NAME_MAX - RESERVED_PID_AND_RANDOM;
     let mut out = String::new();
@@ -174,12 +174,32 @@ impl Drop for TempDir {
             return;
         }
         if let Err(e) = std::fs::remove_dir_all(&self.created) {
-            eprintln!(
+            warn(format_args!(
                 "skuld: warning: could not remove temporary directory {:?}: {e}",
                 self.created
-            );
+            ));
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Where this thread's [`warn`] writes, when a test sets it; stderr otherwise.
+    pub(crate) static WARNINGS: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Print `msg` to stderr, ignoring a failed write: a drop must not panic.
+fn warn(msg: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+
+    #[cfg(test)]
+    {
+        let captured = WARNINGS.with_borrow_mut(|sink| sink.as_mut().map(|buf| writeln!(buf, "{msg}")));
+        if captured.is_some() {
+            return;
+        }
+    }
+    let _ = writeln!(io::stderr(), "{msg}");
 }
 
 impl AsRef<Path> for TempDir {
