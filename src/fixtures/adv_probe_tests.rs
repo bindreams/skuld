@@ -88,12 +88,14 @@ fn adv_probe_deleted_parent() {
     }
 }
 
-fn sddl(p: &Path) -> String {
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &format!("(Get-Acl -LiteralPath '{}').Sddl", p.display())])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+fn acl(p: &Path) -> Vec<String> {
+    let out = std::process::Command::new("icacls").arg(p).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let ps = p.display().to_string();
+    text.lines()
+        .map(|l| l.replace(&ps, "").trim().to_owned())
+        .filter(|l| !l.is_empty() && !l.starts_with("Successfully"))
+        .collect()
 }
 
 #[test]
@@ -101,10 +103,8 @@ fn adv_probe_acl() {
     for base in [std::env::temp_dir(), PathBuf::from(r"C:\Windows\Temp")] {
         let s = TempDir::new_in(&base).unwrap();
         let t = tempfile::Builder::new().tempdir_in(&base).unwrap();
-        let (ps, ss, ts) = (sddl(&base), sddl(s.path()), sddl(t.path()));
-        eprintln!("PROBE acl base {base:?}\n  parent  : {ps}\n  skuld   : {ss}\n  tempfile: {ts}\n  skuld==tempfile: {}", ss == ts);
-        let out = std::process::Command::new("icacls").arg(s.path()).output().unwrap();
-        eprintln!("PROBE icacls skuld:\n{}", String::from_utf8_lossy(&out.stdout));
+        let (pa, sa, ta) = (acl(&base), acl(s.path()), acl(t.path()));
+        eprintln!("PROBE acl base {base:?}\n  parent  : {pa:?}\n  skuld   : {sa:?}\n  tempfile: {ta:?}\n  skuld==tempfile: {}", sa == ta);
     }
 }
 

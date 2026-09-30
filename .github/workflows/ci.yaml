@@ -19,4 +19,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
       - name: Probe
-        run: cargo test -p skuld --lib adv_probe -- --nocapture --test-threads=1
+        run: cargo test -p skuld --lib adv_probe_acl -- --nocapture --test-threads=1
