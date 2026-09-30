@@ -29,6 +29,10 @@ All notable changes to this project are documented in this file.
 
 - **`#[skuld::test(runtime = <path>)]`** runs an `async fn` test on the runtime
   returned by `path: fn() -> tokio::runtime::Runtime`.
+- **`TestRunner::require_known_labels()`.** Opt-in: a `SKULD_LABELS` name that
+  no `#[skuld::label]` in the binary declares makes startup panic, naming the
+  unknown label(s) and the declared set. Names are read as written, so `x | !x`
+  still checks `x`.
 
 ## [0.5.0] - 2026-09-30
 

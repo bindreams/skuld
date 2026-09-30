@@ -162,6 +162,23 @@ required-features = ["tokio"]
 test = false
 doc = false
 
+# Spawns `known_labels_fixture` to test TestRunner::require_known_labels().
+[[test]]
+name = "require_known_labels_cli"
+path = "tests/require_known_labels_cli.rs"
+
+[[bin]]
+name = "known_labels_fixture"
+path = "tests/support_bins/known_labels_fixture/main.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "no_labels_fixture"
+path = "tests/support_bins/no_labels_fixture/main.rs"
+test = false
+doc = false
+
 # End-to-end tests for SKULD_LABELS filtering. Spawns the
 # `label_filter_fixture` binary with various SKULD_LABELS values and
 # verifies which tests collect/run via marker files and --format json

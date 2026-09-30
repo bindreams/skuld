@@ -250,6 +250,16 @@ SKULD_LABELS="(docker | integration) & !slow" cargo test  # combined
 
 Unset `SKULD_LABELS` runs all tests. Precedence: `!` > `&` > `|`. Label names are matched case-insensitively, so `SKULD_LABELS=DOCKER` is equivalent to `SKULD_LABELS=docker`. Filters are stored canonically, so `parse("a & b") == parse("b & a")`.
 
+An unknown name matches no test, so a mistyped `typo` selects nothing, but `!typo` selects everything, silently dropping the exclusion it was meant to express. `require_known_labels()` makes an undeclared name panic at startup, listing it and the declared labels:
+
+```rust
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.require_known_labels();
+    runner.run()
+}
+```
+
 ### Module-level defaults
 
 ```rust

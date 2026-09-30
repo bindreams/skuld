@@ -17,7 +17,8 @@ use crate::fixture::{
     cleanup_process_fixtures, collect_fixture_requires, collect_fixture_serial, enter_test_scope, merge_serial_filters,
 };
 use crate::label::{
-    read_label_filter, resolve_labels, validate_labels, validate_serial_filters, Label, LabelFilter, ModuleLabels,
+    read_label_selection, resolve_labels, validate_known_labels, validate_labels, validate_serial_filters, Label,
+    LabelFilter, ModuleLabels,
 };
 use crate::{Ignore, TestDef};
 
@@ -404,6 +405,8 @@ pub struct TestRunner {
     strip: Vec<String>,
     /// Opt-in libtest-style trial names. See [`effective_trial_name`].
     libtest_names: bool,
+    /// Opt-in: an unknown `SKULD_LABELS` name is a startup failure.
+    require_known_labels: bool,
 }
 
 impl TestRunner {
@@ -430,6 +433,18 @@ impl TestRunner {
     /// startup, in [`TestRunner::run_tests`].
     pub fn libtest_names(&mut self) -> &mut Self {
         self.libtest_names = true;
+        self
+    }
+
+    /// Opt into strict labels: a name in `SKULD_LABELS` that no
+    /// `#[skuld::label]` in this binary declares makes startup panic, naming
+    /// the unknown label and the declared set.
+    ///
+    /// Without this an unknown name matches no test, so a mistyped `typo`
+    /// selects nothing, and `!typo` selects everything. Names are checked as
+    /// written, so `x | !x` still checks `x`.
+    pub fn require_known_labels(&mut self) -> &mut Self {
+        self.require_known_labels = true;
         self
     }
 
@@ -492,12 +507,24 @@ impl TestRunner {
         self.run_tests().exit();
     }
 
+    /// Read `SKULD_LABELS` once. The known-labels check and the filter both
+    /// come from that one read.
+    pub(crate) fn startup_label_filter(&self) -> Option<LabelFilter> {
+        let selection = read_label_selection();
+        if self.require_known_labels {
+            if let Some(selection) = &selection {
+                validate_known_labels(&selection.names);
+            }
+        }
+        selection.map(|s| s.filter)
+    }
+
     /// Run all tests and return the conclusion for post-run assertions.
     pub fn run_tests(self) -> libtest_mimic::Conclusion {
         validate_labels();
+        let label_filter = self.startup_label_filter();
         validate_serial_filters();
         validate_trial_names(self.libtest_names, &self.dynamic);
-        let label_filter = read_label_filter();
         let mut remaining_args: Vec<String> = std::env::args().collect();
         remaining_args.retain(|a| !self.strip.contains(a));
         let mut args = Arguments::parse_from(remaining_args);

@@ -994,3 +994,69 @@ mod canon_proptest {
         }
     }
 }
+
+// LabelSelection and unknown_labels_message =====
+
+#[test]
+fn selection_names_are_lowercased_sorted_and_deduplicated() {
+    let sel = LabelSelection::parse("NOPE | nope & Alpha & (alpha | Zed)").unwrap();
+    assert_eq!(sel.names, ["alpha", "nope", "zed"]);
+}
+
+#[test]
+fn selection_names_keep_names_that_cancel_out() {
+    let sel = LabelSelection::parse("x | !x").unwrap();
+    assert_eq!(sel.names, ["x"]);
+    assert!(sel.filter.is_tautology());
+}
+
+#[test]
+fn selection_names_skip_boolean_constants() {
+    assert!(LabelSelection::parse("true & FALSE").unwrap().names.is_empty());
+    assert_eq!(LabelSelection::parse("true_ish").unwrap().names, ["true_ish"]);
+}
+
+#[test]
+fn selection_filter_matches_labelled_tests() {
+    let sel = LabelSelection::parse("a & !b").unwrap();
+    assert!(sel.filter.matches(&[Label::__new("a")]));
+    assert!(!sel.filter.matches(&[Label::__new("a"), Label::__new("b")]));
+}
+
+#[test]
+fn selection_rejects_malformed_expressions() {
+    for input in ["", "  ", "a &", "a b", "(a", "a)", "a-b"] {
+        let err = LabelSelection::parse(input)
+            .err()
+            .unwrap_or_else(|| panic!("{input:?} parsed"));
+        assert!(err.contains("invalid label expression"), "{input:?}: {err}");
+    }
+}
+
+fn names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn unknown_labels_message_is_none_when_all_are_declared() {
+    assert_eq!(unknown_labels_message(&names(&["a", "b"]), &["b", "a", "c"]), None);
+    assert_eq!(unknown_labels_message(&[], &[]), None);
+}
+
+#[test]
+fn unknown_labels_message_lists_unknown_names_and_the_declared_set_once() {
+    let msg = unknown_labels_message(&names(&["nope", "other"]), &["beta", "alpha", "beta", "alpha"]).unwrap();
+    assert_eq!(
+        msg,
+        "skuld: SKULD_LABELS names unknown label(s) \"nope\", \"other\"; declared labels: [\"alpha\", \"beta\"]"
+    );
+}
+
+#[test]
+fn unknown_labels_message_with_no_declared_labels() {
+    let msg = unknown_labels_message(&names(&["nope"]), &[]).unwrap();
+    assert_eq!(
+        msg,
+        "skuld: SKULD_LABELS names unknown label(s) \"nope\"; declared labels: []"
+    );
+}
