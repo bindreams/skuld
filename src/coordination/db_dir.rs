@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 
 use super::DB_DIR_ENV;
 
+#[cfg(all(test, windows))]
+mod adv92_tests;
 #[cfg(windows)]
 mod windows_probe;
 #[cfg(all(test, windows))]
