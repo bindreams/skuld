@@ -34,7 +34,7 @@
 //! goes on to do uncapped-retry writes while holding this lock, not at
 //! acquisition alone.
 //!
-//! - **Unix** locks `db_path`'s parent directory — the profile directory
+//! - **Unix** locks `db_path`'s parent directory — the directory
 //!   holding `.skuld.db` — opened `O_RDONLY | O_DIRECTORY | O_CLOEXEC` (the
 //!   `CLOEXEC` bit is redundant here — `std` already sets it on every
 //!   `File::open` regardless — and is listed only for parity with
@@ -83,6 +83,7 @@
 //! panics, naming the path — there is no fallback to a different locking
 //! mechanism.
 
+use super::skuld_debug_eprintln;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
@@ -134,16 +135,24 @@ impl<'a> InitLockHeld<'a> {
     /// "Wholesale replacement" bullet.
     #[cfg(unix)]
     pub(super) fn target_has_split(&self) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        let dir = self
-            .path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        match std::fs::metadata(dir) {
-            Ok(m) => (m.dev(), m.ino()) != self.target_identity,
-            Err(_) => true,
+        match self.stat_target() {
+            Ok(identity) => identity != self.target_identity,
+            Err(e) => {
+                skuld_debug_eprintln!(
+                    "init lock target of {:?} could not be inspected, treating as split: {e}",
+                    self.path
+                );
+                true
+            }
         }
+    }
+
+    /// Fresh dev+ino of the lock target directory, for comparison with the identity recorded
+    /// at acquisition.
+    #[cfg(unix)]
+    pub(super) fn stat_target(&self) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(lock_dir(self.path)).map(|m| (m.dev(), m.ino()))
     }
 
     /// Windows: withholding `FILE_SHARE_DELETE` stops the lock file itself
@@ -157,8 +166,15 @@ impl<'a> InitLockHeld<'a> {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
 
-        let Ok(fresh) = std::fs::File::open(lock_path(self.path)) else {
-            return true;
+        let fresh = match std::fs::File::open(lock_path(self.path)) {
+            Ok(f) => f,
+            Err(e) => {
+                skuld_debug_eprintln!(
+                    "init lock file of {:?} could not be reopened, treating as split: {e}",
+                    self.path
+                );
+                return true;
+            }
         };
         let handle = windows::Win32::Foundation::HANDLE(fresh.as_raw_handle());
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
@@ -166,7 +182,11 @@ impl<'a> InitLockHeld<'a> {
         // `fresh` is alive, which outlives this call; `&mut info` is a
         // valid `*mut BY_HANDLE_FILE_INFORMATION` for the call to write
         // into.
-        if unsafe { GetFileInformationByHandle(handle, &mut info) }.is_err() {
+        if let Err(e) = unsafe { GetFileInformationByHandle(handle, &mut info) } {
+            skuld_debug_eprintln!(
+                "init lock file of {:?} could not be inspected, treating as split: {e}",
+                self.path
+            );
             return true;
         }
         let current = (
@@ -224,6 +244,17 @@ pub(super) fn with_init_lock<T>(db_path: &Path, f: impl FnOnce(&InitLockHeld<'_>
     })
 }
 
+/// The directory holding `db_path`, which the Unix lock is taken on. `db_path` is always
+/// absolute (see `db_path()`), so it always has a non-empty parent.
+#[cfg(unix)]
+fn lock_dir(db_path: &Path) -> &Path {
+    debug_assert!(
+        db_path.is_absolute(),
+        "coordination DB path must be absolute: {db_path:?}"
+    );
+    db_path.parent().expect("an absolute path has a parent")
+}
+
 /// Open `db_path`'s lock target, ready to be locked or try-locked (via
 /// [`lock_exclusive`]/[`try_lock_exclusive`]): `db_path`'s parent directory
 /// on Unix, [`lock_path`]'s file on Windows (see the module doc for why
@@ -234,21 +265,16 @@ pub(super) fn open_lock_target(db_path: &Path) -> File {
     {
         use std::os::unix::fs::OpenOptionsExt;
 
-        // `db_path.parent()` is `Some("")` (not `None`) for a bare
-        // relative filename with no directory component — fall back to
-        // `.` the same way `super::publish::ensure_published_with`'s own
-        // temp-file placement does, rather than treating that as an error
-        // `db_path()`'s own callers never actually produce.
-        let dir = db_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
+        let dir = lock_dir(db_path);
         OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(dir)
             .unwrap_or_else(|e| {
-                panic!("skuld: failed to open coordination DB profile directory {dir:?} for locking: {e}")
+                panic!(
+                    "skuld: failed to open coordination DB directory {dir:?} for locking: {e} ({})",
+                    super::DB_DIR_HINT
+                )
             })
     }
     #[cfg(windows)]
@@ -272,7 +298,12 @@ pub(super) fn open_lock_target(db_path: &Path) -> File {
             // deleted or renamed out from under a holder.
             .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
             .open(&path)
-            .unwrap_or_else(|e| panic!("skuld: failed to open coordination DB init lock file {path:?}: {e}"))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "skuld: failed to open coordination DB init lock file {path:?}: {e} ({})",
+                    super::DB_DIR_HINT
+                )
+            })
     }
 }
 

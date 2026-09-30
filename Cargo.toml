@@ -33,6 +33,8 @@ serde_json = "1"
 # Cross-platform anonymous pipe primitive, used by the per-test FD capture in
 # src/capture.rs. Avoids reimplementing pipe()/CreatePipe() ourselves.
 os_pipe = "1.2"
+# Canonicalize without Windows verbatim (`\\?\`) prefixes, for the DB directory.
+dunce = "1"
 # Cross-process test coordination database for serial test scheduling.
 rusqlite = { version = "0.40", features = ["bundled"] }
 pest = "2"
@@ -97,6 +99,11 @@ harness = false
 [[test]]
 name = "capture_cli"
 path = "tests/capture_cli.rs"
+
+# A moved or archived skuld binary locates `.skuld.db` from its own path.
+[[test]]
+name = "relocated_binary_cli"
+path = "tests/relocated_binary_cli.rs"
 
 [[test]]
 name = "compile_errors"
@@ -164,6 +171,13 @@ doc = false
 [[bin]]
 name = "thread_per_trial"
 path = "tests/support_bins/thread_per_trial/main.rs"
+test = false
+doc = false
+
+# Subject fixture for relocated_binary_cli.rs.
+[[bin]]
+name = "db_dir_env_probe"
+path = "tests/support_bins/db_dir_env_probe/main.rs"
 test = false
 doc = false
 

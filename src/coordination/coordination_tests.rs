@@ -1745,3 +1745,26 @@ fn win32_open_process_error_means_dead_only_for_invalid_parameter() {
         "an unrelated error code must not be treated as 'no such process' either"
     );
 }
+
+/// A read-only directory that already holds a DB fails inside SQLite; the message must still
+/// point at `SKULD_DB_DIR`.
+#[cfg(unix)]
+#[test]
+fn a_read_only_directory_with_an_existing_db_names_the_override() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "requires a non-root user: root ignores directory modes"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(".skuld.db");
+    drop(open_db(&path));
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = std::panic::catch_unwind(|| open_db(&path));
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let payload = result.expect_err("expected a panic");
+    let msg = payload.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(msg.contains("SKULD_DB_DIR"), "{msg}");
+}

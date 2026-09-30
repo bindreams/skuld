@@ -6,6 +6,9 @@
 
 #[cfg(test)]
 mod coordination_tests;
+mod db_dir;
+#[cfg(test)]
+mod db_dir_tests;
 mod lock;
 #[cfg(test)]
 mod lock_tests;
@@ -46,10 +49,32 @@ pub const SERIAL_ALL: &str = "*";
 
 // Database path =====
 
-/// Path to the shared coordination database, resolved at compile time from the
-/// build profile directory (shared across all test binaries in a workspace).
+/// Environment variable that overrides the directory holding the coordination
+/// database. Must be an absolute path; created if missing.
+pub(crate) const DB_DIR_ENV: &str = "SKULD_DB_DIR";
+
+/// Appended to failures caused by an unusable coordination directory.
+pub(crate) const DB_DIR_HINT: &str = "if the directory is unusable, set SKULD_DB_DIR to a writable absolute directory";
+
+/// Path to the shared coordination database, resolved at run time, once per process.
+///
+/// Once, so that an environment change made by a test body (`SKULD_DB_DIR` via the `env`
+/// fixture, say) cannot split later trials of this process across two databases.
+///
+/// Panics, naming the cause, when the directory cannot be determined, created or used.
+/// There is deliberately no fallback: a per-process database would silently disable
+/// cross-process locking.
 pub(crate) fn db_path() -> PathBuf {
-    std::path::Path::new(env!("SKULD_TARGET_PROFILE_DIR")).join(".skuld.db")
+    use std::sync::OnceLock;
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let over = std::env::var_os(DB_DIR_ENV);
+        match db_dir::resolve(over.as_deref(), std::env::current_exe) {
+            Ok(dir) => dir.join(".skuld.db"),
+            Err(msg) => panic!("skuld: {msg}"),
+        }
+    })
+    .clone()
 }
 
 // Instance identity =====
@@ -146,7 +171,7 @@ fn connect_locked(path: &std::path::Path, init_lock: &lock::InitLockHeld<'_>) ->
         path,
         rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
     )
-    .unwrap_or_else(|e| panic!("skuld: failed to open coordination DB at {path:?}: {e}"));
+    .unwrap_or_else(|e| panic!("skuld: failed to open coordination DB at {path:?}: {e} ({DB_DIR_HINT})"));
 
     // rusqlite sets a 5 s `sqlite3_busy_timeout` on every connection; zero it so
     // `retry_busy` and `coordinate` are the only waiters (see `retry_busy`).
@@ -203,7 +228,7 @@ fn connect_with_hooks(
                 }
                 before_recheck(path);
                 if !path_is_absent(path) {
-                    panic!("skuld: could not open coordination DB {path:?}: {e}");
+                    panic!("skuld: could not open coordination DB {path:?}: {e} ({DB_DIR_HINT})");
                 }
                 ensure_published(path);
                 // Loop back and reopen; if something outside Skuld keeps
@@ -365,7 +390,7 @@ fn ensure_schema_locked(
 fn panic_on_split_lock(init_lock: &lock::InitLockHeld<'_>) {
     if init_lock.target_has_split() {
         panic!(
-            "skuld: coordination DB init lock for {:?} was split — its profile directory was \
+            "skuld: coordination DB init lock for {:?} was split — its directory was \
              replaced wholesale mid-run",
             init_lock.path()
         );

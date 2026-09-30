@@ -252,3 +252,46 @@ fn lock_exclusive_retries_past_eintr_from_a_non_restarting_handler() {
         "test precondition: at least one EINTR must have been retried inside lock_exclusive"
     );
 }
+
+fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+    let payload = std::panic::catch_unwind(f).expect_err("expected a panic");
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .expect("panic payload is a string")
+}
+
+#[cfg(unix)]
+#[test]
+fn open_lock_target_failure_names_the_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"").unwrap();
+    let msg = panic_message(|| {
+        open_lock_target(&file.join(".skuld.db"));
+    });
+    assert!(msg.contains("SKULD_DB_DIR"), "{msg}");
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
+#[should_panic(expected = "must be absolute")]
+fn open_lock_target_rejects_a_relative_path() {
+    open_lock_target(std::path::Path::new(".skuld.db"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_stat_of_the_lock_target_is_reported_not_swallowed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("d");
+    std::fs::create_dir(&dir).unwrap();
+    with_init_lock(&dir.join(".skuld.db"), |held| {
+        assert!(held.stat_target().is_ok());
+        std::fs::remove_dir(&dir).unwrap();
+        let err = held.stat_target().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(held.target_has_split());
+    });
+}
