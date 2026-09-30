@@ -39,9 +39,7 @@ fn mark_for_deletion(path: &Path, posix: bool) -> File {
                 size_of_val(&info) as u32,
             )
         } else {
-            let info = FILE_DISPOSITION_INFO {
-                DeleteFile: true,
-            };
+            let info = FILE_DISPOSITION_INFO { DeleteFile: true };
             SetFileInformationByHandle(
                 h,
                 FileDispositionInfo,
