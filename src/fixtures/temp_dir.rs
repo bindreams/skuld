@@ -68,21 +68,60 @@ impl Deref for TempDir {
 }
 
 /// Create a directory in `parent`, named by the first name from `next_name` that is not taken.
-pub(crate) fn create_in(parent: &Path, mut next_name: impl FnMut() -> String) -> io::Result<PathBuf> {
-    loop {
-        let path = parent.join(next_name());
-        #[cfg(unix)]
-        let builder = {
-            let mut b = std::fs::DirBuilder::new();
-            std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-            b
+/// On Windows that includes names held by entries that are deleted but still open (see
+/// `crate::win_nt`), which Win32 would report as access denied.
+pub(crate) fn create_in(parent: &Path, next_name: impl FnMut() -> String) -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut next_name = next_name;
+        loop {
+            let path = parent.join(next_name());
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(path),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(io::Error::new(e.kind(), format!("{e} at path {path:?}"))),
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use crate::win_nt::{nt_create, nt_error, open_dir, standard_info};
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Wdk::Storage::FileSystem::{FILE_CREATE, FILE_DIRECTORY_FILE};
+        use windows::Win32::Foundation::{STATUS_DELETE_PENDING, STATUS_OBJECT_NAME_COLLISION};
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAGS_AND_ATTRIBUTES, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
-        #[cfg(not(unix))]
-        let builder = std::fs::DirBuilder::new();
-        match builder.create(&path) {
-            Ok(()) => return Ok(path),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(io::Error::new(e.kind(), format!("{e} at path {path:?}"))),
+
+        let mut next_name = next_name;
+        let handle = open_dir(parent)?;
+        loop {
+            let name = next_name();
+            let wide: Vec<u16> = std::ffi::OsStr::new(&name).encode_wide().collect();
+            let created = nt_create(
+                Some(&handle),
+                &wide,
+                FILE_READ_ATTRIBUTES,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_CREATE,
+                FILE_DIRECTORY_FILE,
+            );
+            match created {
+                Ok(_) => return Ok(parent.join(name)),
+                Err(status) if status == STATUS_OBJECT_NAME_COLLISION => continue,
+                Err(status) if status == STATUS_DELETE_PENDING => {
+                    if standard_info(&handle)?.DeletePending {
+                        return Err(io::Error::other(format!(
+                            "the directory is being deleted (NTSTATUS {:#010x})",
+                            status.0 as u32
+                        )));
+                    }
+                }
+                Err(status) => return Err(nt_error(status, &parent.join(&name))),
+            }
         }
     }
 }
