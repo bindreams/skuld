@@ -29,14 +29,8 @@ All notable changes to this project are documented in this file.
 ### Fixed
 
 - **A test binary run from anywhere other than where it was built no longer
-  panics on every test.** The coordination database's directory was baked
-  into the binary at build time; it is now resolved at run time from the
-  canonicalized executable path (`<profile>/`: the parent of `deps/` or
-  `examples/`, or the profile directory of cargo's `build/<pkg>/<hash>/out/`
-  layout, each only with a positive cargo marker: a hashed executable name,
-  a `.fingerprint` directory, or a `CACHEDIR.TAG`), so moved build trees,
-  extracted nextest archives and read-only workspace mounts work. The path is
-  resolved once per process.
+  panics on every test;** moved build trees, extracted nextest archives and
+  read-only workspace mounts now work.
 
 ### Added
 
