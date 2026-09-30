@@ -1,6 +1,14 @@
 name: Set up Rust build environment
-description: Installs stable Rust, caches cargo registry, configures sccache.
+description: Installs the requested Rust toolchain (default stable), caches cargo registry, configures sccache.
 inputs:
+  toolchain:
+    description: "'stable' or an exact X.Y.Z. Ignored when pin-file is set."
+    required: false
+    default: "stable"
+  pin-file:
+    description: "Release toolchain pin file to install instead of `toolchain`"
+    required: false
+    default: ""
   components:
     description: "Extra rustup components (e.g. 'clippy, rustfmt')"
     required: false
@@ -12,10 +20,18 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Read the toolchain pin
+      id: pin
+      if: inputs.pin-file != ''
+      uses: ./.github/actions/read-toolchain-pin
+      with:
+        file: ${{ inputs.pin-file }}
+
     - name: Install Rust toolchain
       id: rust-toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: ./.github/actions/install-toolchain
       with:
+        toolchain: ${{ steps.pin.outputs.version || inputs.toolchain }}
         components: ${{ inputs.components }}
         targets: ${{ inputs.targets }}
 

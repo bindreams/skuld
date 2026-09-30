@@ -106,7 +106,10 @@ jobs:
       # Release-script tests run against a stubbed `gh`; no network, no repo
       # state.
       - name: Test release scripts
-        run: .github/scripts/tests/verify-sole-release.test.sh
+        run: |
+          .github/scripts/tests/verify-sole-release.test.sh
+          .github/scripts/tests/release-toolchain.test.sh
+          .github/scripts/tests/check-toolchain.test.sh
 
       - uses: j178/prek-action@v2
 
