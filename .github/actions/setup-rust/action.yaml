@@ -1,5 +1,5 @@
 name: Set up Rust build environment
-description: Installs stable Rust, caches cargo registry, configures sccache.
+description: Installs the requested Rust toolchain (default stable), caches cargo registry, configures sccache.
 inputs:
   toolchain:
     description: "Toolchain for dtolnay/rust-toolchain: 'stable' or an exact X.Y.Z"
