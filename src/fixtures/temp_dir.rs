@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 /// Names are `<prefix>-<pid>-<6 random characters>`, created in an absolute parent through
 /// [`tempfile::Builder::make_in`], which retries a taken name with fresh randomness. On Windows a
 /// name held by an entry that is deleted but still open elsewhere counts as taken; Win32 would
-/// report it as access denied.
+/// report it as access denied. After tempfile's attempt limit (65,536 taken names) creation gives
+/// up with `AlreadyExists`.
 ///
 /// On Unix the directory is created with mode 0700. On Windows it inherits the parent's ACL.
 ///
@@ -79,11 +80,14 @@ const RANDOM_LEN: usize = 6;
 /// The longest file name in bytes (Unix) or UTF-16 units (Windows) that common file systems accept.
 const NAME_MAX: usize = 255;
 
-/// `prefix` with path separators, `:`, the other characters Windows forbids in names, and control
-/// characters replaced by `_`, cut short enough that `<prefix>-<pid>-<random>` fits [`NAME_MAX`].
+/// `prefix` made safe as the start of a file name: path separators, `:`, the other characters
+/// Windows forbids in names, and control characters become `_`; a DOS device name (see
+/// [`is_dos_device`]) gets a leading `_`; and it is cut short enough, in bytes, that
+/// `<prefix>-<pid>-<random>` fits [`NAME_MAX`].
 pub(crate) fn file_name_safe(prefix: &str) -> String {
     const RESERVED_PID_AND_RANDOM: usize = "-4294967295-".len() + RANDOM_LEN;
-    let budget = NAME_MAX - RESERVED_PID_AND_RANDOM;
+    // One byte stays free for the `_` a device name gets.
+    let budget = NAME_MAX - RESERVED_PID_AND_RANDOM - 1;
     let mut out = String::new();
     for c in prefix.chars() {
         let c = if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
@@ -96,7 +100,28 @@ pub(crate) fn file_name_safe(prefix: &str) -> String {
         }
         out.push(c);
     }
+    if is_dos_device(&out) {
+        out.insert(0, '_');
+    }
     out
+}
+
+/// Whether Win32 would read a name starting with `name` as a DOS device: the part before the first
+/// `.`, trailing spaces trimmed, is `CON`, `PRN`, `AUX`, `NUL`, `COM0`-`COM9`, `LPT0`-`LPT9` (the
+/// digit may be a superscript `¹²³`), `CONIN$` or `CONOUT$`, in any case. The directory itself is
+/// created natively, but every later Win32 use of its path would open the device instead.
+fn is_dos_device(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or_default().trim_end_matches(' ');
+    let upper = base.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") {
+        return true;
+    }
+    let mut chars = upper.chars();
+    let stem: String = chars.by_ref().take(3).collect();
+    let digit = chars.next();
+    (stem == "COM" || stem == "LPT")
+        && chars.next().is_none()
+        && digit.is_some_and(|d| d.is_ascii_digit() || matches!(d, '¹' | '²' | '³'))
 }
 
 /// Create the directory `path`. A taken name is `AlreadyExists`, which tempfile retries.

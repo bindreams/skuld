@@ -26,7 +26,9 @@ inventory = "0.3"
 libtest-mimic = "0.8"
 # Needed for clap::Parser trait (Arguments::parse_from); libtest-mimic doesn't re-export it.
 clap = { version = "4", features = ["derive"] }
-tempfile = "3"
+# TempDir needs Builder::disable_cleanup (3.20), an absolute make_in base (3.17) and
+# getrandom re-seeding after 3 taken names (3.15).
+tempfile = "3.27"
 serde = { version = "1", features = ["derive"] }
 serde_yml = "0.0.13"
 serde_json = "1"

@@ -71,10 +71,7 @@ fn corpus_image() -> Result<CorpusImage, String> { /* ... */ }
 Fixtures can depend on other fixtures using the same `#[fixture]` parameter syntax:
 
 ```rust
-#[skuld::fixture(scope = test, deref)]
-fn test_name() -> Result<TestName, String> { /* ... */ }
-
-use skuld::test_name;
+use skuld::test_name; // a built-in fixture
 
 #[skuld::fixture(deref)]
 fn scratch_dir(#[fixture(test_name)] name: &str) -> Result<skuld::TempDir, String> {
