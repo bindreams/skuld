@@ -26,7 +26,7 @@ fail=0
 check() {
 	local name=$1 want_rc=$2 want_env=$3 arg=$4 rc=0 got_env
 	: > "$work/env"
-	(cd "$work/tree" && env -u RUSTUP_TOOLCHAIN PATH="$work/bin:$PATH" GITHUB_ENV="$work/env" "$script" "$arg") > "$work/out" 2>&1 || rc=$?
+	(cd "$work/tree" && env -u BASH_ENV -u RUSTUP_TOOLCHAIN PATH="$work/bin:$PATH" GITHUB_ENV="$work/env" "$script" "$arg") > "$work/out" 2>&1 || rc=$?
 	got_env=$(cat "$work/env")
 	if [ "$rc" -ne "$want_rc" ] || [ "$got_env" != "$want_env" ]; then
 		echo "FAIL $name: rc=$rc (want $want_rc), GITHUB_ENV='$got_env' (want '$want_env')"

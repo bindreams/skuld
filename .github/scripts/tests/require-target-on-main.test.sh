@@ -44,7 +44,7 @@ run_case() {
 	fi
 }
 
-# GitHub's compare status is relative to head (`main`): `ahead` means main
+# GitHub's compare status is relative to head (`refs/heads/main`): `ahead` means main
 # contains the target.
 run_case ahead 0 '{"status":"ahead","ahead_by":3}' 0 'is on main'
 run_case identical 0 '{"status":"identical"}' 0 'is on main'
@@ -55,12 +55,14 @@ run_case empty_body 1 '' 0 '::error::.*could not read'
 run_case not_json 1 'oops' 0 '::error::.*could not read'
 run_case no_status 1 '{"message":"x"}' 0 '::error::.*could not read'
 run_case null_status 1 '{"status":null}' 0 '::error::.*could not read'
+run_case number_status 1 '{"status":5}' 0 '::error::.*could not read'
 run_case unknown_status 1 '{"status":"sideways"}' 0 '::error::.*not on main.*sideways'
 run_case non_sha_target 1 '{"status":"ahead"}' 0 '::error::.*40-char' main
 
-# The script must ask for the compare with an explicit GET, base target, head main.
+# The request must be an explicit GET, base target, head `refs/heads/main`: a
+# bare `main` could resolve to a tag of that name.
 got=$(cat "$work/ahead/args")
-want="api -X GET repos/o/r/compare/$target...main"
+want="api -X GET repos/o/r/compare/$target...refs/heads/main?per_page=1"
 if [ "$got" != "$want" ]; then
 	echo "FAIL request: got [$got] want [$want]"
 	fail=1

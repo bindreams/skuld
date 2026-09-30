@@ -10,11 +10,15 @@
 # any commit a writer can push. This is what ties the published tree to
 # `main`.
 #
-# GitHub's compare endpoint reports status relative to the head, here `main`:
-# `ahead` means main contains TARGET and `identical` means main is TARGET.
-# `behind` and `diverged` mean TARGET has commits main lacks. Every other
+# GitHub's compare endpoint reports status relative to the head, here
+# `refs/heads/main`: `ahead` means main contains TARGET and `identical` means
+# main is TARGET. `behind` and `diverged` mean TARGET has commits main lacks. Every other
 # outcome, including an API failure or a body without a status, refuses: the
 # check fails closed.
+#
+# The head is the full ref: a bare `main` may resolve to a tag of that name,
+# which any writer can push. `per_page=1` trims the commit list, of which only
+# `.status` is read.
 set -euo pipefail
 
 : "${GH_REPO:?}" "${TARGET:?}"
@@ -24,7 +28,7 @@ if ! [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]]; then
 	exit 1
 fi
 
-if ! body=$(gh api -X GET "repos/${GH_REPO}/compare/${TARGET}...main"); then
+if ! body=$(gh api -X GET "repos/${GH_REPO}/compare/${TARGET}...refs/heads/main?per_page=1"); then
 	echo "::error::Could not compare ${TARGET} against main, so it is not known to be on main. Refusing to publish."
 	exit 1
 fi

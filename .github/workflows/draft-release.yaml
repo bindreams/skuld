@@ -29,6 +29,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Stage 2 refuses a draft whose target is not on `main`; refuse here,
+      # before anyone reviews a draft that could never be published.
+      - name: Require the commit being drafted to be on main
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TARGET: ${{ github.sha }}
+        shell: bash
+        run: .github/scripts/require-target-on-main.sh
+
       # Stage 2's toolchain: a missing or malformed pin fails here, before any
       # draft exists.
       - uses: ./.github/actions/setup-rust

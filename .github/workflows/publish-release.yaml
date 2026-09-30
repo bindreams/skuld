@@ -32,9 +32,12 @@ concurrency:
 # code execution or different bytes. Nor does `publish` run any action or
 # script from the release tree: it uses the dispatch commit's copy (the commit
 # this workflow file comes from), checked out beside the release tree. The
-# release tree is data there, except that `cargo` reads its `.cargo/config.toml`
-# (a `credential-provider` there would run); that is why `resolve` requires the
-# tree to be on `main`.
+# release tree is data there, except that `cargo` honours its
+# `.cargo/config.toml`: `cargo package --no-verify` runs `build.rustc` and
+# `build.rustc-wrapper` from it, and `cargo publish` runs a
+# `credential-provider` (`cargo metadata --no-deps` runs neither). `resolve`
+# requires the tree to be on `main`, so that config has no more power than an
+# edit to this workflow.
 #
 # `actions/checkout` uses `github.token` in every job (its default `token`
 # input); with `persist-credentials: false` it leaves nothing in `.git/config`.
@@ -306,10 +309,11 @@ jobs:
       # Actions and scripts come from the dispatch commit, which this workflow
       # file is from, never from the release tree that `cargo` reads. The
       # scripts run from `../workflow-ref/`, on the release tree as the
-      # working directory. Both trees sit in subdirectories: the release tree in `release/`,
-      # where this job's own `run:` steps start (composite actions' steps do
-      # not; the toolchain pin does not depend on the directory), so it holds no
-      # stray untracked files for `cargo package` to reject.
+      # working directory. Both trees sit in subdirectories: the release tree
+      # in `release/`, where this job's own `run:` steps start (composite
+      # actions' steps do not; the toolchain pin does not depend on the
+      # directory), so it holds no stray untracked files for `cargo package` to
+      # reject.
       - name: Check out the actions from the workflow ref
         uses: actions/checkout@v4
         timeout-minutes: 5
@@ -384,9 +388,10 @@ jobs:
           fi
 
       # Re-derive the archives from the source tree and compare them to what
-      # the build job verified. `--no-verify` skips the compile, and nothing
-      # else in `cargo package` runs project code (no build script, no
-      # proc-macro), so the bytes come from source, not from the artifact. The
+      # the build job verified. `--no-verify` skips the compile, so no build
+      # script or proc-macro runs, and the bytes come from source, not from the
+      # artifact. (Programs the tree's `.cargo/config.toml` names, such as
+      # `build.rustc-wrapper`, do still run; see the note at the top.) The
       # artifact only carries the hashes to hold them to. Any difference fails
       # closed: the tree that was built is not the tree about to be uploaded.
       - name: Re-derive the packages and check them against the build job
