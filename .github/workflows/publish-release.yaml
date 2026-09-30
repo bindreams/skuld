@@ -59,6 +59,24 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      # The release tree is not checked out until the draft's target SHA is
+      # known (the checkout below), and that lookup itself needs the validated
+      # version. So the version script comes from the workflow's own ref, the
+      # commit this run was dispatched on, via a sparse checkout into a
+      # separate directory. Scripts run *after* the pinned checkout still come
+      # from the release tree, matching the manifests they read.
+      #
+      # The pinned checkout below does `git clean -ffdx` on the workspace and
+      # deletes this directory; nothing after the version step may use it.
+      - name: Check out the release scripts from the workflow ref
+        uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/scripts
+          path: workflow-ref
+          persist-credentials: false
+
       - name: Normalize and validate version
         id: version
         timeout-minutes: 5
@@ -70,7 +88,7 @@ jobs:
           # Validation, and its rationale (leading-`v` and leading-zero
           # rejection), live in normalize-version.sh — shared with
           # draft-release.yaml so both copies stay identical.
-          V=$(.github/scripts/normalize-version.sh "$INPUT_VERSION")
+          V=$(workflow-ref/.github/scripts/normalize-version.sh "$INPUT_VERSION")
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "tag=v${V}" >> "$GITHUB_OUTPUT"
 
