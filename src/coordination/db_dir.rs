@@ -23,6 +23,11 @@ use std::path::{Path, PathBuf};
 
 use super::DB_DIR_ENV;
 
+#[cfg(windows)]
+mod windows_probe;
+#[cfg(all(test, windows))]
+mod windows_probe_tests;
+
 /// `override_dir` is the value of `SKULD_DB_DIR`, if set; `exe` is called only when it is not.
 /// Returns a usable directory, or a message naming the cause.
 pub(super) fn resolve(
@@ -205,11 +210,6 @@ fn check_usable(dir: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        // No `access`-style query reflects ACLs; create-and-delete a probe file.
-        drop(std::fs::read_dir(dir)?);
-        tempfile::Builder::new()
-            .prefix(".skuld-probe-")
-            .tempfile_in(dir)
-            .map(drop)
+        windows_probe::check_usable(dir)
     }
 }
