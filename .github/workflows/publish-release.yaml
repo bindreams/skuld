@@ -59,15 +59,11 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      # The release tree is not checked out until the draft's target SHA is
-      # known (the checkout below), and that lookup itself needs the validated
-      # version. So the version script comes from the workflow's own ref, the
-      # commit this run was dispatched on, via a sparse checkout into a
-      # separate directory. Scripts run *after* the pinned checkout still come
-      # from the release tree, matching the manifests they read.
+      # The release tree can't be checked out until the draft's target SHA is
+      # known, and that lookup needs the validated version; so the version
+      # script comes from the dispatch commit.
       #
-      # The pinned checkout below finds no repository at the workspace root,
-      # so it empties the workspace whatever `clean:` says, deleting this
+      # The pinned checkout below empties the workspace, deleting this
       # directory; nothing after the version step may use it.
       - name: Check out the release scripts from the workflow ref
         uses: actions/checkout@v4
