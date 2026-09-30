@@ -259,7 +259,8 @@ jobs:
     # declares it.
     #
     # Its deployment branch policy allows only `main`, so a run dispatched on any
-    # other ref cannot mint the token. It has no reviewer rule. See CONTRIBUTING.md.
+    # other ref cannot run this job. That restricts the dispatch ref only, not
+    # the commit that is published. It has no reviewer rule. See CONTRIBUTING.md.
     #
     # Real preflight (version validation, CI matrix, cargo publish dry-run)
     # happens in draft-release.yaml before a draft can exist. This workflow
