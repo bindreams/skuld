@@ -95,5 +95,74 @@ mod windows {
             err.contains("being deleted") && !err.contains("Access is denied"),
             "the error must name the deletion, not an access denial: {err}"
         );
+        assert!(names_path(&err, &parent), "{err}");
     }
+}
+
+// Parity with tempfile -----
+
+#[test]
+fn a_relative_parent_hands_out_an_absolute_path() {
+    let dir = TempDir::new_in(".").unwrap();
+    assert!(dir.path().is_absolute(), "{:?}", dir.path());
+    let path = dir.path().to_path_buf();
+    drop(dir);
+    assert!(!path.exists(), "{path:?}");
+}
+
+/// Another local user must not be able to plant every next name in a shared parent, so each name
+/// ends in tempfile's random suffix rather than a counter.
+#[test]
+fn names_end_in_a_random_suffix_after_the_pid() {
+    let dir = TempDir::new().unwrap();
+    let name = dir.file_name().unwrap().to_str().unwrap();
+    let marker = format!("-{}-", std::process::id());
+    let (_, suffix) = name.rsplit_once(&marker).unwrap_or_else(|| panic!("{name}"));
+    assert!(
+        suffix.len() == 6 && suffix.chars().all(|c| c.is_ascii_alphanumeric()),
+        "{name}"
+    );
+}
+
+/// Test names are arbitrary strings, and the fixture uses them as the prefix.
+#[test]
+fn any_prefix_gives_a_directory_directly_in_the_parent() {
+    let parent = TempDir::new().unwrap();
+    let long = "x".repeat(40_000);
+    for prefix in ["a/b", "a\\b", "a:b", "a\u{1}b", long.as_str()] {
+        let dir = TempDir::with_prefix_in(prefix, &parent).unwrap_or_else(|e| panic!("{prefix:.20}: {e}"));
+        assert_eq!(dir.parent(), Some(parent.path()), "{prefix:.20}");
+        assert!(dir.is_dir(), "{prefix:.20}");
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert!(name.encode_utf16().count() <= 255, "{prefix:.20}: {} units", name.len());
+    }
+}
+
+/// Whether `err` names `path`, as written or as `{:?}` formats it.
+fn names_path(err: &str, path: &Path) -> bool {
+    let debug = format!("{path:?}");
+    err.contains(path.to_str().unwrap()) || err.contains(debug.trim_matches('"'))
+}
+
+#[test]
+fn a_missing_parent_is_an_error_naming_it() {
+    let tmp = TempDir::new().unwrap();
+    let parent = tmp.join("nope").join("deeper");
+    let Err(err) = TempDir::new_in(&parent) else {
+        panic!("{parent:?} must be rejected")
+    };
+    let err = err.to_string();
+    assert!(names_path(&err, &parent), "{err}");
+}
+
+#[test]
+fn a_parent_that_is_a_file_is_an_error_naming_it() {
+    let tmp = TempDir::new().unwrap();
+    let parent = tmp.join("file");
+    std::fs::write(&parent, b"").unwrap();
+    let Err(err) = TempDir::new_in(&parent) else {
+        panic!("{parent:?} must be rejected")
+    };
+    let err = err.to_string();
+    assert!(names_path(&err, &parent), "{err}");
 }
