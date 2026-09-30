@@ -23,6 +23,17 @@
       ],
       "depNameTemplate": "rust-lang/rust",
       "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "description": "prek hook revs in prek.toml",
+      "managerFilePatterns": [
+        "/(^|/)prek\\.toml$/"
+      ],
+      "matchStrings": [
+        "repo = \"https://github\\.com/(?<depName>[^\"/]+/[^\"/]+)\"\\s*\\n(?:\\s*#[^\\n]*\\n)*\\s*rev = \"(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "github-tags"
     }
   ],
   "packageRules": [
@@ -57,7 +68,8 @@
     {
       "description": "Group non-major pip updates",
       "matchManagers": [
-        "pep621"
+        "pep621",
+        "poetry"
       ],
       "matchUpdateTypes": [
         "minor",
@@ -69,9 +81,23 @@
       "groupName": "pip"
     },
     {
+      "description": "Group non-major prek hook updates",
+      "matchFileNames": [
+        "prek.toml"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "prek"
+    },
+    {
       "description": "Group non-major release toolchain pin updates",
-      "matchManagers": [
-        "custom.regex"
+      "matchFileNames": [
+        ".github/release-toolchain"
       ],
       "matchUpdateTypes": [
         "minor",
@@ -81,13 +107,6 @@
         "digest"
       ],
       "groupName": "release-toolchain"
-    },
-    {
-      "description": "Pin docs Python dependencies exactly",
-      "matchManagers": [
-        "pep621"
-      ],
-      "rangeStrategy": "pin"
     },
     {
       "description": "Never group major updates: one PR per major",
