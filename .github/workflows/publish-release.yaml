@@ -14,9 +14,10 @@ concurrency:
 
 # Three jobs, so no credential shares a job with code that compiles:
 #
-#   resolve  reads the draft and the toolchain pin. Compiles nothing. Its
-#            token is exposed as `GH_TOKEN` to one step only (the draft lookup;
-#            List releases returns drafts only to a writer).
+#   resolve  reads the draft and the toolchain pin, and requires the draft's
+#            target to be on `main`. Compiles nothing. Its token is exposed as
+#            `GH_TOKEN` to two steps only (the draft lookup, where List
+#            releases returns drafts only to a writer, and the `main` check).
 #   build    compiles: the xtask version check and the packaging verification
 #            build run third-party build scripts and proc-macros. Read-only
 #            token, no environment, no OIDC, so a compromised dependency can
@@ -28,9 +29,23 @@ concurrency:
 #
 # `publish` takes nothing from `build` except the sha256 list it holds its
 # re-derived archives to, so a compromised build job can cause a refusal, never
-# code execution or different bytes. Nor does `publish` run any action from the
-# release tree: it uses the dispatch commit's copy (the commit this workflow
-# file comes from), checked out beside the release tree.
+# code execution or different bytes. Nor does `publish` run any action or
+# script from the release tree: it uses the dispatch commit's copy (the commit
+# this workflow file comes from), checked out beside the release tree. The
+# release tree is data there, except that `cargo` honours its
+# `.cargo/config.toml`: `cargo package --no-verify` runs `build.rustc` and
+# `build.rustc-wrapper` from it, and `cargo publish` runs a
+# `credential-provider` (`cargo metadata --no-deps` runs neither).
+#
+# Trust basis for that tree: `resolve` refuses a draft target that is not on
+# `main` at or after the floor pinned in require-target-on-main.sh. Every commit
+# there is a squash commit of a PR that passed required CI (the ruleset needs no
+# approving reviews, and a later-reverted commit stays eligible), so that config
+# has no more power than an edit to this workflow. This rests on the
+# default-branch ruleset (linear history, squash-only merges, no force-push or
+# deletion, no bypass actors) and on the default branch being `main`. The
+# Deploy environment's branch policy is separate: it restricts only the ref this
+# workflow is dispatched from.
 #
 # `actions/checkout` uses `github.token` in every job (its default `token`
 # input); with `persist-credentials: false` it leaves nothing in `.git/config`.
@@ -86,8 +101,9 @@ jobs:
         # publish job.
         timeout-minutes: 5
         env:
-          # The only step in this job that calls `gh`, so the only one given
-          # the token as `GH_TOKEN`.
+          # One of two steps in this job that call `gh` (the other is the
+          # main-ancestry check below), so the only ones given the token as
+          # `GH_TOKEN`.
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.version.outputs.tag }}
@@ -120,6 +136,16 @@ jobs:
           # RELEASE COMPLETE marker below: a summary write failure must not
           # hide the one value manual recovery needs.
           echo "Resolved $TAG -> $TARGET" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Nothing from the release tree is checked out or run until this passes.
+      - name: Require the draft's target to be on main
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TARGET: ${{ steps.release.outputs.commit_sha }}
+        shell: bash
+        run: workflow-ref/.github/scripts/require-target-on-main.sh
 
       # The toolchain is pinned in the release tree, so a re-run of the same
       # draft installs the same cargo (archives differ between cargo versions)
@@ -259,8 +285,8 @@ jobs:
     # declares it.
     #
     # Its deployment branch policy allows only `main`, so a run dispatched on any
-    # other ref cannot run this job. That restricts the dispatch ref only, not
-    # the commit that is published. It has no reviewer rule. See CONTRIBUTING.md.
+    # other ref cannot run this job. It has no reviewer rule. See CONTRIBUTING.md.
+    # The trust basis for the published tree is in the header.
     #
     # Real preflight (version validation, CI matrix, cargo publish dry-run)
     # happens in draft-release.yaml before a draft can exist. This workflow
@@ -284,12 +310,14 @@ jobs:
       run:
         working-directory: release
     steps:
-      # Actions come from the dispatch commit, which this workflow file is
-      # from, never from the release tree that `cargo` and the scripts below
-      # read. Both trees sit in subdirectories: the release tree in `release/`,
-      # where this job's own `run:` steps start (composite actions' steps do
-      # not; the toolchain pin does not depend on the directory), so it holds no
-      # stray untracked files for `cargo package` to reject.
+      # Actions and scripts come from the dispatch commit, which this workflow
+      # file is from, never from the release tree that `cargo` reads. The
+      # scripts run from `../workflow-ref/`, on the release tree as the
+      # working directory. Both trees sit in subdirectories: the release tree
+      # in `release/`, where this job's own `run:` steps start (composite
+      # actions' steps do not; the toolchain pin does not depend on the
+      # directory), so it holds no stray untracked files for `cargo package` to
+      # reject.
       - name: Check out the actions from the workflow ref
         uses: actions/checkout@v4
         timeout-minutes: 5
@@ -364,9 +392,9 @@ jobs:
           fi
 
       # Re-derive the archives from the source tree and compare them to what
-      # the build job verified. `--no-verify` skips the compile, and nothing
-      # else in `cargo package` runs project code (no build script, no
-      # proc-macro), so the bytes come from source, not from the artifact. The
+      # the build job verified. `--no-verify` skips the compile, so no build
+      # script or proc-macro runs, and the bytes come from source, not from the
+      # artifact. (`.cargo/config.toml` programs still run; see the header.) The
       # artifact only carries the hashes to hold them to. Any difference fails
       # closed: the tree that was built is not the tree about to be uploaded.
       - name: Re-derive the packages and check them against the build job
@@ -375,7 +403,7 @@ jobs:
         run: |
           set -euo pipefail
           built="$RUNNER_TEMP/built"
-          members=$(.github/scripts/publishable-members.sh)
+          members=$(../workflow-ref/.github/scripts/publishable-members.sh)
           args=()
           expected=0
           while read -r c; do
@@ -435,14 +463,14 @@ jobs:
           # `$(...)` in a plain assignment, not inside a `[` test — `set -e`
           # aborts on that, which is what makes publishable-members.sh's own
           # fail-closed refusal fatal here instead of an empty member list.
-          members=$(.github/scripts/publishable-members.sh)
+          members=$(../workflow-ref/.github/scripts/publishable-members.sh)
 
           already=""
           pending=""
           total=0
           for c in $members; do
             total=$((total + 1))
-            state=$(.github/scripts/crate-state.sh "$c" "$VERSION")
+            state=$(../workflow-ref/.github/scripts/crate-state.sh "$c" "$VERSION")
             kind=${state%% *}
             case "$kind" in
               never-published)

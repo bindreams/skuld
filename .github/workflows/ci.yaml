@@ -110,6 +110,7 @@ jobs:
           .github/scripts/tests/verify-sole-release.test.sh
           .github/scripts/tests/release-toolchain.test.sh
           .github/scripts/tests/check-toolchain.test.sh
+          .github/scripts/tests/require-target-on-main.test.sh
 
       - uses: j178/prek-action@v2
 

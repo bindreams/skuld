@@ -50,7 +50,7 @@ run_case() {
 	[ "$suite" -eq 0 ] || path=$work/slowbin:$path
 	mkdir "$dir"
 	printf '%s' "$releases" > "$dir/releases.json"
-	out=$(PATH="$path" STUB_DIR="$dir" STUB_LAG="$lag" \
+	out=$(env -u BASH_ENV PATH="$path" STUB_DIR="$dir" STUB_LAG="$lag" \
 		GH_REPO=o/r VERSION=1.2.3 RELEASE_ID=100 \
 		VERIFY_MAX_WAIT_SECS="$wait" VERIFY_INITIAL_DELAY_SECS=0.05 VERIFY_MAX_DELAY_SECS=0.1 \
 		"$script" 2>&1) || rc=$?
