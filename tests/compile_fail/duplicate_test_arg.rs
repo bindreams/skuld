@@ -23,4 +23,10 @@ fn dup_serial() {}
 #[skuld::test(should_panic, should_panic = "x")]
 fn dup_should_panic() {}
 
+#[skuld::test(labels = [A], name = "x", labels = [A])]
+fn dup_labels_non_adjacent() {}
+
+#[skuld::test(requires = [ok], should_panic, requires = [ok])]
+fn dup_requires_non_adjacent() {}
+
 fn main() {}

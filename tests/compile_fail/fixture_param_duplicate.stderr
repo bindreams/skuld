@@ -1,0 +1,23 @@
+error: duplicate #[fixture] attribute
+  --> tests/compile_fail/fixture_param_duplicate.rs:12:31
+   |
+12 | fn test_repeats(#[fixture(a)] #[fixture(b)] x: &u8) {}
+   |                               ^^^^^^^^^^^^^
+
+error: duplicate #[fixture] attribute
+  --> tests/compile_fail/fixture_param_duplicate.rs:15:71
+   |
+15 | fn test_repeats_non_adjacent(#[fixture(a)] #[allow(unused_variables)] #[fixture(b)] x: &u8) {}
+   |                                                                       ^^^^^^^^^^^^^
+
+error: duplicate #[fixture] attribute
+  --> tests/compile_fail/fixture_param_duplicate.rs:18:34
+   |
+18 | fn fixture_repeats(#[fixture(a)] #[fixture(b)] x: &u8) -> Result<u8, String> {
+   |                                  ^^^^^^^^^^^^^
+
+error: duplicate #[fixture] attribute
+  --> tests/compile_fail/fixture_param_duplicate.rs:23:74
+   |
+23 | fn fixture_repeats_non_adjacent(#[fixture(a)] #[allow(unused_variables)] #[fixture(b)] x: &u8) -> Result<u8, String> {
+   |                                                                          ^^^^^^^^^^^^^

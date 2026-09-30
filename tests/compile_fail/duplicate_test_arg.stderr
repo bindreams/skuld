@@ -33,3 +33,15 @@ error: duplicate argument `should_panic`
    |
 23 | #[skuld::test(should_panic, should_panic = "x")]
    |                             ^^^^^^^^^^^^
+
+error: duplicate argument `labels`
+  --> tests/compile_fail/duplicate_test_arg.rs:26:41
+   |
+26 | #[skuld::test(labels = [A], name = "x", labels = [A])]
+   |                                         ^^^^^^
+
+error: duplicate argument `requires`
+  --> tests/compile_fail/duplicate_test_arg.rs:29:46
+   |
+29 | #[skuld::test(requires = [ok], should_panic, requires = [ok])]
+   |                                              ^^^^^^^^

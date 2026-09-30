@@ -30,4 +30,14 @@ fn dup_serial() -> Result<u8, String> {
     Ok(0)
 }
 
+#[skuld::fixture(name = "a", deref, name = "b")]
+fn dup_name_non_adjacent() -> Result<Box<u8>, String> {
+    Ok(Box::new(0))
+}
+
+#[skuld::fixture(scope = test, serial, scope = process)]
+fn dup_scope_non_adjacent() -> Result<u8, String> {
+    Ok(0)
+}
+
 fn main() {}
