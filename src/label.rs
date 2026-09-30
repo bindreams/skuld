@@ -457,15 +457,11 @@ fn build_expr(pair: pest::iterators::Pair<'_, Rule>) -> Result<LabelExpr, String
 /// Read label filter from the `SKULD_LABELS` environment variable.
 ///
 /// - Unset → `None` (no filtering, all tests run).
-/// - Not valid Unicode → panics (never treated as unset).
+/// - Not valid UTF-8 → panics.
 /// - `""` (empty / whitespace-only) → panics (invalid expression).
 /// - Non-empty → parses as a boolean expression; panics on malformed input.
 pub(crate) fn read_label_filter() -> Option<LabelFilter> {
-    let val = match std::env::var("SKULD_LABELS") {
-        Ok(val) => val,
-        Err(std::env::VarError::NotPresent) => return None,
-        Err(std::env::VarError::NotUnicode(raw)) => panic!("skuld: SKULD_LABELS is not valid UTF-8 ({raw:?})"),
-    };
+    let val = crate::skuld_env::read("SKULD_LABELS")?;
     match LabelFilter::parse(&val) {
         Ok(filter) => Some(filter),
         Err(e) => panic!("skuld: SKULD_LABELS: {e}"),

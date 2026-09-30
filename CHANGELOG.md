@@ -15,8 +15,12 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
-- **A `SKULD_LABELS` that is not valid UTF-8 now panics at startup**, naming the
-  variable. It was treated as unset, so every test ran.
+- **A non-UTF-8 `SKULD_LABELS` or `SKULD_DEBUG` now panics at startup**, naming
+  the variable. `SKULD_LABELS` was treated as unset, so every test ran.
+- **`SKULD_NEXTEST_METADATA_PATH` is read as a path**, so a non-UTF-8 value is
+  honored instead of skipping the dump with a warning.
+- **`EnvGuard` restores a non-UTF-8 prior value byte-identically.** It read the
+  prior value as UTF-8 and restored a non-UTF-8 one as unset.
 
 ## [0.5.0] - 2026-09-30
 

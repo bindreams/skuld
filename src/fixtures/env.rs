@@ -5,6 +5,7 @@
 //! environment variables are process-global, this fixture is marked `serial`
 //! so that tests using it never run in parallel.
 
+use std::ffi::OsString;
 use std::sync::Mutex;
 
 /// A scoped environment variable modifier. All changes made through this guard
@@ -23,7 +24,7 @@ use std::sync::Mutex;
 pub struct EnvGuard {
     /// Stack of (key, original_value). `None` means the variable was not set.
     /// Uses Mutex for Sync bound (never actually contended — serial coordination ensures exclusivity).
-    original: Mutex<Vec<(String, Option<String>)>>,
+    original: Mutex<Vec<(String, Option<OsString>)>>,
 }
 
 impl EnvGuard {
@@ -36,7 +37,7 @@ impl EnvGuard {
     /// Set an environment variable. The original value (or absence) is recorded
     /// and will be restored when this guard drops.
     pub fn set(&self, key: &str, value: &str) {
-        let old = std::env::var(key).ok();
+        let old = std::env::var_os(key);
         self.original.lock().unwrap().push((key.to_owned(), old));
         // SAFETY: we hold the serial coordination, so no other test is touching env concurrently.
         unsafe { std::env::set_var(key, value) };
@@ -45,7 +46,7 @@ impl EnvGuard {
     /// Remove an environment variable. The original value (or absence) is
     /// recorded and will be restored when this guard drops.
     pub fn remove(&self, key: &str) {
-        let old = std::env::var(key).ok();
+        let old = std::env::var_os(key);
         self.original.lock().unwrap().push((key.to_owned(), old));
         // SAFETY: we hold the serial coordination, so no other test is touching env concurrently.
         unsafe { std::env::remove_var(key) };
