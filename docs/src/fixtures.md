@@ -74,16 +74,16 @@ Fixtures can depend on other fixtures using the same `#[fixture]` parameter synt
 #[skuld::fixture(scope = test, deref)]
 fn test_name() -> Result<TestName, String> { /* ... */ }
 
+use skuld::test_name;
+
 #[skuld::fixture(deref)]
-fn temp_dir(#[fixture(test_name)] name: &str) -> Result<TempDir, String> {
+fn scratch_dir(#[fixture(test_name)] name: &str) -> Result<skuld::TempDir, String> {
     // `name` is injected from the test_name fixture.
-    tempfile::Builder::new()
-        .prefix(&format!("{name}-"))
-        .tempdir()
-        .map(|inner| TempDir { inner })
-        .map_err(|e| format!("failed to create temp dir: {e}"))
+    skuld::TempDir::new().map_err(|e| format!("cannot create a scratch dir for {name}: {e}"))
 }
 ```
+
+`skuld::TempDir` also works outside fixtures: `TempDir::new()` and `TempDir::new_in(parent)` create a directory named `.tmp-<pid>-<random>` that is removed on drop, and `close()` returns the removal error that drop only warns about. On Unix the directory is private to its owner (mode 0700).
 
 ## Deref coercion
 

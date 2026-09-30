@@ -45,13 +45,13 @@ pub(crate) fn open_dir(dir: &Path) -> io::Result<File> {
             "{full:?}, or a directory above it, is being deleted (NTSTATUS {:#010x})",
             status.0 as u32
         )),
-        STATUS_NOT_A_DIRECTORY => not_a_directory(),
+        STATUS_NOT_A_DIRECTORY => not_a_directory(&full),
         _ => nt_error(status, &full),
     })?);
     // A device (`\\.\NUL`) can accept FILE_DIRECTORY_FILE without being a directory.
     let info = standard_info(&handle).map_err(|e| io::Error::new(e.kind(), format!("cannot query {full:?}: {e}")))?;
     if !info.Directory {
-        return Err(not_a_directory());
+        return Err(not_a_directory(&full));
     }
     Ok(handle)
 }
@@ -163,8 +163,8 @@ pub(crate) fn standard_info(file: &File) -> io::Result<FILE_STANDARD_INFO> {
     Ok(info)
 }
 
-fn not_a_directory() -> io::Error {
-    io::Error::new(io::ErrorKind::NotADirectory, "not a directory")
+fn not_a_directory(path: &Path) -> io::Error {
+    io::Error::new(io::ErrorKind::NotADirectory, format!("{path:?} is not a directory"))
 }
 
 /// The Win32 error for `status`, naming the NTSTATUS and `path`.
