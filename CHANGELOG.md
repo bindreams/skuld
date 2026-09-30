@@ -25,8 +25,9 @@ All notable changes to this project are documented in this file.
   up-front usability check at random** with `Access is denied`. The probe
   file's name could be held by a deleted file still open elsewhere, which
   Windows reports as access denied. Probe names now include the process id,
-  and a name held that way is skipped. The error for a genuinely denied
-  directory now includes the NTSTATUS.
+  and a name held that way is skipped. A directory that denies file
+  creation now gets an error naming the NTSTATUS, and one being deleted gets
+  an error saying so instead of `Access is denied`.
 
 ### Added
 
