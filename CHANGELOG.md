@@ -21,6 +21,9 @@ All notable changes to this project are documented in this file.
   honored instead of skipping the dump with a warning.
 - **`EnvGuard` restores a non-UTF-8 prior value byte-identically.** It read the
   prior value as UTF-8 and restored a non-UTF-8 one as unset.
+- **On Windows, a writable coordination directory no longer fails the
+  up-front usability check at random** with `Access is denied`. A directory
+  being deleted now reports that instead of `Access is denied`.
 
 ### Added
 

@@ -13,9 +13,10 @@
 //! profile directory, or a `CACHEDIR.TAG` beside it. Without one, `/opt/app/deps/t` is just a
 //! directory named `deps`.
 //!
-//! The directory must be readable, writable and searchable: the database is created on first
-//! use and the lock opens the directory itself. [`resolve`] checks this once and fails with one
-//! message naming the directory and `SKULD_DB_DIR`.
+//! The database is created on first use, so the directory must let the caller create files. On
+//! Unix it must also be readable and searchable, since the lock opens the directory itself; on
+//! Windows the lock is a file. [`resolve`] checks this once and fails with one message naming the
+//! directory and `SKULD_DB_DIR`.
 
 use std::ffi::OsStr;
 use std::io;
@@ -23,12 +24,18 @@ use std::path::{Path, PathBuf};
 
 use super::DB_DIR_ENV;
 
+#[cfg(windows)]
+mod windows_probe;
+#[cfg(all(test, windows))]
+mod windows_probe_tests;
+
 /// `override_dir` is the value of `SKULD_DB_DIR`, if set; `exe` is called only when it is not.
 /// Returns a usable directory, or a message naming the cause.
 pub(super) fn resolve(
     override_dir: Option<&OsStr>,
     exe: impl FnOnce() -> io::Result<PathBuf>,
 ) -> Result<PathBuf, String> {
+    let mut created = Ok(());
     let dir = match override_dir {
         Some(dir) => {
             let dir = Path::new(dir);
@@ -37,11 +44,9 @@ pub(super) fn resolve(
                     "{DB_DIR_ENV} must be an absolute path, got {dir:?} (a relative path would depend on the working directory)"
                 ));
             }
-            // An existing non-directory is left for `check_usable` to reject with a clear message.
-            if !dir.exists() {
-                create_dir_all_open(dir)
-                    .map_err(|e| format!("cannot create coordination DB directory {dir:?} (from {DB_DIR_ENV}): {e}"))?;
-            }
+            // Create rather than check first. A failure is reported only if `check_usable` passes,
+            // since its diagnosis (not a directory, denied, being deleted) names the cause better.
+            created = create_dir_all_open(dir);
             dir.to_path_buf()
         }
         None => {
@@ -59,6 +64,7 @@ pub(super) fn resolve(
     check_usable(&dir).map_err(|e| {
         format!("coordination DB directory {dir:?} is unusable: {e}; set {DB_DIR_ENV} to a writable absolute path")
     })?;
+    created.map_err(|e| format!("cannot create coordination DB directory {dir:?} (from {DB_DIR_ENV}): {e}"))?;
     Ok(dir)
 }
 
@@ -182,15 +188,15 @@ pub(super) fn create_dir_all_open_with(dir: &Path, mut before_publish: impl FnMu
     Ok(())
 }
 
-/// Fail unless `dir` is a directory the calling identity can read, search and write
-/// (`EROFS` included).
+/// Fail unless `dir` is a directory the calling identity can use (module doc), `EROFS` included.
 fn check_usable(dir: &Path) -> io::Result<()> {
-    if !std::fs::metadata(dir)?.is_dir() {
-        return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a directory"));
-    }
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
+
+        if !std::fs::metadata(dir)?.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a directory"));
+        }
 
         let c = std::ffi::CString::new(dir.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
@@ -205,11 +211,6 @@ fn check_usable(dir: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        // No `access`-style query reflects ACLs; create-and-delete a probe file.
-        drop(std::fs::read_dir(dir)?);
-        tempfile::Builder::new()
-            .prefix(".skuld-probe-")
-            .tempfile_in(dir)
-            .map(drop)
+        windows_probe::check_usable(dir)
     }
 }
