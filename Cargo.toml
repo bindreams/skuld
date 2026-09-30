@@ -69,7 +69,7 @@ windows = { version = "0.62", features = [
     # Windows init lock file: opened without FILE_SHARE_DELETE so it can
     # never be deleted or renamed out from under a holder.
     "Win32_Storage_FileSystem",
-    # NtCreateFile (windows_probe) reports STATUS_DELETE_PENDING, which
+    # NtCreateFile (src/win_nt.rs) reports STATUS_DELETE_PENDING, which
     # CreateFileW folds into ERROR_ACCESS_DENIED.
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",

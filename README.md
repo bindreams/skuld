@@ -177,15 +177,16 @@ Fixtures provide dependency-injected values to test functions. Define a fixture 
 ```rust
 use std::path::Path;
 
+use skuld::test_name;
+
 #[skuld::fixture(deref)]
-fn temp_dir(#[fixture(test_name)] name: &str) -> Result<skuld::TempDir, String> {
-    // skuld provides TempDir and TestName as built-in fixtures.
-    // This example shows how custom fixtures work.
-    todo!()
+fn scratch_dir(#[fixture(test_name)] name: &str) -> Result<skuld::TempDir, String> {
+    // `test_name` is a built-in fixture, as is `temp_dir`, which this resembles.
+    skuld::TempDir::new().map_err(|e| format!("cannot create a scratch dir for {name}: {e}"))
 }
 
 #[skuld::test]
-fn my_test(#[fixture(temp_dir)] dir: &Path) {
+fn my_test(#[fixture(scratch_dir)] dir: &Path) {
     assert!(dir.exists());
 }
 ```

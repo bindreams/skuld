@@ -22,6 +22,8 @@ pub mod runner;
 #[cfg(test)]
 mod runner_tests;
 mod skuld_env;
+#[cfg(windows)]
+mod win_nt;
 
 pub use coordination::{SERIAL_ALL, SERIAL_NONE};
 pub use fixture::{
