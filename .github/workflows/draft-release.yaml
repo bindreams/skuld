@@ -29,20 +29,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Read the release toolchain pin
-        id: toolchain
-        timeout-minutes: 5
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Stage 2 installs exactly this toolchain. A missing or malformed
-          # pin fails here, before any draft exists.
-          version=$(.github/scripts/release-toolchain.sh .github/release-toolchain)
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
+      # Stage 2's toolchain: a missing or malformed pin fails here, before any
+      # draft exists.
       - uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.toolchain.outputs.version }}
+          pin-file: .github/release-toolchain
 
       - name: Normalize and validate version
         id: version
@@ -97,20 +88,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Read the release toolchain pin
-        id: toolchain
-        timeout-minutes: 5
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Stage 2 installs exactly this toolchain. A missing or malformed
-          # pin fails here, before any draft exists.
-          version=$(.github/scripts/release-toolchain.sh .github/release-toolchain)
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
+      # Stage 2's toolchain: a missing or malformed pin fails here, before any
+      # draft exists.
       - uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.toolchain.outputs.version }}
+          pin-file: .github/release-toolchain
 
       - name: Dry-run publish workspace
         timeout-minutes: 30

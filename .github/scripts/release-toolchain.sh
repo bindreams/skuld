@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # Read the release toolchain pin and print it, or fail.
 #
-# The pin is one exact `X.Y.Z` in `.github/release-toolchain` (a trailing
-# newline is allowed). Both release stages install exactly that toolchain,
-# because different cargo versions can package one tree into different bytes,
-# and stage 2 holds its re-derived archives to the build job's hashes.
+# Both release stages install exactly this toolchain, because different cargo
+# versions can package one tree into different bytes, and stage 2 holds its
+# re-derived archives to the build job's hashes.
 #
-# This lives in a script, like normalize-version.sh, because stage 1
-# (draft-release.yaml) and stage 2 (publish-release.yaml) must accept exactly
-# the same spellings: the value ends up in a toolchain installer's command
-# line, so anything looser would be an injection sink in the credentialed job.
+# This lives in a script, like normalize-version.sh, because both stages must
+# accept exactly the same spellings: the value ends up in a toolchain
+# installer's command line. The grammar is also written in
+# .github/actions/install-toolchain/action.yaml and .github/renovate.json;
+# change all three together.
 #
-# A malformed file is reported with its content shell-quoted, so a file
-# containing `::error::`-style workflow commands cannot forge annotations.
+# The file is read once into a temporary copy, so the NUL check and the
+# grammar check see the same bytes. Errors quote the file's content with
+# `printf %q`, so it cannot forge workflow commands.
 set -euo pipefail
-# Digits are ASCII digits, whatever the caller's locale.
+# Not known to matter for the grammar below (no locale was found where it
+# changes an outcome); kept as defence and untested.
 export LC_ALL=C
 
 if [ "$#" -ne 1 ]; then
@@ -33,12 +35,20 @@ fail() {
 	exit 1
 }
 
-if [ ! -f "$file" ]; then
-	fail "$(printf '%q' "$file") does not exist. The commit being released must contain the toolchain pin; see CONTRIBUTING.md."
+copy=$(mktemp)
+trap 'rm -f -- "${copy:?}"' EXIT
+
+cat -- "$file" > "$copy" 2>/dev/null ||
+	fail "$(printf '%q' "$file") could not be read (missing, not a regular file, or unreadable). The commit being released must contain the toolchain pin; see CONTRIBUTING.md."
+
+# Command substitution drops NUL bytes, which would let `1.98\0.1` read as 1.98.1.
+nuls=$(tr -cd '\0' < "$copy" | wc -c)
+if [ "$nuls" -ne 0 ]; then
+	fail "$(printf '%q' "$file") contains a NUL byte."
 fi
 
-pin=$(cat "$file")
-if ! [[ "$pin" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+pin=$(cat -- "$copy")
+if ! [[ "$pin" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
 	fail "$(printf '%q' "$file") must be one exact X.Y.Z line, got $(printf '%q' "$pin")."
 fi
 

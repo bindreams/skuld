@@ -1,0 +1,25 @@
+name: Read the release toolchain pin
+description: Reads and validates a release toolchain pin file with the script that sits beside this action.
+inputs:
+  file:
+    description: "Path to the pin file (.github/release-toolchain in some checkout)"
+    required: true
+outputs:
+  version:
+    description: "The validated X.Y.Z"
+    value: ${{ steps.read.outputs.version }}
+runs:
+  using: composite
+  steps:
+    # The script is found relative to this action, so the copy that runs is
+    # the one checked out beside it, wherever the pin file comes from.
+    - name: Read and validate the pin
+      id: read
+      shell: bash
+      env:
+        PIN_FILE: ${{ inputs.file }}
+      run: |
+        set -euo pipefail
+        version=$("$GITHUB_ACTION_PATH/../../scripts/release-toolchain.sh" "$PIN_FILE")
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "Toolchain pin: $version"

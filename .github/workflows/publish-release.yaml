@@ -26,15 +26,14 @@ concurrency:
 #            --no-verify` build no code, and the crates it uploads are
 #            re-derived here and checked against the build job's hashes.
 #
-# `publish` consumes no output of `build`: the toolchain, version and commit
-# come from `resolve`, and the build job's artifact is only the hashes the
-# re-derived archives are compared with. A compromised build job can therefore
-# cause a refusal, never code execution or different bytes in `publish`.
+# `publish` takes nothing from `build` except the sha256 list it holds its
+# re-derived archives to, so a compromised build job can cause a refusal, never
+# code execution or different bytes. Nor does `publish` run any action from the
+# release tree: it uses the dispatch commit's copy (the commit this workflow
+# file comes from), checked out beside the release tree.
 #
 # `actions/checkout` uses `github.token` in every job (its default `token`
-# input) and, with `persist-credentials: false`, does not leave it in
-# `.git/config`. The token is otherwise exposed as `GH_TOKEN` only to the steps
-# that call `gh`.
+# input); with `persist-credentials: false` it leaves nothing in `.git/config`.
 jobs:
   resolve:
     name: Resolve the draft release
@@ -51,14 +50,16 @@ jobs:
       rust_version: ${{ steps.toolchain.outputs.version }}
     steps:
       # The release tree can't be checked out until the draft's target SHA is
-      # known, and that lookup needs the validated version; so the version
-      # script comes from the dispatch commit.
+      # known, and that lookup needs the validated version; so the scripts and
+      # actions used here come from the dispatch commit.
       - name: Check out the release scripts from the workflow ref
         uses: actions/checkout@v4
         timeout-minutes: 5
         with:
           ref: ${{ github.sha }}
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            .github/actions
           path: workflow-ref
           persist-credentials: false
 
@@ -133,17 +134,14 @@ jobs:
           path: release-pin
           persist-credentials: false
 
+      # The script beside the action comes from the dispatch commit; the
+      # file it reads from the draft's target.
       - name: Read and validate the toolchain pin
         id: toolchain
         timeout-minutes: 5
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The script comes from the dispatch commit, the file from the
-          # draft's target.
-          pin=$(workflow-ref/.github/scripts/release-toolchain.sh release-pin/.github/release-toolchain)
-          echo "version=$pin" >> "$GITHUB_OUTPUT"
-          echo "Toolchain pin: $pin" | tee -a "$GITHUB_STEP_SUMMARY"
+        uses: ./workflow-ref/.github/actions/read-toolchain-pin
+        with:
+          file: release-pin/.github/release-toolchain
 
   build:
     name: Verify build
@@ -181,9 +179,7 @@ jobs:
           set -euo pipefail
           git tag "$TAG"
           # Compiles the xtask crate and its dependencies, which is why it is
-          # here and not in the publish job. The publish job re-checks the
-          # version against the manifests with `cargo metadata`, which builds
-          # nothing.
+          # here and not in the publish job.
           cargo xtask version --check --exact
 
       # The verification build runs here, before the token exists. `cargo
@@ -262,9 +258,8 @@ jobs:
     # config, so the OIDC token minted below is only accepted from a run that
     # declares it.
     #
-    # It deliberately has no protection rules or deployment branch policy — the
-    # owner decided against restricting it to `main` (2026-09-26) — so it is
-    # not an authorization control. See CONTRIBUTING.md.
+    # It deliberately has no protection rules or deployment branch policy, so it
+    # is not an authorization control. See CONTRIBUTING.md.
     #
     # Real preflight (version validation, CI matrix, cargo publish dry-run)
     # happens in draft-release.yaml before a draft can exist. This workflow
@@ -284,38 +279,39 @@ jobs:
       id-token: write
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
+    defaults:
+      run:
+        working-directory: release
     steps:
+      # Actions come from the dispatch commit, which this workflow file is
+      # from, never from the release tree that `cargo` and the scripts below
+      # read. Both trees sit in subdirectories: the release tree in `release/`,
+      # where every `run:` starts, so it holds no stray untracked files for
+      # `cargo package` to reject.
+      - name: Check out the actions from the workflow ref
+        uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/actions
+          path: workflow-ref
+          persist-credentials: false
+
       # Same commit the build job built. `persist-credentials: false` keeps the
       # write token out of `.git/config`; the flip step gets it explicitly.
       - uses: actions/checkout@v4
         timeout-minutes: 10
         with:
           ref: ${{ needs.resolve.outputs.commit_sha }}
+          path: release
           persist-credentials: false
 
-      # Deliberately not `./.github/actions/setup-rust`: that installs a
-      # compiler cache wrapper around rustc, which this job never invokes. The
-      # version comes from `resolve`, never from `build`.
-      - uses: dtolnay/rust-toolchain@stable
+      # Not `setup-rust`: that adds a compiler cache wrapper this job never
+      # uses. The version comes from `resolve`, never from `build`.
+      - uses: ./workflow-ref/.github/actions/install-toolchain
         timeout-minutes: 15
         with:
           toolchain: ${{ needs.resolve.outputs.rust_version }}
-
-      # dtolnay's `rustup default` step tolerates failure, which would leave
-      # the runner's preinstalled toolchain in place. Refuse that: the hash
-      # comparison below is only meaningful under the build job's cargo.
-      - name: Check the pinned toolchain is the one running
-        timeout-minutes: 5
-        env:
-          RUST_VERSION: ${{ needs.resolve.outputs.rust_version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          actual=$(cargo --version | cut -d ' ' -f2)
-          if [ "$actual" != "$RUST_VERSION" ]; then
-            echo "::error::Pinned toolchain is ${RUST_VERSION} but cargo ${actual} is running."
-            exit 1
-          fi
 
       # Only the hashes, not the archives: the build job controls this
       # artifact, so the credentialed job unpacks as little of it as it can.
@@ -529,12 +525,9 @@ jobs:
         #
         # `--no-verify` because the build job already ran the verification
         # build, on this commit and over the whole member set, and this job
-        # compiles nothing. Stage 1's dry-run is not the justification: it runs
-        # against `github.sha`, while the build job builds the draft's target,
-        # and those can differ (which is why the flip below re-asserts the
-        # SHA). `--no-verify` skips only that local verification build;
-        # registry-side limits such as crates.io's upload size cap still apply
-        # at upload regardless, and nothing before this step exercises them.
+        # compiles nothing. It skips only that local build; registry-side
+        # limits such as crates.io's upload size cap still apply at upload, and
+        # nothing before this step exercises them.
         shell: bash
         run: |
           set -euo pipefail

@@ -2,9 +2,13 @@ name: Set up Rust build environment
 description: Installs the requested Rust toolchain (default stable), caches cargo registry, configures sccache.
 inputs:
   toolchain:
-    description: "Toolchain for dtolnay/rust-toolchain: 'stable' or an exact X.Y.Z"
+    description: "'stable' or an exact X.Y.Z. Ignored when pin-file is set."
     required: false
     default: "stable"
+  pin-file:
+    description: "Release toolchain pin file to install instead of `toolchain`"
+    required: false
+    default: ""
   components:
     description: "Extra rustup components (e.g. 'clippy, rustfmt')"
     required: false
@@ -16,29 +20,20 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Read the toolchain pin
+      id: pin
+      if: inputs.pin-file != ''
+      uses: ./.github/actions/read-toolchain-pin
+      with:
+        file: ${{ inputs.pin-file }}
+
     - name: Install Rust toolchain
       id: rust-toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: ./.github/actions/install-toolchain
       with:
-        toolchain: ${{ inputs.toolchain }}
+        toolchain: ${{ steps.pin.outputs.version || inputs.toolchain }}
         components: ${{ inputs.components }}
         targets: ${{ inputs.targets }}
-
-    # dtolnay's `rustup default` step tolerates failure, which would silently
-    # leave the runner's preinstalled toolchain in place. When an exact version
-    # was asked for, refuse that.
-    - name: Check the requested toolchain is the one running
-      shell: bash
-      env:
-        TOOLCHAIN: ${{ inputs.toolchain }}
-      run: |
-        if [[ "$TOOLCHAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          actual=$(cargo --version | cut -d ' ' -f2)
-          if [ "$actual" != "$TOOLCHAIN" ]; then
-            echo "::error::Requested toolchain ${TOOLCHAIN} but cargo ${actual} is running."
-            exit 1
-          fi
-        fi
 
     - name: Cache cargo registry
       uses: actions/cache@v4

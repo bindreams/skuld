@@ -9,7 +9,7 @@
       "customType": "regex",
       "description": "Release toolchain pin (see CONTRIBUTING.md, Toolchain pin)",
       "managerFilePatterns": ["/^\\.github/release-toolchain$/"],
-      "matchStrings": ["^(?<currentValue>\\d+\\.\\d+\\.\\d+)\\s*$"],
+      "matchStrings": ["^(?<currentValue>(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*))\\n*$"],
       "depNameTemplate": "rust-lang/rust",
       "datasourceTemplate": "github-releases"
     }

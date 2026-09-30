@@ -1,0 +1,56 @@
+name: Install a Rust toolchain
+description: Installs 'stable' or an exact X.Y.Z, and fails unless that toolchain is the one running.
+inputs:
+  toolchain:
+    description: "'stable' or an exact X.Y.Z"
+    required: true
+  components:
+    description: "Extra rustup components (e.g. 'clippy, rustfmt')"
+    required: false
+    default: ""
+  targets:
+    description: "Rust target triple(s)"
+    required: false
+    default: ""
+outputs:
+  cachekey:
+    description: "dtolnay/rust-toolchain's cache key for the installed toolchain"
+    value: ${{ steps.install.outputs.cachekey }}
+runs:
+  using: composite
+  steps:
+    # The input reaches dtolnay's `run:` by interpolation, so refuse anything
+    # but the two shapes before it gets there. The X.Y.Z grammar is
+    # .github/scripts/release-toolchain.sh's; change both together.
+    - name: Validate the requested toolchain
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ inputs.toolchain }}
+      run: |
+        if [ "$TOOLCHAIN" != stable ] && ! [[ "$TOOLCHAIN" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+          echo "::error::Toolchain must be 'stable' or an exact X.Y.Z, got $(printf '%q' "$TOOLCHAIN")."
+          exit 1
+        fi
+
+    - name: Install Rust toolchain
+      id: install
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    # dtolnay's `rustup default` step tolerates failure, which would silently
+    # leave the runner's preinstalled toolchain in place.
+    - name: Check the requested toolchain is the one running
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ inputs.toolchain }}
+      run: |
+        if [ "$TOOLCHAIN" != stable ]; then
+          actual=$(cargo --version | cut -d ' ' -f2)
+          if [ "$actual" != "$TOOLCHAIN" ]; then
+            echo "::error::Requested toolchain ${TOOLCHAIN} but cargo ${actual} is running."
+            exit 1
+          fi
+        fi
