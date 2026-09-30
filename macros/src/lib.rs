@@ -6,6 +6,17 @@ use syn::{
     ReturnType, Token, Type, Visibility,
 };
 
+/// Error if `key` was already given in this attribute; otherwise record it.
+/// A repeated key would silently replace the earlier value.
+fn reject_duplicate_key(key: &Ident, seen: &mut Vec<String>) -> syn::Result<()> {
+    let name = key.to_string();
+    if seen.contains(&name) {
+        return Err(syn::Error::new(key.span(), format!("duplicate argument `{name}`")));
+    }
+    seen.push(name);
+    Ok(())
+}
+
 // #[skuld::test] argument parsing =================================================================
 
 /// Parsed arguments for `#[skuld::test(...)]`.
@@ -39,6 +50,7 @@ enum ShouldPanicArg {
 impl Parse for TestArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut args = TestArgs::default();
+        let mut seen = Vec::new();
 
         if input.is_empty() {
             return Ok(args);
@@ -46,6 +58,7 @@ impl Parse for TestArgs {
 
         loop {
             let key: Ident = input.parse()?;
+            reject_duplicate_key(&key, &mut seen)?;
             match key.to_string().as_str() {
                 "requires" => {
                     let _eq: Token![=] = input.parse()?;
@@ -196,6 +209,7 @@ struct FixtureArgs {
 impl Parse for FixtureArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut args = FixtureArgs::default();
+        let mut seen = Vec::new();
 
         if input.is_empty() {
             return Ok(args);
@@ -203,6 +217,7 @@ impl Parse for FixtureArgs {
 
         loop {
             let key: Ident = input.parse()?;
+            reject_duplicate_key(&key, &mut seen)?;
             match key.to_string().as_str() {
                 "requires" => {
                     let _eq: Token![=] = input.parse()?;

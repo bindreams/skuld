@@ -1,0 +1,29 @@
+error: duplicate argument `requires`
+ --> tests/compile_fail/duplicate_fixture_arg.rs:8:35
+  |
+8 | #[skuld::fixture(requires = [ok], requires = [ok])]
+  |                                   ^^^^^^^^
+
+error: duplicate argument `scope`
+  --> tests/compile_fail/duplicate_fixture_arg.rs:13:32
+   |
+13 | #[skuld::fixture(scope = test, scope = process)]
+   |                                ^^^^^
+
+error: duplicate argument `name`
+  --> tests/compile_fail/duplicate_fixture_arg.rs:18:30
+   |
+18 | #[skuld::fixture(name = "a", name = "b")]
+   |                              ^^^^
+
+error: duplicate argument `deref`
+  --> tests/compile_fail/duplicate_fixture_arg.rs:23:25
+   |
+23 | #[skuld::fixture(deref, deref)]
+   |                         ^^^^^
+
+error: duplicate argument `serial`
+  --> tests/compile_fail/duplicate_fixture_arg.rs:28:26
+   |
+28 | #[skuld::fixture(serial, serial = A)]
+   |                          ^^^^^^

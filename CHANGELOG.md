@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Breaking
+
+- **A repeated argument in `#[skuld::test(...)]` or `#[skuld::fixture(...)]` is
+  now a compile error** naming the key ("duplicate argument `labels`"). The
+  later value used to replace the earlier one silently, so
+  `labels = [A], labels = [B]` dropped `A`. Code that repeated a key must
+  merge the values.
+
 ## [0.5.0] - 2026-09-30
 
 ### Breaking
