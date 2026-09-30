@@ -1994,6 +1994,7 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "trybuild",
+ "unicode-normalization",
  "windows",
 ]
 

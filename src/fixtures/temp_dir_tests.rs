@@ -298,7 +298,7 @@ fn a_parent_that_is_a_file_is_an_error_naming_it() {
 
 // Sanitiser -----
 
-use super::temp_dir::file_name_safe;
+use super::temp_dir::{file_name_safe, NAME_MAX, RANDOM_LEN};
 
 #[test]
 fn every_forbidden_character_becomes_an_underscore() {
@@ -307,55 +307,147 @@ fn every_forbidden_character_becomes_an_underscore() {
     }
 }
 
-#[test]
-fn a_dos_device_name_before_the_first_dot_is_escaped() {
-    for (prefix, want) in [
-        ("nul.json", "_nul.json"),
-        ("NUL.x", "_NUL.x"),
-        ("con .y", "_con .y"),
-        ("COM1.z", "_COM1.z"),
-        ("com0", "_com0"),
-        ("LPT9.txt", "_LPT9.txt"),
-        ("COM¹.w", "_COM¹.w"),
-        ("lpt³", "_lpt³"),
-        ("CONIN$.q", "_CONIN$.q"),
-        ("conout$", "_conout$"),
-        ("aux", "_aux"),
-        ("prn.a.b", "_prn.a.b"),
-    ] {
-        assert_eq!(file_name_safe(prefix), want, "{prefix}");
-    }
+/// Whether Win32 reads `name` as a DOS device: the part before the first `.`, trailing spaces
+/// trimmed, is a reserved name in any case. An oracle independent of the code under test.
+fn is_device_name(name: &str) -> bool {
+    let base = name.split('.').next().unwrap().trim_end_matches(' ').to_uppercase();
+    let numbered = ["COM", "LPT"].iter().any(|stem| {
+        base.strip_prefix(stem)
+            .is_some_and(|d| d.chars().count() == 1 && "0123456789¹²³".contains(d))
+    });
+    numbered || ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&base.as_str())
+}
+
+/// The name a prefix gets: `<safe prefix>-<pid>-<random>`.
+fn full_name(safe_prefix: &str) -> String {
+    format!("{safe_prefix}-{}-{}", std::process::id(), "a".repeat(RANDOM_LEN))
 }
 
 #[test]
-fn a_name_that_only_starts_like_a_device_is_left_alone() {
+fn a_prefix_is_escaped_exactly_when_its_full_name_would_be_a_dos_device() {
     for prefix in [
+        "nul.json",
+        "NUL.x",
+        "con .y",
+        "COM1.z",
+        "LPT9.txt",
+        "COM¹.w",
+        "lpt³.a",
+        "CONIN$.q",
+        "conout$.b",
+        "prn.a.b",
+        "aux",
+        "com0",
+        "nul",
         "plain.json",
-        "console",
-        "nul_x",
-        "comx",
-        "com10",
-        "lpt",
-        "auxiliary.txt",
+        "console.txt",
+        "nul_x.y",
+        "com10.z",
+        "lpt.w",
         ".nul",
     ] {
-        assert_eq!(file_name_safe(prefix), prefix, "{prefix}");
+        let safe = file_name_safe(prefix);
+        assert!(!is_device_name(&full_name(&safe)), "{prefix}: {safe}");
+        let escaped = safe != prefix;
+        assert_eq!(escaped, is_device_name(&full_name(prefix)), "{prefix}: {safe}");
     }
 }
 
-/// The budget is in bytes: a multibyte prefix must still leave the whole name within 255 bytes.
+/// The escaped directory must be usable through its path, which Win32 would otherwise resolve to
+/// the device.
 #[test]
-fn the_prefix_budget_counts_bytes() {
-    let prefix = "😀".repeat(100);
-    let safe = file_name_safe(&prefix);
-    let whole = format!("{safe}-4294967295-abcdef");
-    assert!(whole.len() <= 255, "{} bytes", whole.len());
-    assert!(safe.chars().all(|c| c == '😀'), "{safe}");
-    assert!(!safe.is_empty());
-
+fn a_device_like_prefix_gives_a_usable_directory() {
     let parent = TempDir::new().unwrap();
-    let dir = TempDir::with_prefix_in(&prefix, &parent).unwrap();
-    assert!(dir.file_name().unwrap().len() <= 255);
+    let dir = TempDir::with_prefix_in("nul.json", &parent).unwrap();
+    assert!(dir.is_dir());
+    std::fs::write(dir.join("f"), b"data").unwrap();
+    assert_eq!(std::fs::read(dir.join("f")).unwrap(), b"data");
+    dir.close().unwrap();
+}
+
+/// Whether the created name `name` fits [`NAME_MAX`] as every covered file system counts it:
+/// UTF-8 bytes, UTF-16 units, and (HFS+) UTF-16 units after canonical decomposition.
+fn assert_fits(name: &str) {
+    use unicode_normalization::UnicodeNormalization;
+
+    assert!(name.len() <= NAME_MAX, "{} bytes", name.len());
+    assert!(
+        name.encode_utf16().count() <= NAME_MAX,
+        "{} UTF-16 units",
+        name.encode_utf16().count()
+    );
+    let nfd: String = name.nfd().collect();
+    assert!(
+        nfd.encode_utf16().count() <= NAME_MAX,
+        "{} NFD UTF-16 units",
+        nfd.encode_utf16().count()
+    );
+}
+
+#[test]
+fn a_long_prefix_is_cut_so_the_created_name_fits() {
+    let parent = TempDir::new().unwrap();
+    for prefix in ["x".repeat(1000), "😀".repeat(100), "ΐ".repeat(118)] {
+        let dir = TempDir::with_prefix_in(&prefix, &parent).unwrap();
+        let name = dir.file_name().unwrap().to_str().unwrap().to_owned();
+        let pid_and_random = format!("-{}-", std::process::id());
+        let (safe, random) = name.rsplit_once(&pid_and_random).unwrap();
+        assert_eq!(random.len(), RANDOM_LEN, "{name}");
+        assert!(prefix.starts_with(safe) && !safe.is_empty(), "{name}");
+        assert_fits(&name);
+    }
+}
+
+// Retries -----
+
+#[test]
+fn a_taken_name_is_retried_with_a_fresh_name() {
+    let parent = TempDir::new().unwrap();
+    let mut tried = Vec::new();
+    let dir = TempDir::create_with("t", parent.path(), |path| {
+        tried.push(path.to_path_buf());
+        if tried.len() <= 5 {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "taken"));
+        }
+        std::fs::create_dir(path)
+    })
+    .unwrap();
+    assert_eq!(tried.len(), 6);
+    assert_eq!(dir.path(), tried[5]);
+    let mut distinct = tried.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 6, "{tried:?}");
+}
+
+#[test]
+fn any_other_error_stops_after_one_attempt() {
+    let parent = TempDir::new().unwrap();
+    let mut attempts = 0;
+    let err = TempDir::create_with("t", parent.path(), |_| {
+        attempts += 1;
+        Err(io::Error::other("the parent is being deleted"))
+    })
+    .unwrap_err();
+    assert_eq!(attempts, 1, "{err}");
+}
+
+// Fixture -----
+
+#[test]
+fn the_fixture_hands_out_a_canonical_path_for_any_test_name() {
+    const NAME: &str = "weird/na:me*?\"<>|.json";
+    let _scope = crate::enter_test_scope(NAME, "temp_dir_tests");
+    let handle = crate::fixture_get("temp_dir", std::any::TypeId::of::<TempDir>());
+    // SAFETY: the temp_dir fixture's value is a TempDir.
+    let dir: &TempDir = unsafe { handle.as_ref::<TempDir>() };
+    assert!(dir.is_dir());
+    assert_eq!(dir.path(), dir.path().canonicalize().unwrap());
+    let name = dir.file_name().unwrap().to_str().unwrap();
+    assert!(name.starts_with(&format!("{}-", file_name_safe(NAME))), "{name}");
+    let path = dir.path().to_path_buf();
+    drop(handle);
+    assert!(!path.exists(), "{path:?}");
 }
 
 // Removal warnings -----

@@ -43,18 +43,29 @@ impl TempDir {
     /// A new directory in `parent`, named after `prefix` made safe for a file name.
     pub(crate) fn with_prefix_in(prefix: &str, parent: &Path) -> io::Result<Self> {
         let parent = std::path::absolute(parent).map_err(|e| io::Error::new(e.kind(), format!("{e}: {parent:?}")))?;
-        let prefix = format!("{}-{}-", file_name_safe(prefix), std::process::id());
         #[cfg(unix)]
-        let create = create_dir;
+        return Self::create_with(prefix, &parent, create_dir);
         #[cfg(windows)]
-        let handle = crate::win_nt::open_dir(&parent)?;
-        #[cfg(windows)]
-        let create = |path: &Path| create_dir(&handle, &parent, path);
+        {
+            let handle = crate::win_nt::open_dir(&parent)?;
+            Self::create_with(prefix, &parent, |path| create_dir(&handle, &parent, path))
+        }
+    }
+
+    /// [`TempDir::with_prefix_in`] with the directory created by `create`, called with each
+    /// candidate path until it returns anything but `AlreadyExists`.
+    pub(crate) fn create_with(
+        prefix: &str,
+        parent: &Path,
+        create: impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        debug_assert!(parent.is_absolute(), "{parent:?}");
+        let prefix = format!("{}-{}-", file_name_safe(prefix), std::process::id());
         let made = tempfile::Builder::new()
             .prefix(&prefix)
             .rand_bytes(RANDOM_LEN)
             .disable_cleanup(true)
-            .make_in(&parent, create)?;
+            .make_in(parent, create)?;
         let created = made.path().to_path_buf();
         Ok(Self {
             path: created.clone(),
@@ -75,10 +86,10 @@ impl TempDir {
 }
 
 /// Characters of randomness tempfile appends to each name.
-const RANDOM_LEN: usize = 6;
+pub(crate) const RANDOM_LEN: usize = 6;
 
 /// The longest file name in bytes (Unix) or UTF-16 units (Windows) that common file systems accept.
-const NAME_MAX: usize = 255;
+pub(crate) const NAME_MAX: usize = 255;
 
 /// `prefix` made safe as the start of a file name: path separators, `:`, the other characters
 /// Windows forbids in names, and control characters become `_`; a DOS device name (see
