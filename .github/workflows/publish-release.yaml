@@ -68,7 +68,7 @@ jobs:
       # known, and that lookup needs the validated version; so the scripts and
       # actions used here come from the dispatch commit.
       - name: Check out the release scripts from the workflow ref
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         timeout-minutes: 5
         with:
           ref: ${{ github.sha }}
@@ -152,7 +152,7 @@ jobs:
       # and a new stable cannot change them. Read from the draft's target, not
       # the dispatch commit.
       - name: Check out the toolchain pin from the draft's target
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         timeout-minutes: 5
         with:
           ref: ${{ steps.release.outputs.commit_sha }}
@@ -178,7 +178,7 @@ jobs:
     steps:
       # The draft's target, not the dispatch commit. No credentials are left in
       # `.git/config`: everything below runs third-party build code.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         timeout-minutes: 10
         with:
           ref: ${{ needs.resolve.outputs.commit_sha }}
@@ -248,14 +248,14 @@ jobs:
           cat "$RUNNER_TEMP/sha256sums/SHA256SUMS"
 
       # For forensics only: nothing downstream reads these.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         timeout-minutes: 5
         with:
           name: crates
           path: ${{ runner.temp }}/crates
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         timeout-minutes: 5
         with:
           name: sha256sums
@@ -319,7 +319,7 @@ jobs:
       # directory), so it holds no stray untracked files for `cargo package` to
       # reject.
       - name: Check out the actions from the workflow ref
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         timeout-minutes: 5
         with:
           ref: ${{ github.sha }}
@@ -331,7 +331,7 @@ jobs:
 
       # Same commit the build job built. `persist-credentials: false` keeps the
       # write token out of `.git/config`; the flip step gets it explicitly.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         timeout-minutes: 10
         with:
           ref: ${{ needs.resolve.outputs.commit_sha }}
@@ -347,7 +347,7 @@ jobs:
 
       # Only the hashes, not the archives: the build job controls this
       # artifact, so the credentialed job unpacks as little of it as it can.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         timeout-minutes: 5
         with:
           name: sha256sums
@@ -532,7 +532,7 @@ jobs:
           fi
 
       - name: Mint a short-lived crates.io token by OIDC
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
         id: auth
         if: steps.crate_state.outputs.all_published != 'true'
         timeout-minutes: 5

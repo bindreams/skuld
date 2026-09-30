@@ -1,40 +1,100 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
-  "schedule": ["before 9am on monday"],
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "schedule": [
+    "before 9am on monday"
+  ],
   "minimumReleaseAge": "7 days",
+  "internalChecksFilter": "strict",
+  "automerge": true,
   "platformAutomerge": true,
   "customManagers": [
     {
       "customType": "regex",
       "description": "Release toolchain pin (see CONTRIBUTING.md, Toolchain pin)",
-      "managerFilePatterns": ["/^\\.github/release-toolchain$/"],
-      "matchStrings": ["^(?<currentValue>(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*))\\n*$"],
+      "managerFilePatterns": [
+        "/^\\.github/release-toolchain$/"
+      ],
+      "matchStrings": [
+        "^(?<currentValue>(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*))\\n*$"
+      ],
       "depNameTemplate": "rust-lang/rust",
       "datasourceTemplate": "github-releases"
     }
   ],
   "packageRules": [
     {
-      "description": "Group GitHub Actions updates",
-      "matchManagers": ["github-actions"],
-      "groupName": "github-actions",
-      "automerge": true,
-      "matchUpdateTypes": ["minor", "patch", "pin", "digest"]
+      "description": "Group non-major GitHub Actions updates",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "github-actions"
     },
     {
-      "description": "Group Cargo updates",
-      "matchManagers": ["cargo"],
-      "groupName": "cargo",
-      "automerge": true,
-      "matchUpdateTypes": ["minor", "patch", "pin", "digest"]
+      "description": "Group non-major Cargo updates",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "cargo"
     },
     {
-      "description": "Group pip updates",
-      "matchManagers": ["pep621"],
-      "groupName": "pip",
-      "automerge": true,
-      "matchUpdateTypes": ["minor", "patch", "pin", "digest"]
+      "description": "Group non-major pip updates",
+      "matchManagers": [
+        "pep621"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "pip"
+    },
+    {
+      "description": "Group non-major release toolchain pin updates",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "release-toolchain"
+    },
+    {
+      "description": "Pin docs Python dependencies exactly",
+      "matchManagers": [
+        "pep621"
+      ],
+      "rangeStrategy": "pin"
+    },
+    {
+      "description": "Never group major updates: one PR per major",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "groupName": null
     }
   ]
 }

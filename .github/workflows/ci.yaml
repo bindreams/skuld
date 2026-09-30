@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # fetch-depth: 0 is required so `cargo xtask version --check`
           # (run via the prek hook) can see ancestor tags. Default depth 1
@@ -67,7 +67,7 @@ jobs:
       # actionlint's shellcheck integration silently degrades if the binary is
       # missing (see prek.toml) — install it explicitly and verify.
       - name: Install shellcheck
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: shellcheck@${{ steps.shellcheck-pin.outputs.version }}
 
@@ -112,7 +112,7 @@ jobs:
           .github/scripts/tests/check-toolchain.test.sh
           .github/scripts/tests/require-target-on-main.test.sh
 
-      - uses: j178/prek-action@v2
+      - uses: j178/prek-action@5337cb91e0fa35a7ff31b9ca345126d8bbbcdf16 # v2
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
@@ -149,13 +149,13 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 
