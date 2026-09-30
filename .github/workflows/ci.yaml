@@ -27,27 +27,3 @@ jobs:
           set +e
           cargo test --lib -p skuld coordination::db_dir:: -- --nocapture --test-threads=1 > base.log 2>&1; echo "exit=$?"
           grep -E "ADV92|^test |test result|panicked" base.log
-      - name: "M1: drop FILE_DELETE_ON_CLOSE"
-        run: |
-          set +e
-          git checkout -- src
-          sed -i 's/FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE | FILE_SYNCHRONOUS_IO_NONALERT/FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT/' src/coordination/db_dir/windows_probe.rs
-          git diff --stat
-          cargo test --lib -p skuld coordination::db_dir:: -- --nocapture --test-threads=1 > m1.log 2>&1; echo "exit=$?"
-          grep -E "^test |test result|panicked|left:|right:|ADV92 S7" m1.log
-      - name: "M2: retry on any STATUS_DELETE_PENDING"
-        run: |
-          set +e
-          git checkout -- src
-          sed -i 's/if status == STATUS_DELETE_PENDING && !delete_pending(&handle)? => continue/if status == STATUS_DELETE_PENDING => continue/' src/coordination/db_dir/windows_probe.rs
-          git diff --stat
-          cargo test --lib -p skuld coordination::db_dir::windows_probe_tests -- --nocapture --test-threads=1 > m2.log 2>&1; echo "exit=$?"
-          grep -E "^test |test result|panicked" m2.log
-      - name: "M3: drop the pid from probe names"
-        run: |
-          set +e
-          git checkout -- src
-          sed -i 's/format!(".skuld-probe-{pid}-{n}")/format!(".skuld-probe-{n}")/' src/coordination/db_dir/windows_probe.rs
-          git diff --stat
-          cargo test --lib -p skuld coordination::db_dir:: -- --test-threads=1 > m3.log 2>&1; echo "exit=$?"
-          grep -E "^test |test result|panicked" m3.log

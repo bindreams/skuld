@@ -224,9 +224,13 @@ fn adv92_measure() {
             nt_create(&h, "held", std_access())
         );
         println!(
-            "ADV92 S3 names with ':' -> {:#010x}",
-            nt_create(&h, "a:b", std_access())
+            "ADV92 S3 name=existing dir, FILE_CREATE without FILE_NON_DIRECTORY_FILE: create={:#010x}",
+            nt_open(&h, "sub", std_access(), FILE_CREATE, FILE_DELETE_ON_CLOSE | FILE_SYNCHRONOUS_IO_NONALERT)
         );
+        let mut it = ["sub", "fresh"].into_iter();
+        let r = probe(&d, || it.next().unwrap().to_string());
+        println!("ADV92 S3 probe(names=[sub(existing dir), fresh]) -> {r:?}");
+        println!("ADV92 S3 listing: {:?}", listing(&d));
     }
     // S4: RootDirectory handle access rights: which ones are needed for a relative create?
     {
