@@ -1,6 +1,6 @@
 //! Tests for async `#[skuld::test]` support.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use skuld::test_name;
 
@@ -97,6 +97,84 @@ pub fn assert_runtime_context_probe_ran() {
     );
 }
 
+// Custom runtime builder -------------------------------------------------------------------------
+
+static RUNTIME_ARG_RAN: AtomicU32 = AtomicU32::new(0);
+const RUNTIME_ARG_TESTS: u32 = 7;
+
+fn paused_runtime() -> tokio::runtime::Runtime {
+    builders::paused()
+}
+
+mod builders {
+    pub fn paused() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("failed to build paused runtime")
+    }
+}
+
+/// Runs `advance`, which panics unless the clock is paused, then counts the
+/// test. So a count proves the body ran on the builder's runtime.
+async fn advance_then_count() {
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    RUNTIME_ARG_RAN.fetch_add(1, Ordering::Relaxed);
+}
+
+#[skuld::test(runtime = paused_runtime)]
+async fn runtime_arg_uses_the_given_builder() {
+    advance_then_count().await;
+}
+
+#[skuld::test(runtime = builders::paused)]
+async fn runtime_arg_accepts_a_multi_segment_path() {
+    advance_then_count().await;
+}
+
+#[skuld::test(runtime = self::builders::paused, should_panic)]
+async fn runtime_arg_under_should_panic() {
+    advance_then_count().await;
+    panic!("expected");
+}
+
+/// A wrong runtime would panic in `advance` with a different message.
+#[skuld::test(runtime = builders::paused, should_panic = "boom")]
+async fn runtime_arg_under_should_panic_message() {
+    advance_then_count().await;
+    panic!("boom");
+}
+
+#[skuld::test(runtime = builders::paused)]
+async fn runtime_arg_with_result_body() -> Result<(), String> {
+    advance_then_count().await;
+    Ok(())
+}
+
+#[skuld::test(runtime = builders::paused)]
+#[should_panic(expected = "boom")]
+async fn runtime_arg_with_outer_should_panic() {
+    advance_then_count().await;
+    panic!("boom");
+}
+
+/// The fixture's setup runs under the builder's runtime context.
+#[skuld::fixture]
+fn paused_handle() -> Result<tokio::runtime::Handle, String> {
+    tokio::runtime::Handle::try_current().map_err(|e| e.to_string())
+}
+
+#[skuld::test(runtime = builders::paused)]
+async fn runtime_arg_fixture_sees_the_builders_runtime(#[fixture(paused_handle)] handle: &tokio::runtime::Handle) {
+    // `advance` in a spawned task panics (failing the join) unless the clock is paused.
+    handle
+        .spawn(async { tokio::time::advance(std::time::Duration::from_secs(1)).await })
+        .await
+        .expect("the fixture's Handle must belong to the paused runtime");
+    RUNTIME_ARG_RAN.fetch_add(1, Ordering::Relaxed);
+}
+
 // Outer attribute tests --------------------------------------------------------------------------
 
 static ASYNC_OUTER_IGNORE_RAN: AtomicBool = AtomicBool::new(false);
@@ -115,6 +193,11 @@ pub fn assert_outer_ignore_did_not_run() {
 }
 
 pub fn assert_all_ran() {
+    assert_eq!(
+        RUNTIME_ARG_RAN.load(Ordering::Relaxed),
+        RUNTIME_ARG_TESTS,
+        "every runtime = ... test should have run on the paused runtime"
+    );
     assert!(
         BASIC_ASYNC_RAN.load(Ordering::Relaxed),
         "basic_async_test should have executed"

@@ -1,0 +1,5 @@
+error: `runtime = ...` is only valid on an `async fn`, but `sync_with_runtime` is not async
+ --> tests/compile_fail/runtime_on_sync_fn.rs:6:4
+  |
+6 | fn sync_with_runtime() {}
+  |    ^^^^^^^^^^^^^^^^^

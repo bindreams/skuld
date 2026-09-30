@@ -144,6 +144,21 @@ async fn connects_to_server() {
 
 Async tests run on a single-threaded tokio runtime (`current_thread` with `enable_all()`). All existing features — fixtures, `requires`, `should_panic`, `serial`, labels — work with async tests.
 
+To run a test on a different runtime (paused clock, multi-thread), point `runtime` at a `fn() -> tokio::runtime::Runtime`:
+
+```rust
+fn paused() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap()
+}
+
+#[skuld::test(runtime = paused)]
+async fn advances_the_clock() {
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+}
+```
+
+`runtime` on a non-`async` fn, or without skuld's `tokio` feature, is a compile error. A builder that panics fails the test, even under `should_panic`.
+
 Tests may also return `Result<(), E>` where `E: Debug`. An `Err` return fails the test:
 
 ```rust

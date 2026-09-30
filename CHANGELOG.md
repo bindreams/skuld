@@ -22,6 +22,11 @@ All notable changes to this project are documented in this file.
 - **`EnvGuard` restores a non-UTF-8 prior value byte-identically.** It read the
   prior value as UTF-8 and restored a non-UTF-8 one as unset.
 
+### Added
+
+- **`#[skuld::test(runtime = <path>)]`** runs an `async fn` test on the runtime
+  returned by `path: fn() -> tokio::runtime::Runtime`.
+
 ## [0.5.0] - 2026-09-30
 
 ### Breaking

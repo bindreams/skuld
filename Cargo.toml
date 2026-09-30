@@ -73,7 +73,7 @@ windows = { version = "0.62", features = [
 
 [dev-dependencies]
 skuld = { path = ".", features = ["tokio"] }
-tokio = { version = "1", features = ["rt", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["rt", "time", "net", "io-util", "test-util"] }
 # Regression tests install their own tracing subscribers and assert that
 # events reach them (proving skuld no longer competes). Not used by skuld
 # runtime code.
@@ -82,6 +82,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 tracing-log = "0.2"
 log = "0.4"
 trybuild = "1"
+# runtime_requires_tokio_cli.rs writes a scratch crate manifest.
+toml = "1"
 # label_filter_cli.rs parses libtest-mimic's --format json output.
 serde_json = "1"
 # Property-based testing for LabelFilter canonicalization invariants.
@@ -134,6 +136,22 @@ doc = false
 [[bin]]
 name = "duplicate_labels"
 path = "tests/support_bins/duplicate_labels/main.rs"
+test = false
+doc = false
+
+[[test]]
+name = "runtime_requires_tokio_cli"
+path = "tests/runtime_requires_tokio_cli.rs"
+
+[[test]]
+name = "runtime_builder_panic_cli"
+path = "tests/runtime_builder_panic_cli.rs"
+
+# Subject of runtime_builder_panic_cli.rs.
+[[bin]]
+name = "runtime_builder_panic_probe"
+path = "tests/support_bins/runtime_builder_panic_probe/main.rs"
+required-features = ["tokio"]
 test = false
 doc = false
 
