@@ -29,8 +29,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Stage 2 refuses a draft whose target is not on `main`; refuse here,
-      # before anyone reviews a draft that could never be published.
+      # Advisory: it runs from the dispatched ref's own tree, so a ref without
+      # this step skips it, and stage 2's `resolve` is the only enforcing gate.
+      # It fails early, before anyone reviews a draft stage 2 would refuse.
       - name: Require the commit being drafted to be on main
         timeout-minutes: 5
         env:

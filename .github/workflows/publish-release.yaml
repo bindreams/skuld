@@ -35,9 +35,17 @@ concurrency:
 # release tree is data there, except that `cargo` honours its
 # `.cargo/config.toml`: `cargo package --no-verify` runs `build.rustc` and
 # `build.rustc-wrapper` from it, and `cargo publish` runs a
-# `credential-provider` (`cargo metadata --no-deps` runs neither). `resolve`
-# requires the tree to be on `main`, so that config has no more power than an
-# edit to this workflow.
+# `credential-provider` (`cargo metadata --no-deps` runs neither).
+#
+# Trust basis for that tree: `resolve` refuses a draft target that is not on
+# `main` at or after the floor pinned in require-target-on-main.sh. Every commit
+# there is a squash commit of a PR that passed required CI (the ruleset needs no
+# approving reviews, and a later-reverted commit stays eligible), so that config
+# has no more power than an edit to this workflow. This rests on the
+# default-branch ruleset (linear history, squash-only merges, no force-push or
+# deletion, no bypass actors) and on the default branch being `main`. The
+# Deploy environment's branch policy is separate: it restricts only the ref this
+# workflow is dispatched from.
 #
 # `actions/checkout` uses `github.token` in every job (its default `token`
 # input); with `persist-credentials: false` it leaves nothing in `.git/config`.
@@ -129,10 +137,7 @@ jobs:
           # hide the one value manual recovery needs.
           echo "Resolved $TAG -> $TARGET" | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # The Deploy environment's branch policy restricts the ref this workflow
-      # is dispatched from, not the commit it publishes, and a draft can target
-      # any commit a writer can push. Nothing from the release tree is checked
-      # out or run until this passes.
+      # Nothing from the release tree is checked out or run until this passes.
       - name: Require the draft's target to be on main
         timeout-minutes: 5
         env:
@@ -280,9 +285,8 @@ jobs:
     # declares it.
     #
     # Its deployment branch policy allows only `main`, so a run dispatched on any
-    # other ref cannot run this job. That restricts the dispatch ref only, not
-    # the commit that is published: `resolve` requires the draft's target to be
-    # on `main`. It has no reviewer rule. See CONTRIBUTING.md.
+    # other ref cannot run this job. It has no reviewer rule. See CONTRIBUTING.md.
+    # The trust basis for the published tree is in the header.
     #
     # Real preflight (version validation, CI matrix, cargo publish dry-run)
     # happens in draft-release.yaml before a draft can exist. This workflow
@@ -390,8 +394,7 @@ jobs:
       # Re-derive the archives from the source tree and compare them to what
       # the build job verified. `--no-verify` skips the compile, so no build
       # script or proc-macro runs, and the bytes come from source, not from the
-      # artifact. (Programs the tree's `.cargo/config.toml` names, such as
-      # `build.rustc-wrapper`, do still run; see the note at the top.) The
+      # artifact. (`.cargo/config.toml` programs still run; see the header.) The
       # artifact only carries the hashes to hold them to. Any difference fails
       # closed: the tree that was built is not the tree about to be uploaded.
       - name: Re-derive the packages and check them against the build job
