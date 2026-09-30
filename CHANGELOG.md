@@ -22,12 +22,8 @@ All notable changes to this project are documented in this file.
 - **`EnvGuard` restores a non-UTF-8 prior value byte-identically.** It read the
   prior value as UTF-8 and restored a non-UTF-8 one as unset.
 - **On Windows, a writable coordination directory no longer fails the
-  up-front usability check at random** with `Access is denied`. The probe
-  file's name could be held by a deleted file still open elsewhere, which
-  Windows reports as access denied. Probe names now include the process id,
-  and a name held that way is skipped. A directory that denies file
-  creation now gets an error naming the NTSTATUS, and one being deleted gets
-  an error saying so instead of `Access is denied`.
+  up-front usability check at random** with `Access is denied`. A directory
+  being deleted now reports that instead of `Access is denied`.
 
 ### Added
 

@@ -35,6 +35,7 @@ pub(super) fn resolve(
     override_dir: Option<&OsStr>,
     exe: impl FnOnce() -> io::Result<PathBuf>,
 ) -> Result<PathBuf, String> {
+    let mut created = Ok(());
     let dir = match override_dir {
         Some(dir) => {
             let dir = Path::new(dir);
@@ -43,12 +44,9 @@ pub(super) fn resolve(
                     "{DB_DIR_ENV} must be an absolute path, got {dir:?} (a relative path would depend on the working directory)"
                 ));
             }
-            // An existing non-directory, or an entry that cannot be queried (on Windows, one being
-            // deleted), is left for `check_usable` to reject with a clear message.
-            if matches!(dir.try_exists(), Ok(false)) {
-                create_dir_all_open(dir)
-                    .map_err(|e| format!("cannot create coordination DB directory {dir:?} (from {DB_DIR_ENV}): {e}"))?;
-            }
+            // Create rather than check first. A failure is reported only if `check_usable` passes,
+            // since its diagnosis (not a directory, denied, being deleted) names the cause better.
+            created = create_dir_all_open(dir);
             dir.to_path_buf()
         }
         None => {
@@ -66,6 +64,7 @@ pub(super) fn resolve(
     check_usable(&dir).map_err(|e| {
         format!("coordination DB directory {dir:?} is unusable: {e}; set {DB_DIR_ENV} to a writable absolute path")
     })?;
+    created.map_err(|e| format!("cannot create coordination DB directory {dir:?} (from {DB_DIR_ENV}): {e}"))?;
     Ok(dir)
 }
 
