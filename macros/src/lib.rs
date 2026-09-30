@@ -6,6 +6,16 @@ use syn::{
     ReturnType, Token, Type, Visibility,
 };
 
+/// Error if `key` was already given in this attribute; otherwise record it.
+fn reject_duplicate_key(key: &Ident, seen: &mut Vec<String>) -> syn::Result<()> {
+    let name = key.to_string();
+    if seen.contains(&name) {
+        return Err(syn::Error::new(key.span(), format!("duplicate argument `{name}`")));
+    }
+    seen.push(name);
+    Ok(())
+}
+
 // #[skuld::test] argument parsing =================================================================
 
 /// Parsed arguments for `#[skuld::test(...)]`.
@@ -39,6 +49,7 @@ enum ShouldPanicArg {
 impl Parse for TestArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut args = TestArgs::default();
+        let mut seen = Vec::new();
 
         if input.is_empty() {
             return Ok(args);
@@ -46,6 +57,7 @@ impl Parse for TestArgs {
 
         loop {
             let key: Ident = input.parse()?;
+            reject_duplicate_key(&key, &mut seen)?;
             match key.to_string().as_str() {
                 "requires" => {
                     let _eq: Token![=] = input.parse()?;
@@ -196,6 +208,7 @@ struct FixtureArgs {
 impl Parse for FixtureArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut args = FixtureArgs::default();
+        let mut seen = Vec::new();
 
         if input.is_empty() {
             return Ok(args);
@@ -203,6 +216,7 @@ impl Parse for FixtureArgs {
 
         loop {
             let key: Ident = input.parse()?;
+            reject_duplicate_key(&key, &mut seen)?;
             match key.to_string().as_str() {
                 "requires" => {
                     let _eq: Token![=] = input.parse()?;
@@ -331,33 +345,42 @@ struct FixtureParam {
 }
 
 /// Parse a `#[fixture]` or `#[fixture(name)]` attribute on a function parameter.
-fn parse_fixture_param(attr: &syn::Attribute, pat_type: &syn::PatType) -> FixtureParam {
+fn parse_fixture_param(attr: &syn::Attribute, pat_type: &syn::PatType) -> syn::Result<FixtureParam> {
     let binding = (*pat_type.pat).clone();
     let param_ty = pat_type.ty.clone();
     let target_ty = strip_reference(&param_ty);
 
     // Fixture name: from #[fixture(name)] or from the parameter name.
-    let fixture_name = parse_fixture_name_arg(attr).unwrap_or_else(|| {
+    let fixture_name = match parse_fixture_name_arg(attr)? {
+        Some(name) => name,
         // Use the parameter's binding pattern as the name.
-        binding_to_name(&binding)
-    });
+        None => binding_to_name(&binding),
+    };
 
-    FixtureParam {
+    Ok(FixtureParam {
         binding,
         fixture_name,
         target_ty,
         param_ty,
+    })
+}
+
+/// The parameter's `#[fixture]` attribute, if any. A second one is an error.
+fn find_fixture_attr(pat_type: &syn::PatType) -> syn::Result<Option<&syn::Attribute>> {
+    let mut attrs = pat_type.attrs.iter().filter(|a| a.path().is_ident("fixture"));
+    let first = attrs.next();
+    match attrs.next() {
+        Some(second) => Err(syn::Error::new_spanned(second, "duplicate #[fixture] attribute")),
+        None => Ok(first),
     }
 }
 
 /// Extract the name argument from `#[fixture(name)]`. Returns `None` for bare `#[fixture]`.
-fn parse_fixture_name_arg(attr: &syn::Attribute) -> Option<String> {
+fn parse_fixture_name_arg(attr: &syn::Attribute) -> syn::Result<Option<String>> {
     match &attr.meta {
-        syn::Meta::List(list) => {
-            let ident: Ident = syn::parse2(list.tokens.clone()).ok()?;
-            Some(ident.to_string())
-        }
-        _ => None,
+        syn::Meta::Path(_) => Ok(None),
+        syn::Meta::List(list) => syn::parse2::<Ident>(list.tokens.clone()).map(|ident| Some(ident.to_string())),
+        syn::Meta::NameValue(_) => Err(syn::Error::new_spanned(attr, "expected #[fixture] or #[fixture(name)]")),
     }
 }
 
@@ -485,9 +508,15 @@ fn expand_test_def(args: &mut TestArgs, func: ItemFn) -> TokenStream {
 
     for param in &func.sig.inputs {
         if let FnArg::Typed(pat_type) = param {
-            let fixture_attr = pat_type.attrs.iter().find(|a| a.path().is_ident("fixture"));
+            let fixture_attr = match find_fixture_attr(pat_type) {
+                Ok(attr) => attr,
+                Err(e) => return e.to_compile_error().into(),
+            };
             if let Some(attr) = fixture_attr {
-                fixture_params.push(parse_fixture_param(attr, pat_type));
+                match parse_fixture_param(attr, pat_type) {
+                    Ok(param) => fixture_params.push(param),
+                    Err(e) => return e.to_compile_error().into(),
+                }
 
                 let mut clean = pat_type.clone();
                 clean.attrs.retain(|a| !a.path().is_ident("fixture"));
@@ -831,9 +860,15 @@ fn expand_fixture_def(args: FixtureArgs, func: &mut ItemFn) -> TokenStream {
 
     for param in &func.sig.inputs {
         if let FnArg::Typed(pat_type) = param {
-            let fixture_attr = pat_type.attrs.iter().find(|a| a.path().is_ident("fixture"));
+            let fixture_attr = match find_fixture_attr(pat_type) {
+                Ok(attr) => attr,
+                Err(e) => return e.to_compile_error().into(),
+            };
             if let Some(attr) = fixture_attr {
-                dep_params.push(parse_fixture_param(attr, pat_type));
+                match parse_fixture_param(attr, pat_type) {
+                    Ok(param) => dep_params.push(param),
+                    Err(e) => return e.to_compile_error().into(),
+                }
             } else {
                 clean_inputs.push(param.clone());
             }

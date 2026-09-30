@@ -1,0 +1,47 @@
+error: duplicate argument `requires`
+ --> tests/compile_fail/duplicate_test_arg.rs:8:32
+  |
+8 | #[skuld::test(requires = [ok], requires = [ok])]
+  |                                ^^^^^^^^
+
+error: duplicate argument `name`
+  --> tests/compile_fail/duplicate_test_arg.rs:11:27
+   |
+11 | #[skuld::test(name = "a", name = "b")]
+   |                           ^^^^
+
+error: duplicate argument `labels`
+  --> tests/compile_fail/duplicate_test_arg.rs:14:29
+   |
+14 | #[skuld::test(labels = [A], labels = [A])]
+   |                             ^^^^^^
+
+error: duplicate argument `ignore`
+  --> tests/compile_fail/duplicate_test_arg.rs:17:23
+   |
+17 | #[skuld::test(ignore, ignore = "why")]
+   |                       ^^^^^^
+
+error: duplicate argument `serial`
+  --> tests/compile_fail/duplicate_test_arg.rs:20:23
+   |
+20 | #[skuld::test(serial, serial = A)]
+   |                       ^^^^^^
+
+error: duplicate argument `should_panic`
+  --> tests/compile_fail/duplicate_test_arg.rs:23:29
+   |
+23 | #[skuld::test(should_panic, should_panic = "x")]
+   |                             ^^^^^^^^^^^^
+
+error: duplicate argument `labels`
+  --> tests/compile_fail/duplicate_test_arg.rs:26:41
+   |
+26 | #[skuld::test(labels = [A], name = "x", labels = [A])]
+   |                                         ^^^^^^
+
+error: duplicate argument `requires`
+  --> tests/compile_fail/duplicate_test_arg.rs:29:46
+   |
+29 | #[skuld::test(requires = [ok], should_panic, requires = [ok])]
+   |                                              ^^^^^^^^

@@ -1,0 +1,41 @@
+error: unexpected token
+  --> tests/compile_fail/fixture_param_malformed.rs:12:30
+   |
+12 | fn test_two_names(#[fixture(a, b)] a: &u8) {}
+   |                              ^
+
+error: expected #[fixture] or #[fixture(name)]
+  --> tests/compile_fail/fixture_param_malformed.rs:15:20
+   |
+15 | fn test_name_value(#[fixture = "a"] a: &u8) {}
+   |                    ^^^^^^^^^^^^^^^^
+
+error: expected identifier
+  --> tests/compile_fail/fixture_param_malformed.rs:18:26
+   |
+18 | fn test_string(#[fixture("a")] a: &u8) {}
+   |                          ^^^
+
+error: unexpected token
+  --> tests/compile_fail/fixture_param_malformed.rs:21:32
+   |
+21 | fn test_assignment(#[fixture(a = b)] a: &u8) {}
+   |                                ^
+
+error: unexpected token
+  --> tests/compile_fail/fixture_param_malformed.rs:24:33
+   |
+24 | fn fixture_two_names(#[fixture(a, b)] a: &u8) -> Result<u8, String> {
+   |                                 ^
+
+error: expected #[fixture] or #[fixture(name)]
+  --> tests/compile_fail/fixture_param_malformed.rs:29:23
+   |
+29 | fn fixture_name_value(#[fixture = "a"] a: &u8) -> Result<u8, String> {
+   |                       ^^^^^^^^^^^^^^^^
+
+error: expected identifier
+  --> tests/compile_fail/fixture_param_malformed.rs:34:29
+   |
+34 | fn fixture_string(#[fixture("a")] a: &u8) -> Result<u8, String> {
+   |                             ^^^

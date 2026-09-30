@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Breaking
+
+- **A repeated argument in `#[skuld::test(...)]` or `#[skuld::fixture(...)]` is
+  now a compile error.** The later value used to silently replace the earlier
+  one (`labels = [A], labels = [B]` dropped `A`); merge the values instead. The
+  same goes for a repeated `#[fixture]` on one parameter, and for a malformed
+  one (`#[fixture(a, b)]`, `#[fixture = "a"]`, `#[fixture("a")]`), which
+  silently fell back to the parameter's own name.
+
 ## [0.5.0] - 2026-09-30
 
 ### Breaking
