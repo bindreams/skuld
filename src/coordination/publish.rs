@@ -1,8 +1,8 @@
 //! Unix-only atomic publish for the coordination DB. Deliberately minimal in
 //! scope: no real threat model here.
 //!
-//! Whichever uid first opens `SKULD_TARGET_PROFILE_DIR/.skuld.db` would
-//! otherwise create it at `0644 & ~umask`, locking out every other uid. The
+//! Whichever uid first opens `.skuld.db` would otherwise create it at `0644 & ~umask`, locking
+//! out every other uid. The
 //! one requirement this module exists for: `.skuld.db` gets created at
 //! `0666`, whichever uid gets there first. It does this by creating a
 //! `0600` temp with `O_EXCL` outside the `.skuld.db*` glob, `fchmod`ing it
@@ -66,11 +66,11 @@ pub(super) fn ensure_published_with(db_path: &Path, publish: impl FnOnce(&Path, 
     if std::fs::symlink_metadata(db_path).is_ok() {
         return;
     }
-    let dir = db_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    publish(dir, db_path);
+    debug_assert!(
+        db_path.is_absolute(),
+        "coordination DB path must be absolute: {db_path:?}"
+    );
+    publish(db_path.parent().expect("an absolute path has a parent"), db_path);
 }
 
 // Publish atomically =====
@@ -161,7 +161,11 @@ fn try_create_publish_temp(dir: &Path, tmp_path: &Path) -> CreateTempOutcome {
         if err.raw_os_error() == Some(libc::EEXIST) {
             return CreateTempOutcome::NameTaken;
         }
-        panic!("skuld: could not create publish temp {tmp_path:?} in {dir:?}: {err}");
+        panic!(
+            "skuld: could not create publish temp {tmp_path:?} in {dir:?}: {err} \
+             ({})",
+            super::DB_DIR_HINT
+        );
     }
     // Safety: fd was just returned by a successful open() above; File takes
     // ownership and closes it on drop.
@@ -257,7 +261,7 @@ pub(super) fn handle_rename_result(dir: &Path, tmp_path: &Path, target: &Path, r
 /// report the same OS-visible pid (possible across pid namespaces) is not
 /// ruled out by this scheme and is instead handled by retry — see
 /// `create_publish_temp_with`.
-fn make_temp_path(dir: &Path) -> PathBuf {
+pub(super) fn make_temp_path(dir: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -362,6 +366,12 @@ compile_error!(
     "skuld's coordination DB publish needs an atomic no-replace rename primitive; \
      this Unix target isn't one of the ones it's implemented for (Linux, Android, macOS)"
 );
+
+/// `rename(2)` `from` to `to` without replacing an existing `to`, for the directories
+/// `db_dir` publishes.
+pub(super) fn rename_no_replace(from: &Path, to: &Path) -> Result<(), RenameError> {
+    atomic_rename_no_replace(&to_cstring(from), &to_cstring(to))
+}
 
 // Shared helpers =====
 

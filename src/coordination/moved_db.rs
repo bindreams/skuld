@@ -247,7 +247,12 @@ impl DbIdentity {
         if self.has_moved(conn, path) {
             format!("skuld coordination DB {path:?} was deleted or replaced mid-run: {detail}")
         } else {
-            format!("skuld: {context} at {path:?}: {detail}")
+            let hint = if failure.dir_unusable() {
+                format!(" ({})", super::DB_DIR_HINT)
+            } else {
+                String::new()
+            };
+            format!("skuld: {context} at {path:?}: {detail}{hint}")
         }
     }
 }
@@ -274,6 +279,19 @@ impl Failure {
         // Safety: `conn.handle()` is a valid `sqlite3*` while `conn` is borrowed.
         let errno = records_errno.then(|| unsafe { rusqlite::ffi::sqlite3_system_errno(conn.handle()) });
         Self { err, errno }
+    }
+
+    /// True for the error classes an unwritable or unreadable directory produces.
+    fn dir_unusable(&self) -> bool {
+        matches!(
+            self.err.sqlite_error_code(),
+            Some(
+                rusqlite::ErrorCode::CannotOpen
+                    | rusqlite::ErrorCode::ReadOnly
+                    | rusqlite::ErrorCode::SystemIoFailure
+                    | rusqlite::ErrorCode::PermissionDenied
+            )
+        )
     }
 
     pub(crate) fn error(&self) -> &rusqlite::Error {

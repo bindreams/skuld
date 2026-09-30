@@ -308,3 +308,10 @@ fn ensure_published_publishes_when_the_target_is_absent() {
 
     assert!(called, "the publish closure must run when the target is absent");
 }
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "absolute")]
+fn ensure_published_rejects_a_relative_db_path() {
+    super::publish::ensure_published_with(std::path::Path::new(".skuld.db"), |_, _| {});
+}

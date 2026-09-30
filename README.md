@@ -275,7 +275,7 @@ fn my_test(#[fixture] env: &EnvGuard) {
 }
 ```
 
-All serial tests run under a cross-process file lock (`target/{profile}/.skuld-serial.lock`). Under `cargo test` the lock is trivially uncontended; under `cargo nextest run` (process-per-test) it serializes across processes automatically. Non-serial tests are unaffected and may still run in parallel.
+All serial tests run under a cross-process lock in a SQLite database, `.skuld.db`, located at run time (override with an absolute `SKULD_DB_DIR`; see [Serial tests](docs/src/serial.md)). Under `cargo test` the lock is trivially uncontended; under `cargo nextest run` (process-per-test) it serializes across processes automatically. Non-serial tests are unaffected and may still run in parallel.
 
 ## Dynamic tests
 

@@ -4,6 +4,42 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A test binary run from anywhere other than where it was built no longer
+  panics on every test.** The coordination database's directory was baked
+  into the binary at build time; it is now resolved at run time from the
+  canonicalized executable path (`<profile>/`: the parent of `deps/` or
+  `examples/`, or the profile directory of cargo's `build/<pkg>/<hash>/out/`
+  layout, each only with a positive cargo marker: a hashed executable name,
+  a `.fingerprint` directory, or a `CACHEDIR.TAG`), so moved build trees,
+  extracted nextest archives and read-only workspace mounts work. The path is
+  resolved once per process.
+
+### Breaking
+
+- **The coordination database follows the executable, not the build.** A
+  binary copied out of a `target/` tree uses (and must be able to create
+  `.skuld.db` in) its own directory. Previously it used the original build's
+  profile directory, which need not exist at run time.
+- **With `build.build-dir` set, test binaries and `CARGO_BIN_EXE_*` binaries
+  no longer share a database.** Test binaries resolve to
+  `<build-dir>/<profile>`; binaries cargo uplifts to `<target-dir>/<profile>`
+  (the ones `CARGO_BIN_EXE_*` names) resolve there instead. Before, both used
+  the build-dir path baked in at build time.
+- **An unusable coordination directory now panics up front**, with one
+  message naming the directory and `SKULD_DB_DIR`, for a read-only mount or
+  directory (whether or not `.skuld.db` already exists), an unreadable
+  directory, a non-directory, and a Windows directory denying writes. Errors
+  from the lock open and SQLite open paths name `SKULD_DB_DIR` too. There is no per-process
+  fallback, since that would silently disable cross-process locking.
+- **New `SKULD_DB_DIR` environment variable**, read before the executable
+  path is consulted. It must be absolute (a relative or empty value panics);
+  directories skuld creates for it are published atomically at mode 0777
+  regardless of umask. Every
+  run sharing one shares coordination.
+- **The internal build-time variable `SKULD_TARGET_PROFILE_DIR` is gone.**
+
 ## [0.4.0] - 2026-09-30
 
 ### Breaking

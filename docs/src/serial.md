@@ -49,6 +49,14 @@ Labels used in serial expressions must be `Label` constants in scope (defined wi
 
 Serial tests are coordinated through a SQLite database, automatically managed by skuld. This works across multiple test processes — if two test binaries run concurrently, their serial constraints are respected across process boundaries.
 
+The database is `.skuld.db`, located at run time from the test executable's path, so a moved or archived test binary keeps working:
+
+- `SKULD_DB_DIR`, if set, names the directory (absolute; created world-writable if missing).
+- Otherwise the directory is the build profile directory (`target/<profile>/`): the parent of `deps/` or `examples/`, or the profile directory of cargo's `build/<pkg>/<hash>/out/` layout. This step up happens only with a positive cargo marker: a cargo-hashed executable name (`name-<16 hex digits>`), a `.fingerprint` directory in the profile directory, or a `CACHEDIR.TAG` beside it. A binary anywhere else, such as a copy, uses its own directory.
+- The path is resolved once per process, from the canonicalized executable path.
+
+Only binaries that resolve to the same directory coordinate with each other, and every run sharing a `SKULD_DB_DIR` shares coordination, including unrelated workspaces and mixed skuld versions. The directory must exist and be readable and writable (for example, not a read-only mount); otherwise the run panics naming the directory and `SKULD_DB_DIR`. Directories skuld creates for `SKULD_DB_DIR` are published atomically at mode 0777, whatever the umask. Skuld never falls back to per-process coordination.
+
 ## Serial fixtures
 
 Fixtures can declare `serial` too. Any test that uses a serial fixture automatically inherits the serial constraint:
