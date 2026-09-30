@@ -110,6 +110,24 @@ mod unix {
         std::fs::remove_dir_all(&path).unwrap();
         assert!(names_path(&err, &path), "{err}");
     }
+
+    #[test]
+    fn a_failed_removal_on_drop_warns_naming_the_path() {
+        assert_not_root();
+        let warnings = CapturedWarnings::start();
+        let dir = TempDir::new().unwrap();
+        let locked = dir.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("f"), b"").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let path = dir.path().to_path_buf();
+
+        drop(dir);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+        let text = warnings.text();
+        assert!(text.contains("could not remove") && names_path(&text, &path), "{text}");
+    }
 }
 
 #[cfg(windows)]
@@ -180,6 +198,40 @@ mod windows {
         std::fs::remove_dir_all(&path).unwrap();
         assert!(names_path(&err, &path), "{err}");
     }
+
+    #[test]
+    fn a_failed_removal_on_drop_warns_naming_the_path() {
+        let warnings = CapturedWarnings::start();
+        let dir = TempDir::new().unwrap();
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .open(dir.join("f"))
+            .unwrap();
+        let path = dir.path().to_path_buf();
+
+        drop(dir);
+        drop(held);
+        std::fs::remove_dir_all(&path).unwrap();
+        let text = warnings.text();
+        assert!(text.contains("could not remove") && names_path(&text, &path), "{text}");
+    }
+
+    /// `D:rel` is relative to drive D's working directory; tempfile alone would keep it relative.
+    #[test]
+    fn a_drive_relative_parent_hands_out_an_absolute_path() {
+        let holder = TempDir::new_in(".").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let drive = &cwd.to_str().unwrap()[..2];
+        assert!(drive.ends_with(':'), "precondition: {cwd:?} has a drive letter");
+        let parent = format!("{drive}{}", holder.file_name().unwrap().to_str().unwrap());
+        assert!(!Path::new(&parent).is_absolute(), "precondition: {parent}");
+
+        let dir = TempDir::new_in(&parent).unwrap();
+        assert!(dir.path().is_absolute(), "{:?}", dir.path());
+        assert_eq!(dir.parent(), Some(holder.path()));
+    }
 }
 
 // Parity with tempfile -----
@@ -242,4 +294,108 @@ fn a_parent_that_is_a_file_is_an_error_naming_it() {
     };
     let err = err.to_string();
     assert!(names_path(&err, &parent), "{err}");
+}
+
+// Sanitiser -----
+
+use super::temp_dir::file_name_safe;
+
+#[test]
+fn every_forbidden_character_becomes_an_underscore() {
+    for c in ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\u{1}', '\u{7f}'] {
+        assert_eq!(file_name_safe(&format!("a{c}b")), "a_b", "{c:?}");
+    }
+}
+
+#[test]
+fn a_dos_device_name_before_the_first_dot_is_escaped() {
+    for (prefix, want) in [
+        ("nul.json", "_nul.json"),
+        ("NUL.x", "_NUL.x"),
+        ("con .y", "_con .y"),
+        ("COM1.z", "_COM1.z"),
+        ("com0", "_com0"),
+        ("LPT9.txt", "_LPT9.txt"),
+        ("COM¹.w", "_COM¹.w"),
+        ("lpt³", "_lpt³"),
+        ("CONIN$.q", "_CONIN$.q"),
+        ("conout$", "_conout$"),
+        ("aux", "_aux"),
+        ("prn.a.b", "_prn.a.b"),
+    ] {
+        assert_eq!(file_name_safe(prefix), want, "{prefix}");
+    }
+}
+
+#[test]
+fn a_name_that_only_starts_like_a_device_is_left_alone() {
+    for prefix in [
+        "plain.json",
+        "console",
+        "nul_x",
+        "comx",
+        "com10",
+        "lpt",
+        "auxiliary.txt",
+        ".nul",
+    ] {
+        assert_eq!(file_name_safe(prefix), prefix, "{prefix}");
+    }
+}
+
+/// The budget is in bytes: a multibyte prefix must still leave the whole name within 255 bytes.
+#[test]
+fn the_prefix_budget_counts_bytes() {
+    let prefix = "😀".repeat(100);
+    let safe = file_name_safe(&prefix);
+    let whole = format!("{safe}-4294967295-abcdef");
+    assert!(whole.len() <= 255, "{} bytes", whole.len());
+    assert!(safe.chars().all(|c| c == '😀'), "{safe}");
+    assert!(!safe.is_empty());
+
+    let parent = TempDir::new().unwrap();
+    let dir = TempDir::with_prefix_in(&prefix, &parent).unwrap();
+    assert!(dir.file_name().unwrap().len() <= 255);
+}
+
+// Removal warnings -----
+
+use super::temp_dir::WARNINGS;
+
+/// Captures this thread's removal warnings until dropped.
+struct CapturedWarnings;
+
+impl CapturedWarnings {
+    fn start() -> Self {
+        WARNINGS.set(Some(Vec::new()));
+        CapturedWarnings
+    }
+
+    fn text(&self) -> String {
+        WARNINGS.with_borrow(|w| String::from_utf8_lossy(w.as_deref().unwrap_or_default()).into_owned())
+    }
+}
+
+impl Drop for CapturedWarnings {
+    fn drop(&mut self) {
+        WARNINGS.set(None);
+    }
+}
+
+#[test]
+fn close_leaves_nothing_for_drop_to_warn_about() {
+    let warnings = CapturedWarnings::start();
+    let dir = TempDir::new().unwrap();
+    dir.close().unwrap();
+    assert_eq!(warnings.text(), "");
+}
+
+#[test]
+fn a_dropped_directory_is_removed_without_a_warning() {
+    let warnings = CapturedWarnings::start();
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+    drop(dir);
+    assert!(!path.exists());
+    assert_eq!(warnings.text(), "");
 }
