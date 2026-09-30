@@ -26,8 +26,8 @@ inventory = "0.3"
 libtest-mimic = "0.8"
 # Needed for clap::Parser trait (Arguments::parse_from); libtest-mimic doesn't re-export it.
 clap = { version = "4", features = ["derive"] }
-# TempDir needs Builder::disable_cleanup (3.20), an absolute make_in base (3.17) and
-# getrandom re-seeding after 3 taken names (3.15).
+# TempDir needs Builder::disable_cleanup, an absolute make_in base and getrandom re-seeding
+# (all in 3.20 or earlier; 3.27 is the tested floor).
 tempfile = "3.27"
 # HFS+ counts a name's length after canonical decomposition, so TempDir budgets names in NFD.
 unicode-normalization = "0.1"

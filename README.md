@@ -181,7 +181,7 @@ use skuld::test_name;
 
 #[skuld::fixture(deref)]
 fn scratch_dir(#[fixture(test_name)] name: &str) -> Result<skuld::TempDir, String> {
-    // `test_name` is a built-in fixture, as is `temp_dir`, which this resembles.
+    // `test_name` is a built-in fixture.
     skuld::TempDir::new().map_err(|e| format!("cannot create a scratch dir for {name}: {e}"))
 }
 

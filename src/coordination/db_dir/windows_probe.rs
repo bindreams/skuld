@@ -2,8 +2,8 @@
 //! file in the directory with `FILE_DELETE_ON_CLOSE`: the file goes away when its handle closes,
 //! even if the process is killed first.
 //!
-//! Opens are native (`crate::win_nt`), because Win32 folds `STATUS_DELETE_PENDING` into `ERROR_ACCESS_DENIED`,
-//! indistinguishable from an ACL denial. A taken name (`STATUS_OBJECT_NAME_COLLISION`, or
+//! Opens are native (`crate::win_nt`), so `STATUS_DELETE_PENDING` stays distinguishable from an
+//! ACL denial. A taken name (`STATUS_OBJECT_NAME_COLLISION`, or
 //! `STATUS_DELETE_PENDING` for an entry deleted but still open elsewhere) does not make the
 //! directory unusable; the probe moves to the next name. `STATUS_DELETE_PENDING` also means the
 //! directory itself is being deleted, which no name gets past, so the directory's own

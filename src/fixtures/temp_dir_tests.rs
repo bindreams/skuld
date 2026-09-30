@@ -8,7 +8,7 @@ fn names_path(err: &str, path: &Path) -> bool {
     err.contains(path.to_str().unwrap()) || err.contains(debug.trim_matches('"'))
 }
 
-/// Create the directory `path` the way `TempDir` does.
+/// The way `TempDir` does.
 fn create(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     return create_dir(path);
@@ -234,8 +234,6 @@ mod windows {
     }
 }
 
-// Parity with tempfile -----
-
 #[test]
 fn a_relative_parent_hands_out_an_absolute_path() {
     let dir = TempDir::new_in(".").unwrap();
@@ -295,8 +293,6 @@ fn a_parent_that_is_a_file_is_an_error_naming_it() {
     let err = err.to_string();
     assert!(names_path(&err, &parent), "{err}");
 }
-
-// Sanitiser -----
 
 use super::temp_dir::{file_name_safe, NAME_MAX, RANDOM_LEN};
 
@@ -398,8 +394,6 @@ fn a_long_prefix_is_cut_so_the_created_name_fits() {
     }
 }
 
-// Retries -----
-
 #[test]
 fn a_taken_name_is_retried_with_a_fresh_name() {
     let parent = TempDir::new().unwrap();
@@ -432,8 +426,6 @@ fn any_other_error_stops_after_one_attempt() {
     assert_eq!(attempts, 1, "{err}");
 }
 
-// Fixture -----
-
 #[test]
 fn the_fixture_hands_out_a_canonical_path_for_any_test_name() {
     const NAME: &str = "weird/na:me*?\"<>|.json";
@@ -449,8 +441,6 @@ fn the_fixture_hands_out_a_canonical_path_for_any_test_name() {
     drop(handle);
     assert!(!path.exists(), "{path:?}");
 }
-
-// Removal warnings -----
 
 use super::temp_dir::WARNINGS;
 
@@ -490,4 +480,15 @@ fn a_dropped_directory_is_removed_without_a_warning() {
     drop(dir);
     assert!(!path.exists());
     assert_eq!(warnings.text(), "");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_non_name_failure_that_maps_to_already_exists_is_not_retried() {
+    use super::temp_dir::not_retried;
+    let e = not_retried(io::Error::new(io::ErrorKind::AlreadyExists, "not a name"));
+    assert_ne!(e.kind(), io::ErrorKind::AlreadyExists);
+    assert!(e.to_string().contains("not a name"), "{e}");
+    let e = not_retried(io::Error::new(io::ErrorKind::NotFound, "gone"));
+    assert_eq!(e.kind(), io::ErrorKind::NotFound);
 }

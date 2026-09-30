@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 
 /// A temporary directory, removed with its contents on drop.
 ///
-/// Names are `<prefix>-<pid>-<6 random characters>`, created in an absolute parent through
-/// [`tempfile::Builder::make_in`], which retries a taken name with fresh randomness. On Windows a
-/// name held by an entry that is deleted but still open elsewhere counts as taken; Win32 would
-/// report it as access denied. After tempfile's attempt limit (65,536 taken names) creation gives
-/// up with `AlreadyExists`.
+/// Names are `<prefix>-<pid>-<6 random characters>`. A taken name is retried with a fresh one (on
+/// Windows this includes a name held by an entry that is deleted but still open); after 65,536
+/// taken names in a row, tempfile's limit, creation fails with `AlreadyExists`. Only a taken name
+/// is retried: any other failure, a parent being deleted included, fails at once. Names are
+/// re-seeded from the OS's randomness after 3 taken ones, so hitting the limit takes predicting it.
 ///
 /// On Unix the directory is created with mode 0700. On Windows it inherits the parent's ACL.
 ///
@@ -40,7 +40,7 @@ impl TempDir {
         Self::with_prefix_in(".tmp", parent.as_ref())
     }
 
-    /// A new directory in `parent`, named after `prefix` made safe for a file name.
+    /// A new directory in `parent`, named after `prefix`.
     pub(crate) fn with_prefix_in(prefix: &str, parent: &Path) -> io::Result<Self> {
         let parent = std::path::absolute(parent).map_err(|e| io::Error::new(e.kind(), format!("{e}: {parent:?}")))?;
         #[cfg(unix)]
@@ -91,14 +91,16 @@ pub(crate) const RANDOM_LEN: usize = 6;
 /// The longest file name in bytes (Unix) or UTF-16 units (Windows) that common file systems accept.
 pub(crate) const NAME_MAX: usize = 255;
 
-/// `prefix` made safe as the start of a file name: path separators, `:`, the other characters
-/// Windows forbids in names, and control characters become `_`; a DOS device name (see
-/// [`is_dos_device`]) gets a leading `_`; and it is cut short enough, in bytes, that
-/// `<prefix>-<pid>-<random>` fits [`NAME_MAX`].
+/// Replace forbidden and control characters in `prefix` with `_`, prefix `_` when the full name
+/// would be a DOS device, and cut it so `<prefix>-<pid>-<random>` fits [`NAME_MAX`] in UTF-8
+/// bytes, UTF-16 units, and (HFS+) UTF-16 units after canonical decomposition.
 pub(crate) fn file_name_safe(prefix: &str) -> String {
+    use unicode_normalization::char::decompose_canonical;
+
     const RESERVED_PID_AND_RANDOM: usize = "-4294967295-".len() + RANDOM_LEN;
-    // One byte stays free for the `_` a device name gets.
+    // One unit stays free for the `_` a device name gets.
     let budget = NAME_MAX - RESERVED_PID_AND_RANDOM - 1;
+    let mut used = 0;
     let mut out = String::new();
     for c in prefix.chars() {
         let c = if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
@@ -106,21 +108,25 @@ pub(crate) fn file_name_safe(prefix: &str) -> String {
         } else {
             c
         };
-        if out.len() + c.len_utf8() > budget {
+        let mut nfd_units = 0;
+        decompose_canonical(c, |d| nfd_units += d.len_utf16());
+        let cost = c.len_utf8().max(nfd_units);
+        if used + cost > budget {
             break;
         }
+        used += cost;
         out.push(c);
     }
-    if is_dos_device(&out) {
+    // The pid and random part start with `-`, so this is the full name's device base.
+    if is_dos_device(&format!("{out}-")) {
         out.insert(0, '_');
     }
     out
 }
 
-/// Whether Win32 would read a name starting with `name` as a DOS device: the part before the first
-/// `.`, trailing spaces trimmed, is `CON`, `PRN`, `AUX`, `NUL`, `COM0`-`COM9`, `LPT0`-`LPT9` (the
-/// digit may be a superscript `¹²³`), `CONIN$` or `CONOUT$`, in any case. The directory itself is
-/// created natively, but every later Win32 use of its path would open the device instead.
+/// Whether Win32 would read `name` as a DOS device (`CON`, `NUL`, `COM1`, `CONIN$`, ... with any
+/// extension after the first `.`). Created natively, but every later Win32 use of the path would
+/// open the device.
 fn is_dos_device(name: &str) -> bool {
     let base = name.split('.').next().unwrap_or_default().trim_end_matches(' ');
     let upper = base.to_ascii_uppercase();
@@ -135,7 +141,7 @@ fn is_dos_device(name: &str) -> bool {
         && digit.is_some_and(|d| d.is_ascii_digit() || matches!(d, '¹' | '²' | '³'))
 }
 
-/// Create the directory `path`. A taken name is `AlreadyExists`, which tempfile retries.
+/// A taken name is `AlreadyExists`, which tempfile retries.
 #[cfg(unix)]
 pub(crate) fn create_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
@@ -146,9 +152,9 @@ pub(crate) fn create_dir(path: &Path) -> io::Result<()> {
         .map_err(|e| io::Error::new(e.kind(), format!("{e} at path {path:?}")))
 }
 
-/// Create the directory `path` in `parent`, which `handle` is open on. A taken name, including one
-/// held by an entry that is deleted but still open elsewhere, is `AlreadyExists`, which tempfile
-/// retries; a parent that is itself being deleted is an error.
+/// `handle` is open on `parent`. A taken name, including one held by an entry that is deleted but
+/// still open elsewhere, is `AlreadyExists`, which tempfile retries; any other failure, a parent
+/// that is itself being deleted included, is not.
 #[cfg(windows)]
 pub(crate) fn create_dir(handle: &std::fs::File, parent: &Path, path: &Path) -> io::Result<()> {
     use crate::win_nt::{nt_create, nt_error, standard_info};
@@ -182,17 +188,17 @@ pub(crate) fn create_dir(handle: &std::fs::File, parent: &Path, path: &Path) -> 
         return Err(taken("exists"));
     }
     if status != STATUS_DELETE_PENDING {
-        return Err(nt_error(status, path));
+        return Err(not_retried(nt_error(status, path)));
     }
     let parent_pending = standard_info(handle)
         .map_err(|e| {
-            io::Error::new(
+            not_retried(io::Error::new(
                 e.kind(),
                 format!(
                     "creating {path:?} gave NTSTATUS {:#010x}, and asking whether {parent:?} is being deleted failed: {e}",
                     status.0 as u32
                 ),
-            )
+            ))
         })?
         .DeletePending;
     if parent_pending {
@@ -202,6 +208,17 @@ pub(crate) fn create_dir(handle: &std::fs::File, parent: &Path, path: &Path) -> 
         )));
     }
     Err(taken("is held by an entry being deleted"))
+}
+
+/// `e`, unless its kind is `AlreadyExists`, which only a taken name may have: tempfile would retry
+/// it.
+#[cfg(windows)]
+pub(crate) fn not_retried(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::AlreadyExists {
+        io::Error::other(e.to_string())
+    } else {
+        e
+    }
 }
 
 impl Drop for TempDir {
@@ -224,7 +241,7 @@ thread_local! {
     pub(crate) static WARNINGS: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Print `msg` to stderr, ignoring a failed write: a drop must not panic.
+/// A drop must not panic.
 fn warn(msg: std::fmt::Arguments<'_>) {
     use std::io::Write;
 
@@ -253,8 +270,7 @@ impl Deref for TempDir {
 
 use crate::fixtures::test_name::test_name;
 
-/// A fresh temporary directory named after the current test (see [`TempDir`]). Its path is
-/// canonical.
+/// A fresh temporary directory named after the current test (see [`TempDir`]).
 #[skuld::fixture(deref)]
 pub fn temp_dir(#[fixture(test_name)] name: &str) -> Result<TempDir, String> {
     let mut dir =

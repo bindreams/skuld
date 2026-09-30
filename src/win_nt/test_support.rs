@@ -11,8 +11,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS,
 };
 
-/// Opens `path` (a file or an empty directory) for DELETE and marks it for deletion on the returned
-/// handle. Classic semantics keep the name, delete-pending, until the last handle closes; POSIX
+/// Classic semantics keep the name, delete-pending, until the last handle closes; POSIX
 /// semantics unlink it when the returned handle closes.
 pub(crate) fn mark_for_deletion(path: &Path, posix: bool) -> File {
     let f = OpenOptions::new()

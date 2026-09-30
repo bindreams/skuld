@@ -26,8 +26,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 
-/// Open the directory `dir` natively, so that the status of the open is available, and fail
-/// unless it is a directory.
+/// Open the directory `dir` natively, so that the status of the open is available.
 pub(crate) fn open_dir(dir: &Path) -> io::Result<File> {
     let full = std::path::absolute(dir).map_err(|e| io::Error::new(e.kind(), format!("{e}: {dir:?}")))?;
     // Without FILE_OPEN_FOR_BACKUP_INTENT, so the directory's ACL applies as it will to later opens.
@@ -120,7 +119,7 @@ pub(crate) fn nt_create(
         Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: root.map_or(HANDLE::default(), |r| HANDLE(r.as_raw_handle())),
         ObjectName: &object_name,
-        // As Win32's CreateFileW does.
+        // Matches CreateFileW's default (case-insensitive lookup).
         Attributes: OBJ_CASE_INSENSITIVE,
         ..Default::default()
     };
