@@ -22,6 +22,15 @@ All notable changes to this project are documented in this file.
   and a name held that way is skipped. A directory that denies file
   creation now gets an error naming the NTSTATUS, and one being deleted gets
   an error saying so instead of `Access is denied`.
+- **On Windows, the `temp_dir` fixture no longer fails at random with
+  `Access is denied`,** for the same reason: a name held by a deleted
+  directory still open elsewhere is now skipped. Its directories are named
+  `<test name>-<pid>-<n>`.
+
+### Added
+
+- **`TempDir::new()` and `TempDir::new_in(parent)`** create a temporary
+  directory outside a test, with the fixture's collision handling.
 
 ## [0.5.0] - 2026-09-30
 

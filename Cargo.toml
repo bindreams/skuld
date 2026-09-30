@@ -26,7 +26,6 @@ inventory = "0.3"
 libtest-mimic = "0.8"
 # Needed for clap::Parser trait (Arguments::parse_from); libtest-mimic doesn't re-export it.
 clap = { version = "4", features = ["derive"] }
-tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_yml = "0.0.13"
 serde_json = "1"
@@ -51,8 +50,7 @@ libc = "0.2"
 # src/coordination/lock.rs's flock calls: std::fs::File::lock()/try_lock()
 # aren't implemented on every Unix target std itself lists as flock-capable
 # (Android is the concrete gap — see that module's doc), so lock.rs calls
-# rustix::fs::flock directly on every Unix instead. Already pulled in
-# transitively via tempfile; this only promotes it to a direct dependency.
+# rustix::fs::flock directly on every Unix instead.
 rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -81,6 +79,7 @@ windows = { version = "0.62", features = [
 
 [dev-dependencies]
 skuld = { path = ".", features = ["tokio"] }
+tempfile = "3"
 tokio = { version = "1", features = ["rt", "time", "net", "io-util"] }
 # Regression tests install their own tracing subscribers and assert that
 # events reach them (proving skuld no longer competes). Not used by skuld

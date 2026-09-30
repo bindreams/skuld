@@ -68,22 +68,44 @@ impl Deref for TempDir {
 }
 
 /// Create a directory in `parent`, named by the first name from `next_name` that is not taken.
-pub(crate) fn create_in(parent: &Path, mut next_name: impl FnMut() -> String) -> io::Result<PathBuf> {
-    loop {
-        let path = parent.join(next_name());
-        #[cfg(unix)]
-        let builder = {
-            let mut b = std::fs::DirBuilder::new();
-            std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-            b
-        };
-        #[cfg(not(unix))]
-        let builder = std::fs::DirBuilder::new();
-        match builder.create(&path) {
-            Ok(()) => return Ok(path),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(io::Error::new(e.kind(), format!("{e} at path {path:?}"))),
+/// On Windows that includes names held by entries that are deleted but still open (see
+/// `crate::win_nt`), which Win32 would report as access denied.
+pub(crate) fn create_in(parent: &Path, next_name: impl FnMut() -> String) -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut next_name = next_name;
+        loop {
+            let path = parent.join(next_name());
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(path),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(io::Error::new(e.kind(), format!("{e} at path {path:?}"))),
+            }
         }
+    }
+    #[cfg(windows)]
+    {
+        use crate::win_nt::{create_unique, nt_create, open_dir};
+        use windows::Wdk::Storage::FileSystem::{FILE_CREATE, FILE_DIRECTORY_FILE};
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAGS_AND_ATTRIBUTES, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let handle = open_dir(parent)?;
+        let (name, _created) = create_unique(parent, &handle, next_name, |dir, name| {
+            nt_create(
+                dir,
+                name,
+                FILE_READ_ATTRIBUTES,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_CREATE,
+                FILE_DIRECTORY_FILE,
+            )
+        })?;
+        Ok(parent.join(name))
     }
 }
 
