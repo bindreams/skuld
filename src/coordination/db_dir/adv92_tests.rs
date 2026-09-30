@@ -8,7 +8,9 @@ use std::process::Command;
 use windows::core::PWSTR;
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows::Wdk::Storage::FileSystem::{
-    NtCreateFile, FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_NON_DIRECTORY_FILE, FILE_SYNCHRONOUS_IO_NONALERT,
+    NtCreateFile, FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+    FILE_OPEN_FOR_BACKUP_INTENT, FILE_SYNCHRONOUS_IO_NONALERT, NTCREATEFILE_CREATE_DISPOSITION,
+    NTCREATEFILE_CREATE_OPTIONS,
 };
 use windows::Win32::Foundation::{HANDLE, OBJ_CASE_INSENSITIVE, UNICODE_STRING};
 use windows::Win32::Storage::FileSystem::{
@@ -16,7 +18,8 @@ use windows::Win32::Storage::FileSystem::{
     SetFileInformationByHandle, DELETE, FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_TEMPORARY, FILE_DISPOSITION_FLAG_DELETE,
     FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
     FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_NONE, FILE_STANDARD_INFO, SYNCHRONIZE,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_STANDARD_INFO, SYNCHRONIZE,
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -60,6 +63,22 @@ fn mark(path: &Path, posix: bool) -> File {
 
 /// Same call as the PR's create_delete_on_close, with the access mask as a parameter.
 fn nt_create(dir: &File, name: &str, access: FILE_ACCESS_RIGHTS) -> u32 {
+    nt_open(
+        dir,
+        name,
+        access,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE | FILE_SYNCHRONOUS_IO_NONALERT,
+    )
+}
+
+fn nt_open(
+    dir: &File,
+    name: &str,
+    access: FILE_ACCESS_RIGHTS,
+    disposition: NTCREATEFILE_CREATE_DISPOSITION,
+    options: NTCREATEFILE_CREATE_OPTIONS,
+) -> u32 {
     let mut wide: Vec<u16> = name.encode_utf16().collect();
     let len = (wide.len() * 2) as u16;
     let object_name = UNICODE_STRING {
@@ -84,9 +103,9 @@ fn nt_create(dir: &File, name: &str, access: FILE_ACCESS_RIGHTS) -> u32 {
             &mut io_status,
             None,
             FILE_ATTRIBUTE_TEMPORARY,
-            FILE_SHARE_NONE,
-            FILE_CREATE,
-            FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            disposition,
+            options,
             None,
             0,
         )
@@ -240,6 +259,35 @@ fn adv92_measure() {
         assert!(out.status.success(), "{out:?}");
         let r = probe(&d, || "q".to_string());
         println!("ADV92 S5 list-denied -> {r:?}");
+        let rd = std::fs::read_dir(&d).map(|mut it| it.next().map(|e| e.map(|e| e.file_name())));
+        println!("ADV92 S5 old path std::fs::read_dir -> {rd:?}");
+        let parent = open_dir(root, SYNCHRONIZE.0);
+        let list = FILE_LIST_DIRECTORY | SYNCHRONIZE;
+        println!(
+            "ADV92 S5 NtCreateFile open LIST no backup intent -> {:#010x}",
+            nt_open(
+                &parent,
+                "s5",
+                list,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
+            )
+        );
+        println!(
+            "ADV92 S5 NtCreateFile open LIST with backup intent -> {:#010x}",
+            nt_open(
+                &parent,
+                "s5",
+                list,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT
+            )
+        );
+        let icacls = Command::new("icacls").arg(&d).output().unwrap();
+        println!(
+            "ADV92 S5 acl: {}",
+            String::from_utf8_lossy(&icacls.stdout).replace(['\r', '\n'], " | ")
+        );
         let _ = Command::new("icacls").arg(&d).args(["/remove:d", "*S-1-1-0"]).output();
     }
     // S6: write-denied via the real check_usable path: full message.
