@@ -51,8 +51,8 @@ fn companion_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
 const NO_CAP_RETRIES: usize = 8;
 
 /// Create a temporary database for testing.
-pub(super) fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
+pub(super) fn temp_db() -> (crate::TempDir, std::path::PathBuf) {
+    let dir = crate::TempDir::new().unwrap();
     let path = dir.path().join("test-coordination.db");
     (dir, path)
 }
@@ -606,7 +606,7 @@ fn open_db_schema_init_fails_loudly_when_the_db_moves_mid_retry() {
 #[cfg(unix)]
 #[test]
 fn open_db_fails_loudly_when_the_profile_directory_is_replaced_wholesale_mid_retry() {
-    let outer = tempfile::tempdir().unwrap();
+    let outer = crate::TempDir::new().unwrap();
     let profile = outer.path().join("profile");
     std::fs::create_dir(&profile).unwrap();
     let path = profile.join("test-coordination.db");
@@ -659,7 +659,7 @@ fn open_db_fails_loudly_when_the_profile_directory_is_replaced_wholesale_mid_ret
 #[cfg(unix)]
 #[test]
 fn init_lock_target_has_split_detects_a_wholesale_directory_replacement() {
-    let outer = tempfile::tempdir().unwrap();
+    let outer = crate::TempDir::new().unwrap();
     let profile = outer.path().join("profile");
     std::fs::create_dir(&profile).unwrap();
     let path = profile.join("test-coordination.db");
@@ -688,7 +688,7 @@ fn init_lock_target_has_split_detects_a_wholesale_directory_replacement() {
 #[cfg(windows)]
 #[test]
 fn init_lock_target_has_split_detects_a_retargeted_symlink_ancestor_windows() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let real1 = dir.path().join("real1");
     let real2 = dir.path().join("real2");
     std::fs::create_dir(&real1).unwrap();
@@ -774,7 +774,7 @@ fn coordinate_fails_loudly_when_the_db_moves_mid_retry() {
 #[cfg(unix)]
 #[test]
 fn registration_drop_fails_loudly_when_a_parent_symlink_is_retargeted_mid_run() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let real1 = dir.path().join("real1");
     let real2 = dir.path().join("real2");
     std::fs::create_dir(&real1).unwrap();
@@ -829,7 +829,7 @@ fn registration_drop_fails_loudly_when_a_parent_symlink_is_retargeted_mid_run() 
 #[cfg(windows)]
 #[test]
 fn registration_drop_fails_loudly_when_a_parent_symlink_is_retargeted_mid_run_windows() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let real1 = dir.path().join("real1");
     let real2 = dir.path().join("real2");
     std::fs::create_dir(&real1).unwrap();
@@ -1758,7 +1758,7 @@ fn a_read_only_directory_with_an_existing_db_names_the_override() {
         0,
         "requires a non-root user: root ignores directory modes"
     );
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::TempDir::new().unwrap();
     let path = tmp.path().join(".skuld.db");
     drop(open_db(&path));
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();

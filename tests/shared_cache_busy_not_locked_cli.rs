@@ -8,7 +8,7 @@ use std::process::Command;
 
 #[test]
 fn shared_cache_mode_enabled_elsewhere_in_the_process_still_reports_busy_not_locked() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = skuld::TempDir::new().unwrap();
     let db_path = dir.path().join(".skuld.db");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_shared_cache_probe"));

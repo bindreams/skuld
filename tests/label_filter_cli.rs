@@ -10,10 +10,10 @@
 //! The plan for this suite lives at
 //! `C:\Users\bindreams\.claude\plans\peppy-meandering-snail.md`.
 
+use skuld::TempDir;
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
-use tempfile::TempDir;
 
 // Shared infrastructure =================================================================================
 //
@@ -72,7 +72,7 @@ fn run_fixture(labels: Option<&str>, extra_args: &[&str]) -> RunOutcome {
 /// `--format`.
 #[track_caller]
 fn run_fixture_raw(labels: Option<&str>, args: &[&str]) -> RunOutcome {
-    let marker_dir = tempfile::tempdir().expect("tempdir");
+    let marker_dir = skuld::TempDir::new().expect("tempdir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_label_filter_fixture"));
     cmd.args(args);
     for key in [

@@ -44,7 +44,7 @@ fn try_probe(db_path: &std::path::Path) -> std::process::Output {
 
 #[test]
 fn a_second_process_try_lock_reports_would_block_while_another_process_holds_the_lock_then_succeeds_after_release() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = skuld::TempDir::new().unwrap();
     let db_path = dir.path().join(".skuld.db");
 
     let mut holder = hold_probe(&db_path).spawn().expect("spawn lock_hold_probe");
@@ -123,7 +123,7 @@ fn a_second_process_try_lock_reports_would_block_while_another_process_holds_the
 /// `src/coordination/lock.rs`'s module doc.
 #[test]
 fn a_holder_cannot_have_its_lock_target_deleted_out_from_under_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = skuld::TempDir::new().unwrap();
     let db_path = dir.path().join(".skuld.db");
     // The Unix half of this test needs `.skuld.db` to genuinely exist so
     // there is something to delete below.

@@ -29,7 +29,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 #[test]
 fn a_lost_publish_race_uses_the_winners_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let target = dir.path().join(".skuld.db");
 
     // Two temps, simulating two processes racing to publish the same target.
@@ -59,7 +59,7 @@ fn create_publish_temp_retries_past_a_name_collision() {
     // same candidate name (see `create_publish_temp_with`'s doc): the first
     // candidate is already taken by an unrelated file, so the call must
     // retry onto the next candidate rather than panicking.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let collided = dir.path().join(".skuld-publish-collide.tmp");
     std::fs::write(&collided, b"someone else's temp").unwrap();
     let free_path = dir.path().join(".skuld-publish-free.tmp");
@@ -109,7 +109,7 @@ fn classify_rename_errno_maps_known_errnos() {
 /// synthetic `RenameError` instead of going through `atomic_rename_no_replace`.
 #[test]
 fn a_kernel_too_old_error_panics_naming_the_kernel_not_the_filesystem() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let tmp = create_publish_temp(dir.path());
     let target = dir.path().join(".skuld.db");
 
@@ -139,7 +139,7 @@ fn a_kernel_too_old_error_panics_naming_the_kernel_not_the_filesystem() {
 /// outright, e.g. some NFS configurations), so driven synthetically too.
 #[test]
 fn an_unsupported_error_panics_naming_the_filesystem_not_the_kernel() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let tmp = create_publish_temp(dir.path());
     let target = dir.path().join(".skuld.db");
 
@@ -165,7 +165,7 @@ fn an_unsupported_error_panics_naming_the_filesystem_not_the_kernel() {
 
 #[test]
 fn a_non_eexist_publish_error_is_named() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
 
     // A structural failure (ENOTDIR: a path component that should be a
     // directory is a regular file instead), not a permissions failure. A
@@ -202,7 +202,7 @@ fn a_vanished_own_temp_panics_loudly() {
     // a rename whose own source has vanished is not a benign, retryable
     // race — it's an unexplained failure, and must panic like any other
     // non-EEXIST rename error.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let target = dir.path().join(".skuld.db");
 
     let tmp = create_publish_temp(dir.path());
@@ -223,7 +223,7 @@ fn a_vanished_own_temp_panics_loudly() {
 
 #[test]
 fn ensure_published_creates_an_absent_file_at_0666() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let target = dir.path().join(".skuld.db");
 
     ensure_published(&target);
@@ -235,7 +235,7 @@ fn ensure_published_creates_an_absent_file_at_0666() {
 
 #[test]
 fn ensure_published_leaves_an_existing_file_untouched() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let target = dir.path().join(".skuld.db");
     std::fs::write(&target, b"already here").unwrap();
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -258,7 +258,7 @@ fn ensure_published_leaves_an_existing_file_untouched() {
 /// attempt entirely instead.
 #[test]
 fn ensure_published_skips_publishing_when_the_target_already_exists() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let target = dir.path().join(".skuld.db");
     std::fs::write(&target, b"already here").unwrap();
 
@@ -280,7 +280,7 @@ fn ensure_published_skips_publishing_when_the_target_already_exists() {
 /// that the rename would just reject anyway.
 #[test]
 fn ensure_published_skips_publishing_for_a_dangling_symlink() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let target = dir.path().join(".skuld.db");
     std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &target).unwrap();
 
@@ -300,7 +300,7 @@ fn ensure_published_skips_publishing_for_a_dangling_symlink() {
 /// false-positive and skip a genuinely absent target.
 #[test]
 fn ensure_published_publishes_when_the_target_is_absent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::TempDir::new().unwrap();
     let target = dir.path().join(".skuld.db");
 
     let mut called = false;

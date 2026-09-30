@@ -21,7 +21,7 @@ fn spawn_list(meta_path: Option<&std::path::Path>) -> (bool, String, String) {
 
 #[test]
 fn dump_matches_declared_tests_and_excludes_ignored() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = skuld::TempDir::new().expect("tempdir");
     let meta_path = dir.path().join("meta.json");
 
     let (ok, _stdout, stderr) = spawn_list(Some(&meta_path));
@@ -57,7 +57,7 @@ fn dump_matches_declared_tests_and_excludes_ignored() {
 
 #[test]
 fn no_file_written_when_env_unset() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = skuld::TempDir::new().expect("tempdir");
     let meta_path = dir.path().join("meta.json");
     let (ok, _, _) = spawn_list(None);
     assert!(ok);
@@ -70,7 +70,7 @@ fn no_file_written_when_env_unset() {
 #[test]
 fn list_stdout_and_exit_code_unaffected_by_metadata_dump_flag() {
     let (ok_without, stdout_without, _) = spawn_list(None);
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = skuld::TempDir::new().expect("tempdir");
     let meta_path = dir.path().join("meta.json");
     let (ok_with, stdout_with, _) = spawn_list(Some(&meta_path));
     assert_eq!(ok_without, ok_with);

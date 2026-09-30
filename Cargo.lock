@@ -210,7 +210,6 @@ dependencies = [
  "serde",
  "serde_json",
  "skuld",
- "tempfile",
  "toml 0.8.23",
  "wait-timeout",
 ]

@@ -37,28 +37,30 @@ fn assert_drop_order(out_path: &std::path::Path) {
 
 #[test]
 fn should_panic_satisfied_reports_panicking_during_scope_drop() {
-    let out_file = tempfile::NamedTempFile::new().expect("create temp file for the probe's output");
-    let out = run_probe_trial("panics_with_tracked_fixture", Some(out_file.path()));
+    let out_dir = skuld::TempDir::new().expect("create a temp dir for the probe's output");
+    let out_file = out_dir.join("out");
+    let out = run_probe_trial("panics_with_tracked_fixture", Some(&out_file));
 
     assert!(
         out.status.success(),
         "expected the should_panic test to be satisfied (process success); stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_drop_order(out_file.path());
+    assert_drop_order(&out_file);
 }
 
 #[test]
 fn should_panic_with_message_satisfied_reports_panicking_during_scope_drop() {
-    let out_file = tempfile::NamedTempFile::new().expect("create temp file for the probe's output");
-    let out = run_probe_trial("panics_with_tracked_fixture_msg", Some(out_file.path()));
+    let out_dir = skuld::TempDir::new().expect("create a temp dir for the probe's output");
+    let out_file = out_dir.join("out");
+    let out = run_probe_trial("panics_with_tracked_fixture_msg", Some(&out_file));
 
     assert!(
         out.status.success(),
         "expected the should_panic = \"...\" test to be satisfied (process success); stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_drop_order(out_file.path());
+    assert_drop_order(&out_file);
 }
 
 #[test]

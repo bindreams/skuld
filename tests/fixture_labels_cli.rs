@@ -29,7 +29,7 @@ fn command(labels: Option<&str>) -> Command {
 
 /// The nextest metadata dump for a `--list` run under `labels`.
 fn dump(labels: &str) -> Vec<serde_json::Value> {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = skuld::TempDir::new().expect("tempdir");
     let path = dir.path().join("meta.json");
     let out = command(Some(labels))
         .arg("--list")
