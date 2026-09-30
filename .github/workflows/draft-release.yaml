@@ -29,7 +29,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Read the release toolchain pin
+        id: toolchain
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Stage 2 installs exactly this toolchain. A missing or malformed
+          # pin fails here, before any draft exists.
+          version=$(.github/scripts/release-toolchain.sh .github/release-toolchain)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
 
       - name: Normalize and validate version
         id: version
@@ -84,7 +97,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read the release toolchain pin
+        id: toolchain
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Stage 2 installs exactly this toolchain. A missing or malformed
+          # pin fails here, before any draft exists.
+          version=$(.github/scripts/release-toolchain.sh .github/release-toolchain)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
 
       - name: Dry-run publish workspace
         timeout-minutes: 30
@@ -94,7 +120,8 @@ jobs:
         # `-p a -p b` alike — builds a temporary overlay registry from the
         # packaged siblings, so each crate's verify step resolves its
         # intra-workspace deps without them being on crates.io. Keeping verification on means stage 1 actually rehearses
-        # stage 2, compiling each crate as packaged rather than as checked out.
+        # stage 2, compiling each crate as packaged rather than as checked out,
+        # under the same pinned toolchain.
         run: cargo publish --workspace --dry-run --locked
 
       # Two questions must be settled before a draft can exist, and the

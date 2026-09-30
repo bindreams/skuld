@@ -139,16 +139,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pin_file=release-pin/.github/release-toolchain
-          if [ ! -f "$pin_file" ]; then
-            echo "::error::The draft's target commit has no .github/release-toolchain. Recreate the draft from a commit that contains it; see CONTRIBUTING.md."
-            exit 1
-          fi
-          pin=$(cat "$pin_file")
-          if ! [[ "$pin" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::.github/release-toolchain must be one exact X.Y.Z line, got '${pin}'."
-            exit 1
-          fi
+          # The script comes from the dispatch commit, the file from the
+          # draft's target.
+          pin=$(workflow-ref/.github/scripts/release-toolchain.sh release-pin/.github/release-toolchain)
           echo "version=$pin" >> "$GITHUB_OUTPUT"
           echo "Toolchain pin: $pin" | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -178,21 +171,6 @@ jobs:
         timeout-minutes: 15
         with:
           toolchain: ${{ needs.resolve.outputs.rust_version }}
-
-      # dtolnay's `rustup default` step tolerates failure, which would leave
-      # the runner's preinstalled toolchain in place. Refuse that.
-      - name: Check the pinned toolchain is the one running
-        timeout-minutes: 5
-        env:
-          RUST_VERSION: ${{ needs.resolve.outputs.rust_version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          actual=$(cargo --version | cut -d ' ' -f2)
-          if [ "$actual" != "$RUST_VERSION" ]; then
-            echo "::error::Pinned toolchain is ${RUST_VERSION} but cargo ${actual} is running."
-            exit 1
-          fi
 
       - name: Re-verify workspace version matches release
         timeout-minutes: 20
@@ -235,22 +213,31 @@ jobs:
           cargo package --locked "${args[@]}"
 
       # `target/package` also holds the unpacked verification trees, so copy
-      # out just the archives.
+      # out just the archives. The hashes go in their own small artifact: the
+      # credentialed job downloads only that one.
       - name: Write the sha256 manifest
         timeout-minutes: 5
         shell: bash
         run: |
           set -euo pipefail
-          mkdir "$RUNNER_TEMP/crates"
+          mkdir "$RUNNER_TEMP/crates" "$RUNNER_TEMP/sha256sums"
           cp target/package/*.crate "$RUNNER_TEMP/crates/"
-          (cd "$RUNNER_TEMP/crates" && sha256sum -- *.crate > SHA256SUMS)
-          cat "$RUNNER_TEMP/crates/SHA256SUMS"
+          (cd "$RUNNER_TEMP/crates" && sha256sum -- *.crate > ../sha256sums/SHA256SUMS)
+          cat "$RUNNER_TEMP/sha256sums/SHA256SUMS"
 
+      # For forensics only: nothing downstream reads these.
       - uses: actions/upload-artifact@v4
         timeout-minutes: 5
         with:
           name: crates
           path: ${{ runner.temp }}/crates
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        timeout-minutes: 5
+        with:
+          name: sha256sums
+          path: ${{ runner.temp }}/sha256sums
           if-no-files-found: error
 
   publish:
@@ -330,10 +317,12 @@ jobs:
             exit 1
           fi
 
+      # Only the hashes, not the archives: the build job controls this
+      # artifact, so the credentialed job unpacks as little of it as it can.
       - uses: actions/download-artifact@v4
         timeout-minutes: 5
         with:
-          name: crates
+          name: sha256sums
           path: ${{ runner.temp }}/built
 
       # Builds nothing, so it also reads no third-party code: `cargo metadata
@@ -408,17 +397,16 @@ jobs:
               echo "::error::The build job's manifest has no valid sha256 for ${file}. Refusing to publish."
               exit 1
             fi
-            for path in "target/package/$file" "$built/$file"; do
-              if [ ! -f "$path" ]; then
-                echo "::error::${path} does not exist. Refusing to publish."
-                exit 1
-              fi
-              got=$(sha256sum "$path" | cut -d ' ' -f1)
-              if [ "$got" != "$want" ]; then
-                echo "::error::${path} hashes to ${got}, but the build job verified ${want} for ${file}. The uploaded tree is not the built tree. Refusing to publish."
-                exit 1
-              fi
-            done
+            path="target/package/$file"
+            if [ ! -f "$path" ]; then
+              echo "::error::${path} does not exist. Refusing to publish."
+              exit 1
+            fi
+            got=$(sha256sum "$path" | cut -d ' ' -f1)
+            if [ "$got" != "$want" ]; then
+              echo "::error::${path} hashes to ${got}, but the build job verified ${want} for ${file}. The uploaded tree is not the built tree. Refusing to publish; see Recovery in CONTRIBUTING.md."
+              exit 1
+            fi
           done
 
       # Idempotency guard: makes a run that failed or was cancelled after this

@@ -24,6 +24,22 @@ runs:
         components: ${{ inputs.components }}
         targets: ${{ inputs.targets }}
 
+    # dtolnay's `rustup default` step tolerates failure, which would silently
+    # leave the runner's preinstalled toolchain in place. When an exact version
+    # was asked for, refuse that.
+    - name: Check the requested toolchain is the one running
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ inputs.toolchain }}
+      run: |
+        if [[ "$TOOLCHAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          actual=$(cargo --version | cut -d ' ' -f2)
+          if [ "$actual" != "$TOOLCHAIN" ]; then
+            echo "::error::Requested toolchain ${TOOLCHAIN} but cargo ${actual} is running."
+            exit 1
+          fi
+        fi
+
     - name: Cache cargo registry
       uses: actions/cache@v4
       with:
