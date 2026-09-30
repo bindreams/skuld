@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-30
+
 ### Breaking
 
 - **Trial names must be unique.** At startup, `TestRunner::run()` now panics if
