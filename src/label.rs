@@ -8,6 +8,7 @@
 #[cfg(test)]
 mod label_tests;
 
+use crate::fixture::{collect_fixture_labels, fixture_registry};
 use crate::TestDef;
 
 // Label type =====
@@ -718,7 +719,7 @@ inventory::collect!(ModuleLabels);
 /// #[skuld::test(labels = [DOCKER])]    // gets [DOCKER], not both
 /// fn test_b() { ... }
 ///
-/// #[skuld::test(labels = [])]          // gets nothing — explicit opt-out
+/// #[skuld::test(labels = [])]          // drops the module default (fixture labels still apply)
 /// fn test_c() { ... }
 /// ```
 #[macro_export]
@@ -731,16 +732,65 @@ macro_rules! default_labels {
     };
 }
 
-/// Resolve the effective labels for a test, applying module defaults if the test
-/// did not explicitly specify `labels = [...]`.
+/// Append each label in `src` to `dst` unless already present.
+pub(crate) fn push_unique(dst: &mut Vec<Label>, src: &[Label]) {
+    for &label in src {
+        if !dst.contains(&label) {
+            dst.push(label);
+        }
+    }
+}
+
+/// Resolve the effective labels for a test: its own (explicit, or the module
+/// default when `labels = [...]` was not written) plus the labels of every
+/// fixture it uses, transitively. Deduplicated, own labels first.
 pub(crate) fn resolve_labels(def: &TestDef, module_defaults: &[&ModuleLabels]) -> Vec<Label> {
+    let mut labels = Vec::new();
+    push_unique(&mut labels, &own_labels(def, module_defaults));
+    push_unique(&mut labels, &collect_fixture_labels(def.fixture_names));
+    labels
+}
+
+/// [`resolve_labels`] with the binary's registered module defaults. The one
+/// entry point for the runner and the `metadata` fixture.
+pub(crate) fn resolve_labels_for(def: &TestDef) -> Vec<Label> {
+    for name in unregistered_fixture_names(def) {
+        eprintln!(
+            "[skuld] warning: test {:?} uses unregistered fixture {name:?}; its labels are not inherited",
+            def.name
+        );
+    }
+    let module_defaults: Vec<&ModuleLabels> = inventory::iter::<ModuleLabels>.into_iter().collect();
+    resolve_labels(def, &module_defaults)
+}
+
+/// The fixtures `def` declares that are not registered, whose labels it
+/// cannot inherit.
+pub(crate) fn unregistered_fixture_names(def: &TestDef) -> Vec<&'static str> {
+    let registry = fixture_registry();
+    def.fixture_names
+        .iter()
+        .copied()
+        .filter(|name| !registry.contains_key(name))
+        .collect()
+}
+
+/// The module default covering `def.module`: the longest `default_labels!`
+/// module that is `def.module` itself or an ancestor of it.
+fn own_labels(def: &TestDef, module_defaults: &[&ModuleLabels]) -> Vec<Label> {
     if def.labels_explicit {
         return def.labels.to_vec();
     }
-    // Find the longest module prefix match.
+    let covers = |m: &ModuleLabels| {
+        def.module == m.module
+            || def
+                .module
+                .strip_prefix(m.module)
+                .is_some_and(|rest| rest.starts_with("::"))
+    };
     let default = module_defaults
         .iter()
-        .filter(|m| def.module.starts_with(m.module))
+        .filter(|m| covers(m))
         .max_by_key(|m| m.module.len());
     match default {
         Some(m) => m.labels.to_vec(),

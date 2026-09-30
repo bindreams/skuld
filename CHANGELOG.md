@@ -12,6 +12,12 @@ All notable changes to this project are documented in this file.
   same goes for a repeated `#[fixture]` on one parameter, and for a malformed
   one (`#[fixture(a, b)]`, `#[fixture = "a"]`, `#[fixture("a")]`), which
   silently fell back to the parameter's own name.
+- **`FixtureDef` gains a `pub labels` field.** Code that builds a `FixtureDef`
+  by hand must set it. `#[skuld::fixture]` fills it in.
+- **`TestMetadata.labels` now reports the resolved labels** (own or module
+  default, plus fixture labels) instead of only the test's explicit ones, and
+  `FixtureMetadata` gains a `pub labels` field (the fixture's own labels, then its
+  dependencies').
 
 ### Fixed
 
@@ -33,6 +39,12 @@ All notable changes to this project are documented in this file.
   no `#[skuld::label]` in the binary declares makes startup panic, naming the
   unknown label(s) and the declared set. Names are read as written, so `x | !x`
   still checks `x`.
+- **`#[skuld::fixture(labels = [L, ...])]`.** A test's labels are its own
+  (explicit, or the module default) plus the labels of every fixture it declares
+  as a `#[fixture]` parameter, transitively through their `#[fixture]`
+  dependencies. The combined set drives `SKULD_LABELS`, serial filters and
+  nextest metadata. Runtime `fixture()` / `fixture_get()` calls and dynamic
+  `TestRunner::add` tests do not inherit labels.
 
 ## [0.5.0] - 2026-09-30
 

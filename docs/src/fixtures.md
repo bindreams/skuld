@@ -41,6 +41,7 @@ The `#[skuld::fixture]` attribute supports these options:
 | --------------------------------- | -------------------------------------------------------------------------------------- |
 | `scope = variable\|test\|process` | Lifetime scope (default: `variable`)                                                   |
 | `requires = [...]`                | Runtime preconditions (propagated to tests)                                            |
+| `labels = [...]`                  | Labels that tests using this fixture inherit (see [Labels](labels.md))                 |
 | `name = "..."`                    | Override the fixture name (default: function name)                                     |
 | `deref`                           | Also support injection as `Deref::Target` type                                         |
 | `serial` or `serial = <expr>`     | Tests using this fixture inherit the serial constraint (see [Serial Tests](serial.md)) |

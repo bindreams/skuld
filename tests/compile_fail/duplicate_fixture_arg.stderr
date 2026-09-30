@@ -39,3 +39,15 @@ error: duplicate argument `scope`
    |
 38 | #[skuld::fixture(scope = test, serial, scope = process)]
    |                                        ^^^^^
+
+error: duplicate argument `labels`
+  --> tests/compile_fail/duplicate_fixture_arg.rs:43:32
+   |
+43 | #[skuld::fixture(labels = [A], labels = [A])]
+   |                                ^^^^^^
+
+error: duplicate argument `labels`
+  --> tests/compile_fail/duplicate_fixture_arg.rs:48:39
+   |
+48 | #[skuld::fixture(labels = [A], deref, labels = [A])]
+   |                                       ^^^^^^

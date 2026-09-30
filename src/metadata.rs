@@ -4,7 +4,10 @@ use std::fmt;
 
 use serde::Serialize;
 
-use crate::fixture::{collect_fixture_serial, fixture_registry, merge_serial_filters, FixtureDef, FixtureScope};
+use crate::fixture::{
+    collect_fixture_serial, fixture_labels_of, fixture_registry, merge_serial_filters, FixtureDef, FixtureScope,
+};
+use crate::label::resolve_labels_for;
 use crate::{Ignore, Requirement, ShouldPanic, TestDef};
 
 // RequirementInfo =================================================================================
@@ -45,6 +48,8 @@ pub struct FixtureMetadata {
     pub scope: String,
     pub serial: String,
     pub deps: Vec<String>,
+    /// Labels a test inherits by using this fixture (own, then dependencies').
+    pub labels: Vec<String>,
     pub type_name: String,
     pub requires: Vec<RequirementInfo>,
 }
@@ -62,6 +67,7 @@ impl FixtureMetadata {
             .to_owned(),
             serial: def.serial.to_owned(),
             deps: def.deps.iter().map(|s| s.to_string()).collect(),
+            labels: fixture_labels_of(def).iter().map(|l| l.name().to_owned()).collect(),
             type_name: def.type_name.to_owned(),
             requires: def.requires.iter().map(RequirementInfo::from_requirement).collect(),
         }
@@ -145,7 +151,7 @@ impl TestMetadata {
             module: def.module.to_owned(),
             display_name: def.display_name.map(str::to_owned),
             serial: effective_serial,
-            labels: def.labels.iter().map(|l| l.name().to_owned()).collect(),
+            labels: resolve_labels_for(def).iter().map(|l| l.name().to_owned()).collect(),
             ignore,
             should_panic,
             fixtures: fixture_metas,

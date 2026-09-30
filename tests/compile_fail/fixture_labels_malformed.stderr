@@ -1,0 +1,37 @@
+error: expected square brackets
+ --> tests/compile_fail/fixture_labels_malformed.rs:6:27
+  |
+6 | #[skuld::fixture(labels = A)]
+  |                           ^
+
+error: expected `=`
+  --> tests/compile_fail/fixture_labels_malformed.rs:11:1
+   |
+11 | #[skuld::fixture(labels)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `skuld::fixture` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: expected identifier
+  --> tests/compile_fail/fixture_labels_malformed.rs:16:28
+   |
+16 | #[skuld::fixture(labels = ["a"])]
+   |                            ^^^
+
+error: expected identifier
+  --> tests/compile_fail/fixture_labels_malformed.rs:26:30
+   |
+26 | #[skuld::fixture(labels = [A,, A])]
+   |                              ^
+
+error: unknown argument `bogus`; expected requires, labels, scope, name, deref, or serial
+  --> tests/compile_fail/fixture_labels_malformed.rs:31:18
+   |
+31 | #[skuld::fixture(bogus)]
+   |                  ^^^^^
+
+error[E0308]: mismatched types
+  --> tests/compile_fail/fixture_labels_malformed.rs:21:28
+   |
+21 | #[skuld::fixture(labels = [NOT_A_LABEL])]
+   |                            ^^^^^^^^^^^ expected `Label`, found `u8`

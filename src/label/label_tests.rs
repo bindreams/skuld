@@ -1060,3 +1060,88 @@ fn unknown_labels_message_with_no_declared_labels() {
         "skuld: SKULD_LABELS names unknown label(s) \"nope\"; declared labels: []"
     );
 }
+
+// resolve_labels =====
+
+fn test_def(module: &'static str, labels: &'static [Label], explicit: bool) -> TestDef {
+    TestDef {
+        name: "t",
+        module,
+        display_name: None,
+        requires: &[],
+        fixture_names: &[],
+        ignore: crate::Ignore::No,
+        labels,
+        labels_explicit: explicit,
+        serial: "",
+        should_panic: crate::ShouldPanic::No,
+        body: || {},
+    }
+}
+
+const A: Label = Label::__new("a");
+const B: Label = Label::__new("b");
+
+#[test]
+fn a_module_default_applies_to_the_module_and_its_children() {
+    let defaults = ModuleLabels {
+        module: "krate::a",
+        labels: &[A],
+    };
+    let defaults = [&defaults];
+    for module in ["krate::a", "krate::a::inner", "krate::a::inner::deeper"] {
+        assert_eq!(
+            resolve_labels(&test_def(module, &[], false), &defaults),
+            [A],
+            "{module}"
+        );
+    }
+}
+
+#[test]
+fn a_module_default_does_not_apply_to_a_sibling_sharing_its_prefix() {
+    let defaults = ModuleLabels {
+        module: "krate::a",
+        labels: &[A],
+    };
+    let defaults = [&defaults];
+    for module in ["krate::ab", "krate::a_other", "krate::ab::inner", "krate"] {
+        assert_eq!(
+            resolve_labels(&test_def(module, &[], false), &defaults),
+            Vec::<Label>::new(),
+            "{module}"
+        );
+    }
+}
+
+#[test]
+fn the_longest_matching_module_default_wins() {
+    let outer = ModuleLabels {
+        module: "krate",
+        labels: &[A],
+    };
+    let inner = ModuleLabels {
+        module: "krate::a",
+        labels: &[B],
+    };
+    let defaults = [&outer, &inner];
+    assert_eq!(resolve_labels(&test_def("krate::a::t", &[], false), &defaults), [B]);
+    assert_eq!(resolve_labels(&test_def("krate::other", &[], false), &defaults), [A]);
+}
+
+#[test]
+fn resolved_labels_are_deduplicated_including_own_labels() {
+    assert_eq!(resolve_labels(&test_def("krate", &[A, B, A], true), &[]), [A, B]);
+}
+
+#[test]
+fn unregistered_test_level_fixtures_are_reported() {
+    let mut def = test_def("krate", &[], false);
+    def.fixture_names = &["test_name", "no_such_fixture_anywhere", "also_missing"];
+    assert_eq!(
+        unregistered_fixture_names(&def),
+        ["no_such_fixture_anywhere", "also_missing"]
+    );
+    def.fixture_names = &["test_name"];
+    assert!(unregistered_fixture_names(&def).is_empty());
+}

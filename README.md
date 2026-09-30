@@ -274,9 +274,13 @@ fn test_a() { /* ... */ }
 #[skuld::test(labels = [SLOW])]     // gets [SLOW], NOT [SMOKE, UNIT, SLOW]
 fn test_b() { /* ... */ }
 
-#[skuld::test(labels = [])]         // gets nothing (explicit opt-out)
+#[skuld::test(labels = [])]         // drops the module default (fixture labels still apply)
 fn test_c() { /* ... */ }
 ```
+
+### Fixture-carried labels
+
+A fixture can carry labels with `#[skuld::fixture(labels = [DOCKER])]`. A test gets those labels on top of its own when it declares the fixture as a `#[fixture]` parameter, directly or through another fixture's `#[fixture]` dependencies, so `SKULD_LABELS=docker` selects it. Runtime `skuld::fixture()` / `fixture_get()` calls and dynamic `TestRunner::add` tests do not inherit labels.
 
 ## Serial tests
 
