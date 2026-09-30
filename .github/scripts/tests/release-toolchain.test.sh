@@ -79,6 +79,31 @@ ln -s loop "$work/loop"
 run symlink-loop 1 '' 'could not be read' "$work/loop"
 ln -s absent "$work/dangling"
 run dangling-symlink 1 '' 'could not be read' "$work/dangling"
+# A symlink to an endless device must not be read to the end.
+ln -s /dev/zero "$work/zero"
+run symlink-to-dev-zero 1 '' 'or longer' "$work/zero"
+
+# 63 bytes is the longest accepted file, 64 the shortest refused.
+newlines=''
+for _ in $(seq 57); do newlines+='\n'; done
+check longest-accepted 0 1.98.1 - "1.98.1${newlines}"
+check shortest-refused 1 '' 'or longer' "1.98.1${newlines}\\n"
+
+# Needs a non-root user: root reads mode-000 files. Fail rather than skip.
+uid=$(id -u)
+if [ "$uid" -eq 0 ]; then
+	echo "FAIL mode-000: this test must run as a non-root user"
+	fail=1
+else
+	printf '1.98.1\n' > "$work/private"
+	chmod 000 "$work/private"
+	run mode-000 1 '' 'could not be read' "$work/private"
+	chmod 600 "$work/private"
+fi
+
+# No FIFO test: git cannot store a FIFO, so a pin cannot be one; the only route
+# is a symlink to a FIFO already on the runner, which a commit cannot create.
+
 printf '1.98.1\n' > "$work/real"
 ln -s real "$work/link"
 run symlink-to-valid 0 1.98.1 - "$work/link"

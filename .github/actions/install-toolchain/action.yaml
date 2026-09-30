@@ -40,17 +40,9 @@ runs:
         components: ${{ inputs.components }}
         targets: ${{ inputs.targets }}
 
-    # dtolnay's `rustup default` step tolerates failure, which would silently
-    # leave the runner's preinstalled toolchain in place.
+    # Also pins RUSTUP_TOOLCHAIN for later steps; see the script.
     - name: Check the requested toolchain is the one running
       shell: bash
       env:
         TOOLCHAIN: ${{ inputs.toolchain }}
-      run: |
-        if [ "$TOOLCHAIN" != stable ]; then
-          actual=$(cargo --version | cut -d ' ' -f2)
-          if [ "$actual" != "$TOOLCHAIN" ]; then
-            echo "::error::Requested toolchain ${TOOLCHAIN} but cargo ${actual} is running."
-            exit 1
-          fi
-        fi
+      run: '"$GITHUB_ACTION_PATH/../../scripts/check-toolchain.sh" "$TOOLCHAIN"'

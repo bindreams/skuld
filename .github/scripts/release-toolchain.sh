@@ -11,7 +11,7 @@
 # .github/actions/install-toolchain/action.yaml and .github/renovate.json;
 # change all three together.
 #
-# The file is read once into a temporary copy, so the NUL check and the
+# The file is read once, bounded, into a temporary copy, so the NUL check and the
 # grammar check see the same bytes. Errors quote the file's content with
 # `printf %q`, so it cannot forge workflow commands.
 set -euo pipefail
@@ -38,8 +38,16 @@ fail() {
 copy=$(mktemp)
 trap 'rm -f -- "${copy:?}"' EXIT
 
-cat -- "$file" > "$copy" 2>/dev/null ||
+# The read is bounded: git stores symlinks, so the pin may point at an endless
+# device such as /dev/zero.
+max_bytes=64
+head -c "$max_bytes" -- "$file" > "$copy" 2>/dev/null ||
 	fail "$(printf '%q' "$file") could not be read (missing, not a regular file, or unreadable). The commit being released must contain the toolchain pin; see CONTRIBUTING.md."
+
+size=$(wc -c < "$copy")
+if [ "$size" -ge "$max_bytes" ]; then
+	fail "$(printf '%q' "$file") is ${max_bytes} bytes or longer; a pin is one short X.Y.Z line."
+fi
 
 # Command substitution drops NUL bytes, which would let `1.98\0.1` read as 1.98.1.
 nuls=$(tr -cd '\0' < "$copy" | wc -c)

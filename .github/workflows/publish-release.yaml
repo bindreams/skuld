@@ -286,14 +286,17 @@ jobs:
       # Actions come from the dispatch commit, which this workflow file is
       # from, never from the release tree that `cargo` and the scripts below
       # read. Both trees sit in subdirectories: the release tree in `release/`,
-      # where every `run:` starts, so it holds no stray untracked files for
-      # `cargo package` to reject.
+      # where this job's own `run:` steps start (composite actions' steps do
+      # not; the toolchain pin does not depend on the directory), so it holds no
+      # stray untracked files for `cargo package` to reject.
       - name: Check out the actions from the workflow ref
         uses: actions/checkout@v4
         timeout-minutes: 5
         with:
           ref: ${{ github.sha }}
-          sparse-checkout: .github/actions
+          sparse-checkout: |
+            .github/actions
+            .github/scripts
           path: workflow-ref
           persist-credentials: false
 
