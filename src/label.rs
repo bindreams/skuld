@@ -391,6 +391,78 @@ fn format_expr(expr: &LabelExpr) -> String {
 /// semantically-equivalent inputs produce structurally identical outputs.
 /// Returns `Err` with a human-readable message on malformed input.
 pub(crate) fn parse_label_expr(input: &str) -> Result<LabelExpr, String> {
+    parse_raw_label_expr(input).map(canonicalize)
+}
+
+/// `SKULD_LABELS`, parsed once: the canonical filter, and the label names as
+/// written. Canonicalization drops names that cancel out (`x | !x` becomes
+/// `true`), so the names come from the raw expression.
+pub(crate) struct LabelSelection {
+    pub(crate) filter: LabelFilter,
+    /// Lowercased, sorted, deduplicated.
+    pub(crate) names: Vec<String>,
+}
+
+impl LabelSelection {
+    pub(crate) fn parse(input: &str) -> Result<Self, String> {
+        let raw = parse_raw_label_expr(input)?;
+        let mut names: Vec<String> = collect_terminals(&raw).into_iter().map(str::to_owned).collect();
+        names.sort();
+        names.dedup();
+        Ok(Self {
+            filter: LabelFilter {
+                expr: canonicalize(raw),
+            },
+            names,
+        })
+    }
+}
+
+/// Read and parse `SKULD_LABELS`. `None` if unset.
+///
+/// # Panics
+///
+/// If the value is not valid UTF-8, or is not a valid expression (including
+/// `""` and whitespace-only).
+pub(crate) fn read_label_selection() -> Option<LabelSelection> {
+    let val = crate::skuld_env::read("SKULD_LABELS")?;
+    match LabelSelection::parse(&val) {
+        Ok(selection) => Some(selection),
+        Err(e) => panic!("skuld: SKULD_LABELS: {e}"),
+    }
+}
+
+/// The panic message for names in `names` that `declared` lacks, or `None` if
+/// all are declared. `declared` may repeat and is listed sorted, once.
+pub(crate) fn unknown_labels_message(names: &[String], declared: &[&str]) -> Option<String> {
+    let mut declared: Vec<&str> = declared.to_vec();
+    declared.sort();
+    declared.dedup();
+    let unknown: Vec<String> = names
+        .iter()
+        .filter(|n| !declared.contains(&n.as_str()))
+        .map(|n| format!("{n:?}"))
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    let declared: Vec<String> = declared.iter().map(|n| format!("{n:?}")).collect();
+    Some(format!(
+        "skuld: SKULD_LABELS names unknown label(s) {}; declared labels: [{}]",
+        unknown.join(", "),
+        declared.join(", ")
+    ))
+}
+
+/// Panic if `names` includes a label no `#[skuld::label]` in this binary declares.
+pub(crate) fn validate_known_labels(names: &[String]) {
+    let declared: Vec<&str> = inventory::iter::<LabelEntry>.into_iter().map(|e| e.name).collect();
+    if let Some(msg) = unknown_labels_message(names, &declared) {
+        panic!("{msg}");
+    }
+}
+
+fn parse_raw_label_expr(input: &str) -> Result<LabelExpr, String> {
     use pest::Parser;
 
     let pairs =
@@ -406,8 +478,7 @@ pub(crate) fn parse_label_expr(input: &str) -> Result<LabelExpr, String> {
         .find(|p| p.as_rule() == Rule::expr)
         .expect("pest grammar guarantees input rule contains expr");
 
-    let raw = build_expr(expr_pair)?;
-    Ok(canonicalize(raw))
+    build_expr(expr_pair)
 }
 
 fn build_expr(pair: pest::iterators::Pair<'_, Rule>) -> Result<LabelExpr, String> {
@@ -451,20 +522,6 @@ fn build_expr(pair: pest::iterators::Pair<'_, Rule>) -> Result<LabelExpr, String
         Rule::bool_lit => Ok(Expr::Const(pair.as_str().eq_ignore_ascii_case("true"))),
         Rule::label => Ok(Expr::Terminal(pair.as_str().to_ascii_lowercase())),
         _ => Err(format!("unexpected rule: {:?}", pair.as_rule())),
-    }
-}
-
-/// Read label filter from the `SKULD_LABELS` environment variable.
-///
-/// - Unset → `None` (no filtering, all tests run).
-/// - Not valid UTF-8 → panics.
-/// - `""` (empty / whitespace-only) → panics (invalid expression).
-/// - Non-empty → parses as a boolean expression; panics on malformed input.
-pub(crate) fn read_label_filter() -> Option<LabelFilter> {
-    let val = crate::skuld_env::read("SKULD_LABELS")?;
-    match LabelFilter::parse(&val) {
-        Ok(filter) => Some(filter),
-        Err(e) => panic!("skuld: SKULD_LABELS: {e}"),
     }
 }
 

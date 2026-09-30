@@ -275,3 +275,26 @@ fn no_violations_leave_the_conclusion_untouched() {
         passing_conclusion()
     );
 }
+
+// SKULD_LABELS is read once =====
+
+/// The startup label check and the filter must come from the same read of
+/// `SKULD_LABELS`: a second read could see a value the check never validated.
+/// The environment cannot be changed deterministically between two reads, so
+/// this counts reads instead.
+#[test]
+fn the_label_check_and_the_filter_share_one_read_of_skuld_labels() {
+    for require_known in [false, true] {
+        crate::skuld_env::reset_reads();
+        let mut runner = TestRunner::new();
+        if require_known {
+            runner.require_known_labels();
+        }
+        let _filter = runner.startup_label_filter();
+        assert_eq!(
+            crate::skuld_env::reads_of("SKULD_LABELS"),
+            1,
+            "require_known_labels = {require_known}"
+        );
+    }
+}
