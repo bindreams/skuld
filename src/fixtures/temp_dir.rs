@@ -27,7 +27,7 @@ impl TempDir {
         Self::with_prefix_in(".tmp", parent.as_ref())
     }
 
-    fn with_prefix_in(prefix: &str, parent: &Path) -> io::Result<Self> {
+    pub(crate) fn with_prefix_in(prefix: &str, parent: &Path) -> io::Result<Self> {
         let pid = std::process::id();
         let created = create_in(parent, || {
             let n = NEXT.fetch_add(1, Ordering::Relaxed);
