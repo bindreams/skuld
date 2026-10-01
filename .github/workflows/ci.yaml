@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # `.config/nextest.toml` requires the same nextest.
+  # `.config/nextest.toml` requires the same nextest; one Renovate manager moves both.
   NEXTEST_VERSION: "0.9.137"
 
 jobs:
@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # fetch-depth: 0 is required so `cargo xtask version --check`
           # (run via the prek hook) can see ancestor tags. Default depth 1
@@ -28,6 +28,7 @@ jobs:
       # cargo-xtask-version hooks inside prek can find a Rust toolchain.
       - uses: ./.github/actions/setup-rust
         with:
+          pin-file: .github/release-toolchain
           components: rustfmt, clippy
 
       # Single source of truth for lint is prek.toml — the same checks run
@@ -41,33 +42,19 @@ jobs:
       - name: Derive pinned shellcheck version from prek.toml
         # actionlint's shellcheck (see prek.toml) is not the shellcheck-py
         # hook's own binary — it shells out to whatever `shellcheck` is on
-        # PATH, so CI needs its own install. Parse the version straight out
-        # of prek.toml's shellcheck-py `rev` instead of pinning a second copy
-        # by hand, so there's one number to bump, not two to keep in step.
+        # PATH, so CI needs its own install. The version comes from the
+        # `# frozen: <tag>` comment on prek.toml's shellcheck-py `rev`, so
+        # there's one number to bump, not two to keep in step.
         id: shellcheck-pin
         run: |
           set -euo pipefail
-          version=$(python3 - <<'PY'
-          import tomllib
-
-          with open("prek.toml", "rb") as f:
-              data = tomllib.load(f)
-          rev = next(
-              r["rev"]
-              for r in data["repos"]
-              if r.get("repo") == "https://github.com/shellcheck-py/shellcheck-py"
-          )
-          # shellcheck-py tags as v<shellcheck-version>.<pypi-patch>, e.g.
-          # v0.11.0.1 wraps shellcheck 0.11.0 -- drop the trailing segment.
-          print(".".join(rev.lstrip("v").split(".")[:-1]))
-          PY
-          )
+          version=$(.github/scripts/prek-frozen-tag.sh prek.toml https://github.com/shellcheck-py/shellcheck-py --tool-version)
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # actionlint's shellcheck integration silently degrades if the binary is
       # missing (see prek.toml) — install it explicitly and verify.
       - name: Install shellcheck
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: shellcheck@${{ steps.shellcheck-pin.outputs.version }}
 
@@ -109,10 +96,13 @@ jobs:
         run: |
           .github/scripts/tests/verify-sole-release.test.sh
           .github/scripts/tests/release-toolchain.test.sh
+          .github/scripts/tests/prek-frozen-tag.test.sh
           .github/scripts/tests/check-toolchain.test.sh
           .github/scripts/tests/require-target-on-main.test.sh
 
-      - uses: j178/prek-action@v2
+      - uses: j178/prek-action@5337cb91e0fa35a7ff31b9ca345126d8bbbcdf16 # v2
+        with:
+          prek-version: 0.5.3
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
@@ -149,13 +139,14 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: ./.github/actions/setup-rust
         with:
+          pin-file: .github/release-toolchain
           targets: ${{ matrix.target }}
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 

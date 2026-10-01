@@ -34,7 +34,7 @@ runs:
 
     - name: Install Rust toolchain
       id: install
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
       with:
         toolchain: ${{ inputs.toolchain }}
         components: ${{ inputs.components }}

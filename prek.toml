@@ -63,9 +63,13 @@ pass_filenames = false
 
 # External hooks =======================================================================================================
 
+# Every external hook is pinned as `rev = "<40-hex commit SHA>" # frozen: <tag>`, with `repo` on the line
+# before `rev` (comment lines may sit between). `prek autoupdate --freeze` writes this form. Renovate's
+# prek manager (.github/renovate.json) tracks only this form, so a rev in any other shape goes untracked.
+
 [[repos]]
 repo = "https://github.com/pre-commit/pre-commit-hooks"
-rev = "v5.0.0"
+rev = "cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b" # frozen: v5.0.0
 hooks = [
   { id = "check-executables-have-shebangs" },
   { id = "check-shebang-scripts-are-executable", exclude_types = ["rust"] },
@@ -78,7 +82,7 @@ hooks = [
 # rewriting it to `\`. That matters for files like LICENSE.md whose
 # byte identity is conventional.
 repo = "https://github.com/rbubley/mirrors-prettier"
-rev = "v3.8.2"
+rev = "b25652612a4a3c1da8caccfca9af661db56b2c07" # frozen: v3.8.2
 hooks = [
   { id = "prettier", types = ["markdown"] },
 ]
@@ -94,8 +98,12 @@ hooks = [
 # shellcheck-py rather than the upstream Docker hook: this is a Rust repo and
 # a Docker daemon is a heavy thing to require of anyone running `prek` on a
 # staged shell script.
+# ci.yaml installs the shellcheck that actionlint shells out to, at the version
+# in this block's `# frozen: <tag>` comment (`.github/scripts/prek-frozen-tag.sh`
+# reads it), rather than pinning its own copy. `rev` and the comment must move
+# together; Renovate's prek manager moves both.
 repo = "https://github.com/shellcheck-py/shellcheck-py"
-rev = "v0.11.0.1"
+rev = "745eface02aef23e168a8afb6b5737818efbea95" # frozen: v0.11.0.1
 hooks = [
   { id = "shellcheck" },
 ]
@@ -107,23 +115,21 @@ hooks = [
 # otherwise silently skips that rule; the `shellcheck-on-path` local hook
 # above turns a missing binary into a loud failure instead, so this can no
 # longer pass quietly in either a local `prek run` or CI's `prek run
-# --all-files`. ci.yaml derives the shellcheck version it installs from this
-# block's `rev` rather than pinning its own copy, so there is one version
-# number to bump, not two to keep in step.
+# --all-files`.
 #
 # actionlint invokes shellcheck with `--norc`, so `.shellcheckrc` cannot reach
 # `run:` blocks. The options are therefore set as this hook's own environment,
 # which keeps them in the same file as every other lint setting. Keep this
 # list in step with `.shellcheckrc`, which governs standalone scripts.
 repo = "https://github.com/rhysd/actionlint"
-rev = "v1.7.12"
+rev = "914e7df21a07ef503a81201c76d2b11c789d3fca" # frozen: v1.7.12
 hooks = [
   { id = "actionlint", env = { SHELLCHECK_OPTS = "--enable=add-default-case,check-extra-masked-returns" } },
 ]
 
 [[repos]]
 repo = "https://github.com/editorconfig-checker/editorconfig-checker.python"
-rev = "3.2.1"
+rev = "3bea62898235acc3f05c1d9c33023345f6cd3c6f" # frozen: 3.2.1
 hooks = [
   { id = "editorconfig-checker", exclude_types = ["rust", "markdown"] },
 ]

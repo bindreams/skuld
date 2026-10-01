@@ -1,40 +1,231 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
-  "schedule": ["before 9am on monday"],
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "schedule": [
+    "before 9am on monday"
+  ],
   "minimumReleaseAge": "7 days",
-  "platformAutomerge": true,
+  "internalChecksFilter": "strict",
+  "automerge": true,
+  "platformAutomerge": false,
   "customManagers": [
     {
       "customType": "regex",
       "description": "Release toolchain pin (see CONTRIBUTING.md, Toolchain pin)",
-      "managerFilePatterns": ["/^\\.github/release-toolchain$/"],
-      "matchStrings": ["^(?<currentValue>(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*))\\n*$"],
+      "managerFilePatterns": [
+        "/^\\.github/release-toolchain$/"
+      ],
+      "matchStrings": [
+        "^(?<currentValue>(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*))\\n*$"
+      ],
       "depNameTemplate": "rust-lang/rust",
       "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "description": "prek hook revs in prek.toml, pinned by commit SHA with a `# frozen: <tag>` comment",
+      "managerFilePatterns": [
+        "/^prek\\.toml$/"
+      ],
+      "matchStrings": [
+        "repo = \"https://github\\.com/(?<depName>[^\"/]+/[^\"/]+)\"\\s*\\n(?:\\s*#[^\\n]*\\n)*\\s*rev = \"(?<currentDigest>[0-9a-f]{40})\"\\s*# frozen: (?<currentValue>\\S+)"
+      ],
+      "datasourceTemplate": "github-tags",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "description": "cargo-nextest: one version in ci.yaml and .config/nextest.toml, moved together",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yaml$/",
+        "/^\\.config/nextest\\.toml$/"
+      ],
+      "matchStrings": [
+        "NEXTEST_VERSION: \"(?<currentValue>[^\"]+)\"",
+        "nextest-version = \\{ required = \"(?<currentValue>[^\"]+)\" \\}"
+      ],
+      "depNameTemplate": "cargo-nextest",
+      "datasourceTemplate": "crate",
+      "depTypeTemplate": "ci-tool",
+      "matchStringsStrategy": "any",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "sccache installed by mozilla-actions/sccache-action",
+      "managerFilePatterns": [
+        "/^\\.github/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "sccache-action@[0-9a-f]{40} # \\S+\\n\\s+with:\\n\\s+version: (?<currentValue>\\S+)"
+      ],
+      "depNameTemplate": "mozilla/sccache",
+      "datasourceTemplate": "github-releases",
+      "depTypeTemplate": "ci-tool"
+    },
+    {
+      "customType": "regex",
+      "description": "prek installed by j178/prek-action",
+      "managerFilePatterns": [
+        "/^\\.github/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "prek-action@[0-9a-f]{40} # \\S+\\n\\s+with:\\n\\s+prek-version: (?<currentValue>\\S+)"
+      ],
+      "depNameTemplate": "j178/prek",
+      "datasourceTemplate": "github-releases",
+      "depTypeTemplate": "ci-tool",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "uv installed on Read the Docs",
+      "managerFilePatterns": [
+        "/^docs/\\.readthedocs\\.yaml$/"
+      ],
+      "matchStrings": [
+        "asdf install uv (?<currentValue>\\S+)",
+        "asdf global uv (?<currentValue>\\S+)"
+      ],
+      "depNameTemplate": "astral-sh/uv",
+      "datasourceTemplate": "github-releases",
+      "depTypeTemplate": "ci-tool",
+      "matchStringsStrategy": "any"
     }
   ],
   "packageRules": [
     {
-      "description": "Group GitHub Actions updates",
-      "matchManagers": ["github-actions"],
-      "groupName": "github-actions",
-      "automerge": true,
-      "matchUpdateTypes": ["minor", "patch", "pin", "digest"]
+      "description": "Cargo.toml keeps library version ranges; the lockfile is the pin, so updates within range touch only Cargo.lock",
+      "matchManagers": [
+        "cargo"
+      ],
+      "rangeStrategy": "update-lockfile"
     },
     {
-      "description": "Group Cargo updates",
-      "matchManagers": ["cargo"],
-      "groupName": "cargo",
-      "automerge": true,
-      "matchUpdateTypes": ["minor", "patch", "pin", "digest"]
+      "matchManagers": [
+        "cargo"
+      ],
+      "rangeStrategy": "update-lockfile"
     },
     {
-      "description": "Group pip updates",
-      "matchManagers": ["pep621"],
-      "groupName": "pip",
-      "automerge": true,
-      "matchUpdateTypes": ["minor", "patch", "pin", "digest"]
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Renovate's built-in github-actions manager also reads prek-action's `prek-version` input, with tags in a form that does not match the pinned value; the custom manager owns it",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepNames": [
+        "prek"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Actions only the release workflows run: PR CI never exercises them, so a green PR proves nothing and they are never automerged",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "rust-lang/crates-io-auth-action",
+        "actions/download-artifact",
+        "actions/upload-artifact"
+      ],
+      "groupName": "release-actions",
+      "automerge": false
+    },
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "cargo"
+    },
+    {
+      "matchManagers": [
+        "pep621",
+        "poetry"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "pip"
+    },
+    {
+      "matchFileNames": [
+        "prek.toml"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "prek"
+    },
+    {
+      "matchDepTypes": [
+        "ci-tool"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "ci-tools"
+    },
+    {
+      "description": "docs/uv.lock pins the transitive docs dependencies; Renovate refreshes it",
+      "matchManagers": [
+        "pep621"
+      ],
+      "lockFileMaintenance": {
+        "enabled": true
+      }
+    },
+    {
+      "matchFileNames": [
+        ".github/release-toolchain"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "release-toolchain"
+    },
+    {
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "groupName": null
     }
   ]
 }
