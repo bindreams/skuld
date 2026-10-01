@@ -63,6 +63,10 @@ pass_filenames = false
 
 # External hooks =======================================================================================================
 
+# Every external hook is pinned as `rev = "<40-hex commit SHA>" # frozen: <tag>`, with `repo` on the line
+# before `rev` (comment lines may sit between). `prek autoupdate --freeze` writes this form. Renovate's
+# prek manager (.github/renovate.json) tracks only this form, so a rev in any other shape goes untracked.
+
 [[repos]]
 repo = "https://github.com/pre-commit/pre-commit-hooks"
 rev = "cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b" # frozen: v5.0.0
@@ -94,6 +98,10 @@ hooks = [
 # shellcheck-py rather than the upstream Docker hook: this is a Rust repo and
 # a Docker daemon is a heavy thing to require of anyone running `prek` on a
 # staged shell script.
+# ci.yaml installs the shellcheck that actionlint shells out to, at the version
+# in this block's `# frozen: <tag>` comment (`.github/scripts/prek-frozen-tag.sh`
+# reads it), rather than pinning its own copy. `rev` and the comment must move
+# together; Renovate's prek manager moves both.
 repo = "https://github.com/shellcheck-py/shellcheck-py"
 rev = "745eface02aef23e168a8afb6b5737818efbea95" # frozen: v0.11.0.1
 hooks = [
@@ -107,9 +115,7 @@ hooks = [
 # otherwise silently skips that rule; the `shellcheck-on-path` local hook
 # above turns a missing binary into a loud failure instead, so this can no
 # longer pass quietly in either a local `prek run` or CI's `prek run
-# --all-files`. ci.yaml derives the shellcheck version it installs from this
-# block's `rev` rather than pinning its own copy, so there is one version
-# number to bump, not two to keep in step.
+# --all-files`.
 #
 # actionlint invokes shellcheck with `--norc`, so `.shellcheckrc` cannot reach
 # `run:` blocks. The options are therefore set as this hook's own environment,

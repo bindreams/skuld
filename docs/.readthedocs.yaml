@@ -5,11 +5,18 @@ build:
   os: ubuntu-24.04
   tools:
     python: "3.13"
+  jobs:
+    # The install is `uv sync --frozen`, so docs/uv.lock pins every transitive dependency.
+    # The uv version below is tracked by Renovate (.github/renovate.json).
+    pre_create_environment:
+      - asdf plugin add uv
+      - asdf install uv 0.12.18
+      - asdf global uv 0.12.18
+    create_environment:
+      - uv venv "${READTHEDOCS_VIRTUALENV_PATH}"
+    install:
+      - UV_PROJECT_ENVIRONMENT="${READTHEDOCS_VIRTUALENV_PATH}" uv sync --frozen --project docs
 
 sphinx:
   configuration: docs/src/conf.py
   fail_on_warning: true
-
-python:
-  install:
-    - path: docs
