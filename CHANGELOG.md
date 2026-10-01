@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-01
+
 ### Breaking
 
 - **A repeated argument in `#[skuld::test(...)]` or `#[skuld::fixture(...)]` is
