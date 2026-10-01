@@ -48,18 +48,21 @@ jobs:
         run: |
           set -euo pipefail
           version=$(python3 - <<'PY'
-          import tomllib
+          import re
 
-          with open("prek.toml", "rb") as f:
-              data = tomllib.load(f)
-          rev = next(
-              r["rev"]
-              for r in data["repos"]
-              if r.get("repo") == "https://github.com/shellcheck-py/shellcheck-py"
+          # `rev` is a commit SHA; the tag is its `# frozen: <tag>` comment,
+          # which tomllib discards, so match the raw text.
+          with open("prek.toml", encoding="utf-8") as f:
+              text = f.read()
+          m = re.search(
+              r'repo = "https://github\.com/shellcheck-py/shellcheck-py"\n'
+              r'rev = "[0-9a-f]{40}" # frozen: (\S+)',
+              text,
           )
+          assert m, "shellcheck-py rev not found in prek.toml"
           # shellcheck-py tags as v<shellcheck-version>.<pypi-patch>, e.g.
           # v0.11.0.1 wraps shellcheck 0.11.0 -- drop the trailing segment.
-          print(".".join(rev.lstrip("v").split(".")[:-1]))
+          print(".".join(m.group(1).lstrip("v").split(".")[:-1]))
           PY
           )
           echo "version=$version" >> "$GITHUB_OUTPUT"
