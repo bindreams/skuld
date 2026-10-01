@@ -68,7 +68,7 @@ jobs:
       # known, and that lookup needs the validated version; so the scripts and
       # actions used here come from the dispatch commit.
       - name: Check out the release scripts from the workflow ref
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         timeout-minutes: 5
         with:
           ref: ${{ github.sha }}
@@ -152,7 +152,7 @@ jobs:
       # and a new stable cannot change them. Read from the draft's target, not
       # the dispatch commit.
       - name: Check out the toolchain pin from the draft's target
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         timeout-minutes: 5
         with:
           ref: ${{ steps.release.outputs.commit_sha }}
@@ -178,7 +178,7 @@ jobs:
     steps:
       # The draft's target, not the dispatch commit. No credentials are left in
       # `.git/config`: everything below runs third-party build code.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         timeout-minutes: 10
         with:
           ref: ${{ needs.resolve.outputs.commit_sha }}
@@ -319,7 +319,7 @@ jobs:
       # directory), so it holds no stray untracked files for `cargo package` to
       # reject.
       - name: Check out the actions from the workflow ref
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         timeout-minutes: 5
         with:
           ref: ${{ github.sha }}
@@ -331,7 +331,7 @@ jobs:
 
       # Same commit the build job built. `persist-credentials: false` keeps the
       # write token out of `.git/config`; the flip step gets it explicitly.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         timeout-minutes: 10
         with:
           ref: ${{ needs.resolve.outputs.commit_sha }}
