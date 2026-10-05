@@ -1,4 +1,4 @@
-nextest-version = { required = "0.9.137" }
+nextest-version = { required = "0.9.146" }
 
 [profile.default]
 # `tests/integration.rs` (`harness = false`) asserts whole-run side effects after `run_tests`
