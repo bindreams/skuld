@@ -9,7 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # `.config/nextest.toml` requires the same nextest; one Renovate manager moves both.
-  NEXTEST_VERSION: "0.9.137"
+  NEXTEST_VERSION: "0.9.146"
 
 jobs:
   lint:
