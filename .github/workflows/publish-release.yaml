@@ -248,14 +248,14 @@ jobs:
           cat "$RUNNER_TEMP/sha256sums/SHA256SUMS"
 
       # For forensics only: nothing downstream reads these.
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         timeout-minutes: 5
         with:
           name: crates
           path: ${{ runner.temp }}/crates
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         timeout-minutes: 5
         with:
           name: sha256sums
