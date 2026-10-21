@@ -12,4 +12,5 @@ gix = { version = "0.85.0", default-features = false, features = ["revision", "s
 semver = "1"
 
 [dev-dependencies]
+ignore = "0.4"
 tempfile = "3"
