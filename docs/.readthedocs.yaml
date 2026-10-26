@@ -10,8 +10,8 @@ build:
     # The uv version below is tracked by Renovate (.github/renovate.json).
     pre_create_environment:
       - asdf plugin add uv
-      - asdf install uv 0.13.0
-      - asdf global uv 0.13.0
+      - asdf install uv 0.13.1
+      - asdf global uv 0.13.1
     create_environment:
       - uv venv "${READTHEDOCS_VIRTUALENV_PATH}"
     install:
