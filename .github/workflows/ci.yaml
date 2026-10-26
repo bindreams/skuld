@@ -102,7 +102,7 @@ jobs:
 
       - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
         with:
-          prek-version: 0.5.5
+          prek-version: 0.5.6
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
