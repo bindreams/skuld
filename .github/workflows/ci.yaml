@@ -9,7 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # `.config/nextest.toml` requires the same nextest; one Renovate manager moves both.
-  NEXTEST_VERSION: "0.9.149"
+  NEXTEST_VERSION: "0.9.150"
 
 jobs:
   lint:
@@ -102,7 +102,7 @@ jobs:
 
       - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
         with:
-          prek-version: 0.5.7
+          prek-version: 0.5.9
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
