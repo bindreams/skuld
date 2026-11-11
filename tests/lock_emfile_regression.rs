@@ -45,8 +45,10 @@ fn open_lock_target_panics_immediately_on_emfile_instead_of_spinning() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("failed to open the coordination directory") && stderr.contains("os error 24"),
-        "expected lock_emfile_probe to panic from open_lock_target's own panic message, with EMFILE, got \
-         stderr:\n{stderr}"
+        stderr.contains("failed to open the coordination directory")
+            && stderr.contains(&format!("{coord_dir:?}"))
+            && stderr.contains("os error 24"),
+        "expected lock_emfile_probe to panic from open_lock_target's own panic message, naming the \
+         directory, with EMFILE, got stderr:\n{stderr}"
     );
 }

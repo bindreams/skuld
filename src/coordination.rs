@@ -84,7 +84,7 @@ pub(crate) fn coord_dir() -> PathBuf {
 /// deterministically prove a second process's `try_lock` on the same lock target reports
 /// `WouldBlock` while this one is running, then succeeds once it returns.
 pub(crate) fn probe_hold_global_lock(coord_dir: &std::path::Path, while_held: impl FnOnce()) {
-    lock::with_global_lock(&registry::mutex_base(coord_dir), |_token| while_held())
+    lock::with_global_lock(coord_dir, |_token| while_held())
 }
 
 /// Probe hook for Skuld's own test suite (`tests/lock_contention_regression.rs`,
@@ -94,7 +94,7 @@ pub(crate) fn probe_hold_global_lock(coord_dir: &std::path::Path, while_held: im
 /// `flock`/`LockFileEx` locks are scoped to the open file description/handle, not the process:
 /// only a genuinely separate handle (here, in a separate process) can observe contention.
 pub(crate) fn probe_try_global_lock(coord_dir: &std::path::Path) -> Result<(), std::fs::TryLockError> {
-    lock::try_lock_exclusive(&lock::open_lock_target(&registry::mutex_base(coord_dir)))
+    lock::try_lock_exclusive(&lock::open_lock_target(coord_dir))
 }
 
 /// Canonicalize a raw `serial_filter` string for storage in a registry entry.

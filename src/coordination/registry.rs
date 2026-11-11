@@ -1,7 +1,7 @@
 //! The registry of running tests, kept on OS file locks.
 //!
-//! `coord_dir` (`<resolved>/.skuld`) holds the global mutex (see [`super::lock`], taken for
-//! [`mutex_base`]) and `running/`, which holds per registered test:
+//! `coord_dir` (`<resolved>/.skuld`) holds the global mutex (see [`super::lock`]) and `running/`,
+//! which holds per registered test:
 //!
 //! - `<id>.lock`, created and locked by its owner for the registration's lifetime. The kernel
 //!   releases the lock when the owner dies, so liveness is whether the lock can be taken, not a
@@ -29,12 +29,6 @@ use crate::label::{Label, LabelFilter};
 use super::test_hooks::{self, Seam};
 
 // Layout =====
-
-/// The base path the global mutex is taken for: Unix locks `coord_dir` itself, Windows
-/// `coord_dir/global.lock`.
-pub(super) fn mutex_base(coord_dir: &Path) -> PathBuf {
-    coord_dir.join("global")
-}
 
 pub(super) fn running_dir(coord_dir: &Path) -> PathBuf {
     coord_dir.join("running")
@@ -352,7 +346,7 @@ impl Registration {
         let (lock, json) = (lock_path(&running, &self.id), json_path(&running, &self.id));
         // Opens nothing on Unix: `stat`, `metadata` and `remove_file` need no descriptor. (Windows
         // has no descriptor limit, and `target_has_split` there reopens the lock file.)
-        with_locked_target(&mutex_base(&coord_dir), &self.mutex_target, |held| {
+        with_locked_target(&coord_dir, &self.mutex_target, |held| {
             #[cfg(test)]
             test_hooks::run_seam(Seam::Unregistering);
             let json_exists = or_panic("inspect", &json, json.try_exists());
@@ -393,9 +387,8 @@ pub(super) fn try_register(
         &running,
         super::db_dir::create_dir_all_open(&running),
     );
-    let base = mutex_base(coord_dir);
-    let mutex_target = open_lock_target(&base);
-    let (id, lock, lock_identity, json_hold) = with_locked_target(&base, &mutex_target, |held| {
+    let mutex_target = open_lock_target(coord_dir);
+    let (id, lock, lock_identity, json_hold) = with_locked_target(coord_dir, &mutex_target, |held| {
         if held.target_has_split() {
             panic!("{}", moved_message(coord_dir, "registering a test"));
         }

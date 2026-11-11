@@ -1,11 +1,11 @@
 //! The global mutex of the coordination directory `.skuld/`: a blocking, exclusive advisory lock
 //! that every test taking part in coordination holds while it creates or deletes anything in it.
 //!
-//! It is taken for a base path (`<coord_dir>/global`). Unix locks the base's parent directory
-//! itself, opened `O_RDONLY | O_DIRECTORY`: `flock` works on a read-only directory fd, so there is
-//! no lock file, and deleting files inside the directory cannot split the lock. Windows locks the
-//! sibling file `<base>.lock` ([`lock_path`]), opened without `FILE_SHARE_DELETE` so it cannot be
-//! deleted or renamed while held. Opening it needs read permission on the directory (Unix) or
+//! It is taken for the coordination directory `coord_dir`, on the path [`lock_path`] returns. Unix
+//! locks `coord_dir` itself, opened `O_RDONLY | O_DIRECTORY`: `flock` works on a read-only
+//! directory fd, so there is no lock file, and deleting files inside the directory cannot split
+//! the lock. Windows locks `coord_dir/global.lock`, opened without `FILE_SHARE_DELETE` so it cannot
+//! be deleted or renamed while held. Opening it needs read permission on the directory (Unix) or
 //! create permission (Windows).
 //!
 //! An open that succeeds is already the lock every other caller contends for, as long as the
@@ -26,10 +26,7 @@
 
 use super::skuld_debug_eprintln;
 use std::fs::{File, OpenOptions};
-use std::path::Path;
-
-#[cfg(windows)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The share mode of every file the coordination directory holds open: no `FILE_SHARE_DELETE`, so
 /// none can be deleted or renamed while open.
@@ -37,19 +34,20 @@ use std::path::PathBuf;
 pub(super) const WINDOWS_SHARE_MODE: u32 =
     windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0 | windows::Win32::Storage::FileSystem::FILE_SHARE_WRITE.0;
 
-/// The lock file for `base` on Windows: `base` with `.lock` appended verbatim, so `<dir>/global`
-/// gets `<dir>/global.lock`. Unix has no lock file (see the module doc).
-#[cfg(windows)]
-pub(super) fn lock_path(base: &Path) -> PathBuf {
-    let mut name = base.as_os_str().to_owned();
-    name.push(".lock");
-    PathBuf::from(name)
+/// What the mutex of `coord_dir` locks: `coord_dir` itself on Unix, `coord_dir/global.lock` on
+/// Windows. The path every message about the lock names.
+pub(super) fn lock_path(coord_dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        coord_dir.join("global.lock")
+    } else {
+        coord_dir.to_path_buf()
+    }
 }
 
-/// Proof that the global mutex is held, carrying the base path it was taken for. Obtainable only
-/// inside [`with_global_lock`]'s closure.
+/// Proof that the global mutex is held, carrying the coordination directory it was taken for.
+/// Obtainable only inside [`with_global_lock`]'s closure.
 pub(super) struct GlobalLockHeld<'a> {
-    path: &'a Path,
+    coord_dir: &'a Path,
     /// dev+ino (Unix) or volume serial + file index (Windows) of the lock target this token's lock
     /// is held on, recorded at acquisition; see [`Self::target_has_split`].
     #[cfg(unix)]
@@ -59,18 +57,18 @@ pub(super) struct GlobalLockHeld<'a> {
 }
 
 impl<'a> GlobalLockHeld<'a> {
-    /// True once the lock target this token holds no longer matches what the base path
+    /// True once the lock target this token holds no longer matches what `coord_dir`
     /// resolves to: the lock has split, so a new opener locks the replacement while this handle
-    /// only excludes callers of the detached original. Unix compares the parent directory's
-    /// recorded identity against a fresh `stat`.
+    /// only excludes callers of the detached original. Unix compares `coord_dir`'s recorded
+    /// identity against a fresh `stat`.
     #[cfg(unix)]
     pub(super) fn target_has_split(&self) -> bool {
         match self.stat_target() {
             Ok(identity) => identity != self.target_identity,
             Err(e) => {
                 skuld_debug_eprintln!(
-                    "global lock target of {:?} could not be inspected, treating as split: {e}",
-                    self.path
+                    "global lock target {:?} could not be inspected, treating as split: {e}",
+                    lock_path(self.coord_dir)
                 );
                 true
             }
@@ -82,10 +80,10 @@ impl<'a> GlobalLockHeld<'a> {
     #[cfg(unix)]
     pub(super) fn stat_target(&self) -> std::io::Result<(u64, u64)> {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(lock_dir(self.path)).map(|m| (m.dev(), m.ino()))
+        std::fs::metadata(self.coord_dir).map(|m| (m.dev(), m.ino()))
     }
 
-    /// Windows: compares a fresh open of [`lock_path`] against the recorded identity.
+    /// Windows: compares a fresh open of `coord_dir/global.lock` against the recorded identity.
     /// Withholding `FILE_SHARE_DELETE` stops the lock file itself being deleted or renamed, but
     /// not a symlink or junction ancestor being retargeted.
     #[cfg(windows)]
@@ -93,12 +91,12 @@ impl<'a> GlobalLockHeld<'a> {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
 
-        let fresh = match std::fs::File::open(lock_path(self.path)) {
+        let fresh = match std::fs::File::open(lock_path(self.coord_dir)) {
             Ok(f) => f,
             Err(e) => {
                 skuld_debug_eprintln!(
-                    "global lock file of {:?} could not be reopened, treating as split: {e}",
-                    self.path
+                    "global lock file {:?} could not be reopened, treating as split: {e}",
+                    lock_path(self.coord_dir)
                 );
                 return true;
             }
@@ -111,8 +109,8 @@ impl<'a> GlobalLockHeld<'a> {
         // into.
         if let Err(e) = unsafe { GetFileInformationByHandle(handle, &mut info) } {
             skuld_debug_eprintln!(
-                "global lock file of {:?} could not be inspected, treating as split: {e}",
-                self.path
+                "global lock file {:?} could not be inspected, treating as split: {e}",
+                lock_path(self.coord_dir)
             );
             return true;
         }
@@ -124,10 +122,10 @@ impl<'a> GlobalLockHeld<'a> {
     }
 }
 
-/// Run `f` while holding the global mutex for `base` (see the module doc). Blocks with no
+/// Run `f` while holding the global mutex of `coord_dir` (see the module doc). Blocks with no
 /// timeout. The lock is released when the handle closes, on `f`'s return and on a panic in it.
-pub(super) fn with_global_lock<T>(base: &Path, f: impl FnOnce(&GlobalLockHeld<'_>) -> T) -> T {
-    with_locked_target(base, &open_lock_target(base), f)
+pub(super) fn with_global_lock<T>(coord_dir: &Path, f: impl FnOnce(&GlobalLockHeld<'_>) -> T) -> T {
+    with_locked_target(coord_dir, &open_lock_target(coord_dir), f)
 }
 
 /// [`with_global_lock`] on a `target` the caller already opened with [`open_lock_target`] and
@@ -135,8 +133,13 @@ pub(super) fn with_global_lock<T>(base: &Path, f: impl FnOnce(&GlobalLockHeld<'_
 /// panics, so the caller can lock it again later without opening anything. A registration holds
 /// its `target` for that, because a test that has used up its file descriptors must still be able
 /// to unregister. `target` must not be locked already.
-pub(super) fn with_locked_target<T>(base: &Path, target: &File, f: impl FnOnce(&GlobalLockHeld<'_>) -> T) -> T {
-    lock_exclusive(target).unwrap_or_else(|e| panic!("skuld: failed to acquire the global lock for {base:?}: {e}"));
+pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnOnce(&GlobalLockHeld<'_>) -> T) -> T {
+    lock_exclusive(target).unwrap_or_else(|e| {
+        panic!(
+            "skuld: failed to acquire the global lock {:?}: {e}",
+            lock_path(coord_dir)
+        )
+    });
     /// Unlocks on drop, so a panic in `f` does not leave the mutex held by a handle that outlives it.
     struct Unlock<'a>(&'a File);
     impl Drop for Unlock<'_> {
@@ -148,10 +151,12 @@ pub(super) fn with_locked_target<T>(base: &Path, target: &File, f: impl FnOnce(&
     #[cfg(unix)]
     let target_identity = {
         use std::os::unix::fs::MetadataExt;
-        target
-            .metadata()
-            .map(|m| (m.dev(), m.ino()))
-            .unwrap_or_else(|e| panic!("skuld: failed to inspect the global lock target for {base:?}: {e}"))
+        target.metadata().map(|m| (m.dev(), m.ino())).unwrap_or_else(|e| {
+            panic!(
+                "skuld: failed to inspect the global lock {:?}: {e}",
+                lock_path(coord_dir)
+            )
+        })
     };
     #[cfg(windows)]
     let target_identity = {
@@ -164,42 +169,41 @@ pub(super) fn with_locked_target<T>(base: &Path, target: &File, f: impl FnOnce(&
         // `target` is alive, which outlives this call; `&mut info` is a
         // valid `*mut BY_HANDLE_FILE_INFORMATION` for the call to write
         // into.
-        unsafe { GetFileInformationByHandle(handle, &mut info) }
-            .unwrap_or_else(|e| panic!("skuld: failed to inspect the global lock target for {base:?}: {e}"));
+        unsafe { GetFileInformationByHandle(handle, &mut info) }.unwrap_or_else(|e| {
+            panic!(
+                "skuld: failed to inspect the global lock {:?}: {e}",
+                lock_path(coord_dir)
+            )
+        });
         (
             info.dwVolumeSerialNumber,
             (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         )
     };
     f(&GlobalLockHeld {
-        path: base,
+        coord_dir,
         target_identity,
     })
 }
 
-/// The directory holding `base`, which the Unix lock is taken on. `base` is always absolute (it
-/// derives from `coord_dir()`), so it always has a parent.
-#[cfg(unix)]
-fn lock_dir(base: &Path) -> &Path {
-    debug_assert!(base.is_absolute(), "global lock base path must be absolute: {base:?}");
-    base.parent().expect("an absolute path has a parent")
-}
-
-/// Open `base`'s lock target, ready to be locked or try-locked: `base`'s parent directory on
-/// Unix, [`lock_path`]'s file on Windows. Panics if it cannot be opened.
-pub(super) fn open_lock_target(base: &Path) -> File {
+/// Open `coord_dir`'s lock target ([`lock_path`]), ready to be locked or try-locked. Panics if it
+/// cannot be opened.
+pub(super) fn open_lock_target(coord_dir: &Path) -> File {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
 
-        let dir = lock_dir(base);
+        debug_assert!(
+            coord_dir.is_absolute(),
+            "coordination directory must be absolute: {coord_dir:?}"
+        );
         OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(dir)
+            .open(coord_dir)
             .unwrap_or_else(|e| {
                 panic!(
-                    "skuld: failed to open the coordination directory {dir:?} for locking: {e} ({})",
+                    "skuld: failed to open the coordination directory {coord_dir:?} for locking: {e} ({})",
                     super::DB_DIR_HINT
                 )
             })
@@ -208,7 +212,7 @@ pub(super) fn open_lock_target(base: &Path) -> File {
     {
         use std::os::windows::fs::OpenOptionsExt;
 
-        let path = lock_path(base);
+        let path = lock_path(coord_dir);
         OpenOptions::new()
             .create(true)
             .write(true)

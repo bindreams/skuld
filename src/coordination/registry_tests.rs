@@ -5,9 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 
 use super::lock::{lock_exclusive, open_lock_target, try_lock_exclusive};
-use super::registry::{
-    mutex_base, register, register_with, running_dir, try_register, IdGenerator, Registration, PROCESS_IDS,
-};
+use super::registry::{register, register_with, running_dir, try_register, IdGenerator, Registration, PROCESS_IDS};
 use super::rendezvous::rendezvous;
 use super::test_hooks::{retry_rendezvous, set_test_retry_hook, set_test_seam_hook, Seam};
 use super::{SERIAL_ALL, SERIAL_NONE};
@@ -336,7 +334,7 @@ fn lock_file_is_created_under_the_mutex() {
     let _hook = set_test_seam_hook(Seam::Created, {
         let coord = coord.clone();
         move || {
-            let fresh = open_lock_target(&mutex_base(&coord));
+            let fresh = open_lock_target(&coord);
             assert!(
                 matches!(try_lock_exclusive(&fresh), Err(std::fs::TryLockError::WouldBlock)),
                 "the mutex must be held while the lock file is created"

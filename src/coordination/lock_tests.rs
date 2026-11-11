@@ -1,21 +1,23 @@
 //! Tests for the global mutex ([`super::lock`]).
 
-#[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering::SeqCst};
 
-#[cfg(windows)]
-use super::lock::lock_path;
 #[cfg(unix)]
 use super::lock::{lock_exclusive, EINTR_RETRIES};
-use super::lock::{open_lock_target, try_lock_exclusive, with_global_lock};
+use super::lock::{lock_path, open_lock_target, try_lock_exclusive, with_global_lock};
 use super::rendezvous::rendezvous;
 
-#[cfg(windows)]
+/// The path the mutex locks, which every message about it names.
 #[test]
-fn lock_path_appends_dot_lock_to_the_full_base_verbatim() {
-    let base = PathBuf::from(r"C:\some\dir\global");
-    assert_eq!(lock_path(&base), PathBuf::from(r"C:\some\dir\global.lock"));
+fn lock_path_is_the_directory_on_unix_and_global_lock_in_it_on_windows() {
+    let coord = PathBuf::from("some").join("dir");
+    let expected = if cfg!(windows) {
+        coord.join("global.lock")
+    } else {
+        coord.clone()
+    };
+    assert_eq!(lock_path(&coord), expected);
 }
 
 /// `with_global_lock` must be a *mutual exclusion* primitive, not just "don't
@@ -35,7 +37,7 @@ fn with_global_lock_serializes_concurrent_callers() {
 
     for _ in 0..ROUNDS {
         let dir = crate::TempDir::new().unwrap();
-        let base = dir.path().join("global");
+        let coord = dir.path();
         let in_critical_section = AtomicI64::new(0);
         let max_seen = AtomicI64::new(0);
         let points = rendezvous(THREADS);
@@ -44,7 +46,7 @@ fn with_global_lock_serializes_concurrent_callers() {
             for point in points {
                 s.spawn(|| {
                     point.wait();
-                    with_global_lock(&base, |_token| {
+                    with_global_lock(coord, |_token| {
                         let now = in_critical_section.fetch_add(1, SeqCst) + 1;
                         max_seen.fetch_max(now, SeqCst);
                         // Give any missing exclusion room to show up: real
@@ -88,9 +90,9 @@ fn with_global_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet
     const THREADS: usize = 32;
 
     let dir = crate::TempDir::new().unwrap();
-    let base = dir.path().join("global");
+    let coord = dir.path();
     assert!(
-        !lock_path(&base).exists(),
+        !lock_path(coord).exists(),
         "test precondition: lock file must not pre-exist"
     );
 
@@ -102,7 +104,7 @@ fn with_global_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet
         for point in points {
             s.spawn(|| {
                 point.wait();
-                with_global_lock(&base, |_token| {
+                with_global_lock(coord, |_token| {
                     let now = in_critical_section.fetch_add(1, SeqCst) + 1;
                     max_seen.fetch_max(now, SeqCst);
                     in_critical_section.fetch_sub(1, SeqCst);
@@ -130,10 +132,9 @@ fn with_global_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet
 #[test]
 fn a_fresh_try_lock_reports_would_block_while_with_global_lock_holds_the_lock() {
     let dir = crate::TempDir::new().unwrap();
-    let base = dir.path().join("global");
 
-    with_global_lock(&base, |_token| {
-        let fresh = open_lock_target(&base);
+    with_global_lock(dir.path(), |_token| {
+        let fresh = open_lock_target(dir.path());
         match try_lock_exclusive(&fresh) {
             Err(std::fs::TryLockError::WouldBlock) => {}
             other => panic!(
@@ -151,13 +152,13 @@ fn a_fresh_try_lock_reports_would_block_while_with_global_lock_holds_the_lock() 
 #[test]
 fn with_global_lock_panics_immediately_when_the_coordination_directory_does_not_exist_instead_of_spinning() {
     let dir = crate::TempDir::new().unwrap();
-    let base = dir.path().join("nonexistent-subdir").join("global");
+    let coord = dir.path().join("nonexistent-subdir");
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| with_global_lock(&base, |_token| {})));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| with_global_lock(&coord, |_token| {})));
 
     assert!(
         result.is_err(),
-        "with_global_lock must panic when base's parent directory doesn't exist, not hang"
+        "with_global_lock must panic when the coordination directory doesn't exist, not hang"
     );
 }
 
@@ -207,11 +208,10 @@ fn lock_exclusive_retries_past_eintr_from_a_non_restarting_handler() {
     }
 
     let dir = crate::TempDir::new().unwrap();
-    let base = dir.path().join("global");
 
-    let holder = open_lock_target(&base);
+    let holder = open_lock_target(dir.path());
     lock_exclusive(&holder).expect("uncontended lock must succeed immediately");
-    let waiter = open_lock_target(&base);
+    let waiter = open_lock_target(dir.path());
 
     let (tid_tx, tid_rx) = std::sync::mpsc::channel();
     let waiter_thread = std::thread::spawn(move || {
@@ -263,15 +263,16 @@ fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
         .expect("panic payload is a string")
 }
 
-#[cfg(unix)]
+/// The message names what the open actually tried: the directory on Unix, `global.lock` in it on
+/// Windows.
 #[test]
-fn open_lock_target_failure_names_the_override() {
+fn open_lock_target_failure_names_the_real_path_and_the_override() {
     let tmp = crate::TempDir::new().unwrap();
-    let file = tmp.path().join("file");
-    std::fs::write(&file, b"").unwrap();
+    let missing = tmp.path().join("missing");
     let msg = panic_message(|| {
-        open_lock_target(&file.join("global"));
+        open_lock_target(&missing);
     });
+    assert!(msg.contains(&format!("{:?}", lock_path(&missing))), "{msg}");
     assert!(msg.contains("SKULD_DB_DIR"), "{msg}");
 }
 
@@ -279,7 +280,7 @@ fn open_lock_target_failure_names_the_override() {
 #[test]
 #[should_panic(expected = "must be absolute")]
 fn open_lock_target_rejects_a_relative_path() {
-    open_lock_target(std::path::Path::new("global"));
+    open_lock_target(std::path::Path::new("coord"));
 }
 
 #[cfg(unix)]
@@ -288,7 +289,7 @@ fn a_failed_stat_of_the_lock_target_is_reported_not_swallowed() {
     let tmp = crate::TempDir::new().unwrap();
     let dir = tmp.path().join("d");
     std::fs::create_dir(&dir).unwrap();
-    with_global_lock(&dir.join("global"), |held| {
+    with_global_lock(&dir, |held| {
         assert!(held.stat_target().is_ok());
         std::fs::remove_dir(&dir).unwrap();
         let err = held.stat_target().unwrap_err();
@@ -307,7 +308,7 @@ fn target_has_split_detects_a_wholesale_directory_replacement() {
     std::fs::create_dir(&coord).unwrap();
 
     let mut split_detected = false;
-    with_global_lock(&coord.join("global"), |held| {
+    with_global_lock(&coord, |held| {
         std::fs::rename(&coord, outer.path().join("aside")).unwrap();
         std::fs::create_dir(&coord).unwrap();
         split_detected = held.target_has_split();
@@ -335,7 +336,7 @@ fn target_has_split_detects_a_retargeted_symlink_ancestor() {
         .expect("creating a directory symlink must succeed in this CI environment");
 
     let mut split_detected = false;
-    with_global_lock(&link.join("global"), |held| {
+    with_global_lock(&link, |held| {
         std::fs::remove_dir(&link).unwrap();
         std::os::windows::fs::symlink_dir(&real2, &link).unwrap();
         split_detected = held.target_has_split();
