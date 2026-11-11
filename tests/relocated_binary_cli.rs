@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const DB: &str = ".skuld.db";
+const COORD: &str = ".skuld";
 
 /// A cargo-style test binary name, `name-<16 hex>`, which marks a binary as cargo's.
 fn hashed(name: &str) -> String {
@@ -48,7 +48,11 @@ fn binary_moved_into_a_deps_dir_elsewhere_uses_that_profile_dir() {
     let exe = copy_fixture_to(&profile.join("deps"), &hashed("capture_fixture"));
     let out = run(&exe, None);
     assert!(out.status.success(), "{out:?}\n{}", stderr(&out));
-    assert!(profile.join(DB).is_file(), "expected {:?} to exist", profile.join(DB));
+    assert!(
+        profile.join(COORD).is_dir(),
+        "expected {:?} to exist",
+        profile.join(COORD)
+    );
 }
 
 #[test]
@@ -58,7 +62,7 @@ fn binary_moved_next_to_no_deps_dir_uses_its_own_directory() {
     let exe = copy_fixture_to(&profile, &plain("capture_fixture"));
     let out = run(&exe, None);
     assert!(out.status.success(), "{out:?}\n{}", stderr(&out));
-    assert!(profile.join(DB).is_file());
+    assert!(profile.join(COORD).is_dir());
 }
 
 /// Without a cargo marker, a directory named `deps` is just a directory.
@@ -69,8 +73,8 @@ fn unhashed_binary_in_a_deps_dir_uses_that_directory() {
     let exe = copy_fixture_to(&deps, &plain("capture_fixture"));
     let out = run(&exe, None);
     assert!(out.status.success(), "{out:?}\n{}", stderr(&out));
-    assert!(deps.join(DB).is_file());
-    assert!(!tmp.path().join("opt/app").join(DB).exists());
+    assert!(deps.join(COORD).is_dir());
+    assert!(!tmp.path().join("opt/app").join(COORD).exists());
 }
 
 #[test]
@@ -80,9 +84,9 @@ fn override_env_var_picks_the_directory_and_creates_it() {
     let db_dir = tmp.path().join("elsewhere").join("nested");
     let out = run(&exe, Some(&db_dir));
     assert!(out.status.success(), "{out:?}\n{}", stderr(&out));
-    assert!(db_dir.join(DB).is_file());
+    assert!(db_dir.join(COORD).is_dir());
     assert!(
-        !tmp.path().join("debug").join(DB).exists(),
+        !tmp.path().join("debug").join(COORD).exists(),
         "override must win over the exe location"
     );
 }
@@ -97,7 +101,7 @@ fn relative_override_fails_loudly() {
     assert!(err.contains("SKULD_DB_DIR") && err.contains("relative/dir"), "{err}");
 }
 
-/// Test binaries in cargo's new build-dir layout share the profile dir's DB.
+/// Test binaries in cargo's new build-dir layout share the profile dir's coordination directory.
 
 #[test]
 fn new_build_dir_layout_resolves_to_the_profile_dir() {
@@ -107,11 +111,14 @@ fn new_build_dir_layout_resolves_to_the_profile_dir() {
     let exe = copy_fixture_to(&out, &hashed("a"));
     let res = run(&exe, None);
     assert!(res.status.success(), "{res:?}\n{}", stderr(&res));
-    assert!(profile.join(DB).is_file(), "DB should be in {profile:?}");
-    assert!(!out.join(DB).exists());
+    assert!(
+        profile.join(COORD).is_dir(),
+        "coordination directory should be in {profile:?}"
+    );
+    assert!(!out.join(COORD).exists());
 }
 
-/// A trial that changes `SKULD_DB_DIR` mid-run must not move later trials to another DB.
+/// A trial that changes `SKULD_DB_DIR` mid-run must not move later trials to another coordination directory.
 #[test]
 fn db_path_is_resolved_once_per_process() {
     let tmp = skuld::TempDir::new().unwrap();
@@ -128,9 +135,9 @@ fn db_path_is_resolved_once_per_process() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}\n{}", stderr(&out));
-    assert!(profile.join(DB).is_file());
+    assert!(profile.join(COORD).is_dir());
     assert!(
-        !other.join(DB).exists(),
+        !other.join(COORD).exists(),
         "second trial registered in the mid-run SKULD_DB_DIR"
     );
 }
@@ -167,7 +174,7 @@ fn created_override_dirs_are_world_writable_despite_umask() {
     );
 }
 
-/// The DB must not depend on how the binary was reached: direct, via a file symlink, or via a
+/// The coordination directory must not depend on how the binary was reached: direct, via a file symlink, or via a
 /// directory symlink (macOS and Windows `current_exe` do not resolve symlinks).
 #[cfg(unix)]
 #[test]
@@ -190,14 +197,14 @@ fn symlinked_binary_uses_the_real_profile_dir() {
         let out = run(&via, None);
         assert!(out.status.success(), "{via:?}: {out:?}\n{}", stderr(&out));
     }
-    assert!(real_profile.join(DB).is_file());
+    assert!(real_profile.join(COORD).is_dir());
     assert!(
-        !real_deps.join(DB).exists(),
-        "dir symlink must not create a DB in deps/"
+        !real_deps.join(COORD).exists(),
+        "dir symlink must not create a coordination directory in deps/"
     );
     assert!(
-        !file_link_dir.join(DB).exists(),
-        "file symlink must not create a DB beside the link"
+        !file_link_dir.join(COORD).exists(),
+        "file symlink must not create a coordination directory beside the link"
     );
 }
 
@@ -255,7 +262,7 @@ mod read_only {
         let exe = copy_fixture_to(&profile.join("deps"), &hashed("capture_fixture"));
         let first = run(&exe, None);
         assert!(first.status.success(), "{first:?}");
-        assert!(profile.join(DB).is_file());
+        assert!(profile.join(COORD).is_dir());
         let _ro = Mode::set(&profile, 0o555);
         let out = run(&exe, None);
         assert!(!out.status.success(), "{out:?}");
@@ -293,8 +300,8 @@ mod read_only {
         let db_dir = tmp.path().join("rw");
         let out = run(&exe, Some(&db_dir));
         assert!(out.status.success(), "{out:?}\n{}", stderr(&out));
-        assert!(db_dir.join(DB).is_file());
-        assert!(!profile.join(DB).exists());
+        assert!(db_dir.join(COORD).is_dir());
+        assert!(!profile.join(COORD).exists());
     }
 }
 

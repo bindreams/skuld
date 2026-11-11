@@ -5,8 +5,8 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-/// A file's identity, following symlinks and reparse points as a fresh
-/// `connect`/`open_db` of the same path would.
+/// A file's identity, following symlinks and reparse points as
+/// a fresh open of the same path would.
 ///
 /// Unix: device + inode (`stat`). Windows: volume serial + 64-bit file index
 /// (`GetFileInformationByHandle`). Resolving a path fresh, not reusing a held

@@ -1,34 +1,32 @@
 //! End-to-end subprocess test for the panic-during-unwind hazard in
 //! `TestRegistration::drop`, via the `drop_panic_during_unwind_probe`
-//! binary. `Drop::drop`'s own cleanup panics loudly on a genuine,
-//! non-retryable DB error (e.g. the table it deletes from is gone) — so a
-//! test that panics for an unrelated reason, while its coordination DB has
-//! independently gone unusable, causes a *second* panic during the first
-//! one's unwind. An uncaught panic during an active unwind is Rust's
+//! binary. `Drop::drop`'s own cleanup panics loudly when the coordination directory no longer
+//! matches what the registration made (its `<id>.json` is gone) — so a test that panics for an
+//! unrelated reason, while its registration has independently been broken, causes a *second*
+//! panic during the first one's unwind. An uncaught panic during an active unwind is Rust's
 //! "double panic": `std::process::abort()` (`SIGABRT` on Unix), killing the
 //! whole test process rather than just failing the one test. This needs a
 //! genuine subprocess: the abort, if it happens, must not take this driver
 //! test binary down with it.
 //!
 //! Runs on every platform: the `Drop::drop` fix it exercises is not
-//! platform-gated, and Skuld's CI has a Windows lane. The probe's corruption
-//! method (dropping the `running` table via a second connection) fails the
-//! registration's own cleanup `DELETE` on both platforms (see
-//! `probe_drop_panic_during_unwind` in `src/lib.rs`). The test asserts that the
-//! process exits via a single ordinary panic (not an abort), and that the
-//! downgraded warning names the database path and SQLite's own cause rather
-//! than the `panic_payload_message` fallback placeholder: during an unwind the
-//! warning is the only signal left of the failure.
+//! platform-gated, and Skuld's CI has a Windows lane. The probe's sabotage
+//! (deleting the registration's own `<id>.json`) fails its cleanup on both
+//! platforms (see `probe_drop_panic_during_unwind` in `src/lib.rs`). The test
+//! asserts that the process exits via a single ordinary panic (not an abort),
+//! and that the downgraded warning names the coordination directory and the
+//! cause rather than the `panic_payload_message` fallback placeholder: during
+//! an unwind the warning is the only signal left of the failure.
 
 use std::process::Command;
 
 #[test]
 fn a_second_panic_during_drop_does_not_abort_the_process() {
     let dir = skuld::TempDir::new().unwrap();
-    let db_path = dir.path().join(".skuld.db");
+    let coord_dir = dir.path().join(".skuld");
 
     let out = Command::new(env!("CARGO_BIN_EXE_drop_panic_during_unwind_probe"))
-        .env("SKULD_DROP_PANIC_PROBE_DB", &db_path)
+        .env("SKULD_DROP_PANIC_PROBE_COORD_DIR", &coord_dir)
         .output()
         .expect("spawn drop_panic_during_unwind_probe");
 
@@ -58,15 +56,15 @@ fn a_second_panic_during_drop_does_not_abort_the_process() {
     );
     let warning_line = stderr
         .lines()
-        .find(|l| l.contains("coordination DB cleanup panicked while already unwinding"))
+        .find(|l| l.contains("coordination cleanup panicked while already unwinding"))
         .unwrap_or_else(|| panic!("the downgraded second-panic warning must reach stderr: {stderr}"));
     // The default panic hook prints the second panic's raw message too
     // (before our `catch_unwind` even sees it), so checking `stderr` as a
     // whole would pass even if the downgraded warning's own extracted message
     // were wrong: check the warning line itself.
     assert!(
-        warning_line.contains(&format!("{db_path:?}")) && warning_line.contains("no such table: running"),
-        "the downgraded warning must name the database path and the cause: {warning_line:?}"
+        warning_line.contains(&format!("{coord_dir:?}")) && warning_line.contains("moved"),
+        "the downgraded warning must name the coordination directory and the cause: {warning_line:?}"
     );
     assert!(
         !warning_line.contains("<non-string panic payload>"),

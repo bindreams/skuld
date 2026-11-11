@@ -93,7 +93,7 @@ fn dump_nextest_metadata_if_requested(tests: Vec<NextestTestMetadata>) {
 
 /// Run one test body with per-test observability and serial coordination.
 ///
-/// Every test (serial or not) registers in the coordination database before
+/// Every test (serial or not) registers in the coordination registry before
 /// running and unregisters on completion. Serial tests block until their
 /// constraints are satisfied.
 ///
@@ -123,7 +123,7 @@ fn run_with_observability(
     // `Drop` impl in `capture.rs`).
     ensure_valid_thread_name(name);
 
-    let db_path = coordination::db_path();
+    let coord_dir = coordination::coord_dir();
 
     // Runner-level "starting" line. Printed BEFORE FdCapture::begin so it
     // lands on the real terminal stderr, not in the capture buffer.
@@ -162,9 +162,9 @@ fn run_with_observability(
     let serial_filter_owned = serial_filter.to_string();
     let labels_owned = labels.to_vec();
     let handle = match std::thread::Builder::new().name(thread_name).spawn(move || {
-        // Coordinate: register in DB, block if serial constraints aren't met.
+        // Coordinate: register, block if serial constraints aren't met.
         // The registration guard unregisters on drop (including panic unwind).
-        let _reg = coordination::coordinate(&db_path, &coordinate_name, &labels_owned, &serial_filter_owned);
+        let _reg = coordination::coordinate(&coord_dir, &coordinate_name, &labels_owned, &serial_filter_owned);
         body();
     }) {
         Ok(h) => h,
@@ -626,8 +626,8 @@ impl TestRunner {
             // normal run — including them here would over-serialize real
             // tests that only "conflict" through this never-executed one.
             if !ignored_flag {
-                // Canonicalize via the same to_storage() the coordination DB uses, so
-                // the JSON dump's serial_filter matches the DB's canonical-form
+                // Canonicalize via the same to_storage() the registry uses, so
+                // the JSON dump's serial_filter matches the registry's canonical-form
                 // invariant instead of leaking a raw, possibly-mixed-case declaration
                 // (e.g. `serial = FAST` from a user-declared label identifier).
                 metadata.push(NextestTestMetadata {
@@ -674,8 +674,8 @@ impl TestRunner {
             let name_static: &'static str = Box::leak(dyn_test.name.into_boxed_str());
 
             if !dyn_test.ignored {
-                // Canonicalize via the same to_storage() the coordination DB uses, so
-                // the JSON dump's serial_filter matches the DB's canonical-form
+                // Canonicalize via the same to_storage() the registry uses, so
+                // the JSON dump's serial_filter matches the registry's canonical-form
                 // invariant instead of leaking a raw declaration string.
                 metadata.push(NextestTestMetadata {
                     name: name_static.to_string(),
@@ -702,7 +702,7 @@ impl TestRunner {
 /// Fail the run for every coordination cleanup failure that was downgraded to a
 /// warning while a test was unwinding (see `coordination::violations`): a
 /// `#[should_panic]` test, or one whose own failure was reported first, would
-/// otherwise hide a moved or broken coordination database. The runner owns the
+/// otherwise hide a moved or broken coordination directory. The runner owns the
 /// process's exit, so this is where it can still fail.
 pub(crate) fn fail_on_violations(
     mut conclusion: libtest_mimic::Conclusion,

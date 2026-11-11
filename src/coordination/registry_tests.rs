@@ -514,7 +514,7 @@ fn non_serial_registrations_do_not_block_can_start_for_another_non_serial_test()
 
     assert!(
         can_start_now(&coord, &[docker, network], SERIAL_NONE),
-        "{REGISTRATIONS} labelled non-serial registrations and a serial entry with a non-matching          filter must not block another non-serial test from starting"
+        "{REGISTRATIONS} labelled non-serial registrations and a serial entry with a non-matching filter must not block another non-serial test from starting"
     );
     assert!(
         !can_start_now(&coord, &[cache], SERIAL_NONE),
@@ -613,4 +613,44 @@ fn unregister_panics_when_the_mutex_has_split() {
         move || split(&coord)
     });
     reg.unregister();
+}
+
+/// A symlink ancestor of `coord` retargeted mid-run leaves the registration's files behind the
+/// old target, so unregistering must fail rather than report success against whatever the path
+/// names now. Windows withholds `FILE_SHARE_DELETE` from the lock file, but that does not stop an
+/// ancestor being retargeted.
+#[test]
+#[should_panic(expected = "moved")]
+fn unregister_panics_when_a_parent_symlink_is_retargeted_mid_run() {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink as symlink_dir;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_dir;
+
+    let dir = crate::TempDir::new().unwrap();
+    let (real1, real2, link) = (
+        dir.path().join("real1"),
+        dir.path().join("real2"),
+        dir.path().join("link"),
+    );
+    std::fs::create_dir(&real1).unwrap();
+    std::fs::create_dir(&real2).unwrap();
+    symlink_dir(&real1, &link).expect("creating a directory symlink must succeed in this CI environment");
+    let coord = link.join(".skuld");
+
+    let mut a = running(&coord, "a", &[], SERIAL_ALL);
+
+    // Retarget. A symlink directory is removed with `remove_dir` on Windows and `remove_file` on
+    // Unix; `symlink_dir` after either makes a fresh one.
+    #[cfg(unix)]
+    std::fs::remove_file(&link).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_dir(&link).unwrap();
+    symlink_dir(&real2, &link).unwrap();
+
+    // `b` registers through the retargeted link, in a coordination directory `a` knows nothing
+    // of, so it must not wait on `a`'s global-serial entry.
+    let _b = running(&coord, "b", &[], SERIAL_ALL);
+
+    a.unregister();
 }

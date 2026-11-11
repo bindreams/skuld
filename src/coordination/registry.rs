@@ -21,7 +21,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::file_identity::FileIdentity;
-use super::lock::{lock_exclusive, try_lock_exclusive, unlock, with_init_lock, InitLockHeld};
+use super::lock::{lock_exclusive, try_lock_exclusive, unlock, with_global_lock, GlobalLockHeld};
 use super::{skuld_debug_eprintln, DB_DIR_HINT, SERIAL_ALL, SERIAL_NONE};
 use crate::label::{Label, LabelFilter};
 
@@ -304,6 +304,7 @@ pub(super) struct Registration {
 }
 
 impl Registration {
+    #[cfg(test)]
     pub(super) fn id(&self) -> &str {
         &self.id
     }
@@ -318,7 +319,7 @@ impl Registration {
         let coord_dir = self.coord_dir.clone();
         let running = running_dir(&coord_dir);
         let (lock, json) = (lock_path(&running, &self.id), json_path(&running, &self.id));
-        with_init_lock(&mutex_base(&coord_dir), |held| {
+        with_global_lock(&mutex_base(&coord_dir), |held| {
             #[cfg(test)]
             test_hooks::run_seam(Seam::Unregistering);
             let json_exists = or_panic("inspect", &json, json.try_exists());
@@ -358,7 +359,7 @@ pub(super) fn try_register(
         &running,
         super::db_dir::create_dir_all_open(&running),
     );
-    with_init_lock(&mutex_base(coord_dir), |held| {
+    with_global_lock(&mutex_base(coord_dir), |held| {
         if held.target_has_split() {
             panic!("{}", moved_message(coord_dir, "registering a test"));
         }
@@ -373,7 +374,7 @@ pub(super) fn try_register(
 /// Create, lock and publish the registration. The caller holds the mutex and has decided the
 /// test can start.
 fn publish(
-    held: &InitLockHeld<'_>,
+    held: &GlobalLockHeld<'_>,
     ids: &IdGenerator,
     coord_dir: &Path,
     name: &str,

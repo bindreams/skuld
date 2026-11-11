@@ -17,10 +17,10 @@ use std::process::Command;
 
 // Shared infrastructure =================================================================================
 //
-// No driver-level mutex. All skuld binaries in the workspace share the same
-// `.skuld.db` (located at run time from the executable's path), but the WAL-init retry loop
-// in src/coordination.rs already handles concurrent opens across processes. `tests/capture_cli.rs`
-// uses the same pattern with no mutex; staying consistent with it.
+// No driver-level mutex. All skuld binaries in the workspace share the same `.skuld/` (located
+// at run time from the executable's path), but its global mutex already serializes concurrent
+// registrations across processes. `tests/capture_cli.rs` uses the same pattern with no mutex;
+// staying consistent with it.
 
 /// Captured outcome of one fixture run.
 struct RunOutcome {

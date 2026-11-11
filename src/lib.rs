@@ -204,115 +204,53 @@ pub mod __private {
         }
     }
 
-    /// Probe hook for Skuld's own test suite: open a coordination DB
-    /// connection at `path`, running the Unix atomic-publish step and the
-    /// real schema-init path (`open_db`, not just `connect`),
-    /// and return it instead of dropping it. Going through `open_db` — not
-    /// `connect` alone — matters here: `PRAGMA journal_mode = WAL` is what
-    /// makes SQLite create the `-wal`/`-shm` companions in the first place,
-    /// and this hook exists to measure the mode those companions come out
-    /// at. `umask` is process-global, so testing "publish creates 0666
-    /// files despite a restrictive umask" safely needs a genuine subprocess
-    /// rather than mutating umask in-process, where it would corrupt
-    /// concurrently running unit tests. Support binaries under
-    /// `tests/support_bins/` link against Skuld's public API only, hence
-    /// this hook.
-    ///
-    /// Returning the live connection (rather than dropping it here) matters:
-    /// SQLite deletes `-wal`/`-shm` when the last connection to a database
-    /// closes, so a caller that dropped the connection before the driver
-    /// process got a chance to `stat` the companions would see them
-    /// vanish — not because publishing failed, but because nothing was
-    /// holding the database open anymore. `publish_probe`'s `main` keeps
-    /// this connection alive across a handshake with the driver for exactly
-    /// that reason.
-    #[cfg(unix)]
-    pub fn probe_coordination_connect(path: &std::path::Path) -> rusqlite::Connection {
-        crate::coordination::open_db(path).0
+    /// Probe hook for Skuld's own test suite: register a non-serial test in the coordination
+    /// directory `coord_dir` and return the registration, which unregisters on drop. `umask` is
+    /// process-global, so testing "the directories and files come out 0777/0644 despite a
+    /// restrictive umask" safely needs a genuine subprocess rather than mutating umask in-process,
+    /// where it would corrupt concurrently running unit tests. Support binaries under
+    /// `tests/support_bins/` link against Skuld's public API only, hence this hook. Returned
+    /// rather than dropped so the driver can inspect the files while the test is registered.
+    pub fn probe_register(coord_dir: &std::path::Path) -> impl Drop {
+        crate::coordination::coordinate(coord_dir, "probe", &[], "")
     }
 
     /// Probe hook for Skuld's own test suite (`tests/lock_contention_regression.rs`,
-    /// via the `lock_hold_probe` support binary): hold `path`'s coordination
-    /// DB init lock — the real one `connect`/`open_db` use — for the
-    /// duration of `while_held`, so a driver process can deterministically
-    /// prove a second process's `try_lock` on the same lock file blocks
-    /// while this one runs, and succeeds once it returns. Thin wrapper
-    /// around `coordination`'s own `probe_hold_init_lock`, needed because
-    /// the `lock` module is private to `coordination` and can't be reached
-    /// from `lib.rs` directly.
-    pub fn probe_hold_init_lock(path: &std::path::Path, while_held: impl FnOnce()) {
-        crate::coordination::probe_hold_init_lock(path, while_held)
+    /// via the `lock_hold_probe` support binary): hold `coord_dir`'s global mutex, the real one
+    /// registration takes, for the duration of `while_held`, so a driver process can
+    /// deterministically prove a second process's `try_lock` on the same lock target blocks
+    /// while this one runs, and succeeds once it returns. Thin wrapper around `coordination`'s
+    /// own `probe_hold_global_lock`, needed because the `lock` module is private to
+    /// `coordination` and can't be reached from `lib.rs` directly.
+    pub fn probe_hold_global_lock(coord_dir: &std::path::Path, while_held: impl FnOnce()) {
+        crate::coordination::probe_hold_global_lock(coord_dir, while_held)
     }
 
     /// Probe hook for Skuld's own test suite (`tests/lock_contention_regression.rs`,
-    /// via the `lock_try_probe` support binary): attempt a non-blocking
-    /// `try_lock` on `path`'s coordination DB init lock file through a fresh
-    /// handle, returning the raw result for the caller to report. See
-    /// [`probe_hold_init_lock`].
-    pub fn probe_try_init_lock(path: &std::path::Path) -> Result<(), std::fs::TryLockError> {
-        crate::coordination::probe_try_init_lock(path)
+    /// via the `lock_try_probe` support binary): attempt a non-blocking `try_lock` on
+    /// `coord_dir`'s global mutex through a fresh handle, returning the raw result for the caller
+    /// to report. See [`probe_hold_global_lock`].
+    pub fn probe_try_global_lock(coord_dir: &std::path::Path) -> Result<(), std::fs::TryLockError> {
+        crate::coordination::probe_try_global_lock(coord_dir)
     }
 
-    /// Probe hook for Skuld's own test suite: register in the coordination
-    /// DB at `path`, corrupt its schema so `_registration`'s own cleanup
-    /// fails later, then panic while the guard is still alive, so unwinding
-    /// drops it. Without a `catch_unwind` in `Drop`, its panic during that
-    /// unwind would `abort()` the whole process. Needs a genuine subprocess:
-    /// aborting the caller is the point of the probe.
-    ///
-    /// Corruption: a second connection drops `running`, which SQLite
-    /// propagates to `_registration`'s connection on its next prepare,
-    /// failing its cleanup `DELETE`.
-    pub fn probe_drop_panic_during_unwind(path: &std::path::Path) {
-        let _registration = crate::coordination::coordinate(path, "probe", &[], "");
-        let (saboteur, _identity) = crate::coordination::open_db(path);
-        saboteur
-            .execute_batch("DROP TABLE running")
-            .unwrap_or_else(|e| panic!("probe: could not drop the running table to corrupt it: {e}"));
-        drop(saboteur);
+    /// Probe hook for Skuld's own test suite: register in the coordination directory `coord_dir`,
+    /// sabotage the registration by deleting its own `<id>.json` so its cleanup fails later, then
+    /// panic while the guard is still alive, so unwinding drops it. Without a `catch_unwind` in
+    /// `Drop`, its panic during that unwind would `abort()` the whole process. Needs a genuine
+    /// subprocess: aborting the caller is the point of the probe.
+    pub fn probe_drop_panic_during_unwind(coord_dir: &std::path::Path) {
+        let _registration = crate::coordination::coordinate(coord_dir, "probe", &[], "");
+        let running = coord_dir.join("running");
+        for entry in std::fs::read_dir(&running).unwrap_or_else(|e| panic!("probe: could not list {running:?}: {e}")) {
+            let path = entry
+                .unwrap_or_else(|e| panic!("probe: could not list {running:?}: {e}"))
+                .path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                std::fs::remove_file(&path).unwrap_or_else(|e| panic!("probe: could not delete {path:?}: {e}"));
+            }
+        }
 
-        panic!(
-            "probe: artificial panic to trigger unwind; TestRegistration::drop's own cleanup \
-             must not be allowed to abort the process"
-        );
-    }
-
-    /// Probe hook for Skuld's own test suite: prove that
-    /// `SQLITE_OPEN_PRIVATE_CACHE` (set on every connection Skuld opens, see
-    /// `connect_with_hooks`) keeps contention between two of Skuld's own
-    /// connections reporting `SQLITE_BUSY` even when something else in the
-    /// process enabled shared-cache mode globally first. Needs a genuine
-    /// subprocess: `sqlite3_enable_shared_cache` has no un-set.
-    pub fn probe_shared_cache_still_reports_busy(path: &std::path::Path) {
-        // Safety: `sqlite3_enable_shared_cache` has no documented safety
-        // precondition beyond "call it before opening the connections you
-        // want it to apply to", which this probe does.
-        let rc = unsafe { rusqlite::ffi::sqlite3_enable_shared_cache(1) };
-        assert_eq!(
-            rc,
-            rusqlite::ffi::SQLITE_OK,
-            "probe: sqlite3_enable_shared_cache(1) failed: {rc}"
-        );
-
-        // Two of Skuld's own connections to the same coordination DB,
-        // opened exactly as any two real Skuld processes/threads would.
-        let (holder, _identity) = crate::coordination::open_db(path);
-        holder
-            .execute_batch("BEGIN EXCLUSIVE")
-            .unwrap_or_else(|e| panic!("probe: holder's BEGIN EXCLUSIVE failed: {e}"));
-
-        let (waiter, _identity) = crate::coordination::open_db(path);
-        let result = waiter.execute_batch("BEGIN IMMEDIATE");
-        let err = match result {
-            Ok(()) => panic!("probe: waiter's BEGIN IMMEDIATE must fail while holder holds BEGIN EXCLUSIVE"),
-            Err(e) => e,
-        };
-        assert_eq!(
-            err.sqlite_error_code(),
-            Some(rusqlite::ErrorCode::DatabaseBusy),
-            "probe: contention between two of Skuld's own connections must still report \
-             SQLITE_BUSY, not SQLITE_LOCKED, even with shared-cache mode enabled process-wide \
-             by something else: {err:?}"
-        );
+        panic!("probe: artificial panic to trigger unwind; TestRegistration::drop must not abort the process");
     }
 }

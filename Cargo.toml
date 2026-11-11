@@ -113,7 +113,7 @@ harness = false
 name = "capture_cli"
 path = "tests/capture_cli.rs"
 
-# A moved or archived skuld binary locates `.skuld.db` from its own path.
+# A moved or archived skuld binary locates `.skuld/` from its own path.
 [[test]]
 name = "relocated_binary_cli"
 path = "tests/relocated_binary_cli.rs"
@@ -284,10 +284,10 @@ path = "tests/support_bins/duplicate_names_ignored/main.rs"
 test = false
 doc = false
 
-# See tests/support_bins/publish_probe/main.rs's module doc.
+# See tests/support_bins/register_probe/main.rs's module doc.
 [[bin]]
-name = "publish_probe"
-path = "tests/support_bins/publish_probe/main.rs"
+name = "register_probe"
+path = "tests/support_bins/register_probe/main.rs"
 test = false
 doc = false
 
@@ -323,11 +323,5 @@ doc = false
 [[bin]]
 name = "lock_emfile_probe"
 path = "tests/support_bins/lock_emfile_probe/main.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "shared_cache_probe"
-path = "tests/support_bins/shared_cache_probe/main.rs"
 test = false
 doc = false

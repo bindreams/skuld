@@ -1,7 +1,7 @@
 //! Regression guard: with zero file descriptors left to spend (the
 //! probe's `RLIMIT_NOFILE` soft limit is lowered to exactly the 3 already
-//! open — stdin/stdout/stderr — leaving none free), opening the coordination
-//! DB's lock target fails `EMFILE`; `open_lock_target` must turn that into
+//! open — stdin/stdout/stderr — leaving none free), opening the global mutex's
+//! lock target fails `EMFILE`; `open_lock_target` must turn that into
 //! an immediate panic, not an infinite spin. See
 //! `tests/support_bins/lock_emfile_probe/main.rs`'s module doc for how the
 //! subprocess reaches `EMFILE` deterministically, without looping.
@@ -12,7 +12,7 @@
 //! unit and integration tests concurrently, on multiple threads, inside one
 //! process; starving that whole process of file descriptors would corrupt
 //! every other test racing alongside this one, the same class of hazard
-//! `tests/coordination_publish_cli.rs`'s module doc documents for `umask`.
+//! `tests/coordination_modes_cli.rs`'s module doc documents for `umask`.
 //!
 //! No timeout on the subprocess wait: if `open_lock_target` ever regresses
 //! back to a retry loop, this test would hang instead of failing cleanly —
@@ -27,10 +27,12 @@ use std::process::Command;
 #[test]
 fn open_lock_target_panics_immediately_on_emfile_instead_of_spinning() {
     let dir = skuld::TempDir::new().unwrap();
-    let db_path = dir.path().join(".skuld.db");
+    // Exists, so that the open below can only fail for want of a descriptor.
+    let coord_dir = dir.path().join(".skuld");
+    std::fs::create_dir(&coord_dir).unwrap();
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_lock_emfile_probe"));
-    cmd.env("SKULD_LOCK_EMFILE_PROBE_DB", &db_path);
+    cmd.env("SKULD_LOCK_EMFILE_PROBE_COORD_DIR", &coord_dir);
     let output = cmd.output().unwrap_or_else(|e| panic!("spawn lock_emfile_probe: {e}"));
 
     assert!(
@@ -43,8 +45,8 @@ fn open_lock_target_panics_immediately_on_emfile_instead_of_spinning() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("failed to open coordination DB"),
-        "expected lock_emfile_probe to panic from open_lock_target's own panic message, got \
+        stderr.contains("failed to open the coordination directory") && stderr.contains("os error 24"),
+        "expected lock_emfile_probe to panic from open_lock_target's own panic message, with EMFILE, got \
          stderr:\n{stderr}"
     );
 }

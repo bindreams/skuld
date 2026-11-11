@@ -1,9 +1,8 @@
-//! Thread-scoped test seams for the coordination retry loops.
+//! Thread-scoped test seams for the coordination retry loop and registry steps.
 //!
-//! Thread-local, not process-wide: `retry_busy` also runs in every
-//! `TestRegistration`'s drop, and libtest runs those concurrently, so a global
-//! signal could wake a test before its own call retried. Each seam is
-//! installed by a single-purpose worker thread and reset by an RAII guard.
+//! Thread-local, not process-wide: libtest runs coordination tests concurrently, so a global
+//! signal could wake a test before its own call retried. Each seam is installed by a
+//! single-purpose worker thread and reset by an RAII guard.
 
 use std::cell::RefCell;
 use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
@@ -71,15 +70,6 @@ impl RetryTest {
         let _ = self.ack.try_send(());
     }
 
-    /// Let the worker retry `n` times while whatever makes it busy stays in
-    /// place: for each, wait for its signal and release it.
-    pub(crate) fn pass_retries(&self, n: usize) {
-        for _ in 0..n {
-            self.wait_for_retry();
-            self.release();
-        }
-    }
-
     /// Whether the worker has sent a signal not yet consumed by
     /// [`Self::wait_for_retry`], without blocking.
     #[cfg(test)]
@@ -138,18 +128,6 @@ pub(super) fn signal_retry() {
 /// change: the one place no contention can open deterministically.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Seam {
-    /// `coordinate`, right after its COMMIT succeeded.
-    Commit,
-    /// `TestRegistration::drop`, right after its DELETE succeeded.
-    Delete,
-    /// `open_db`, right after the connection opened, before identity is recorded.
-    Open,
-    /// Recording the main identity, between reading the connection's own fd and
-    /// the path stats it is validated against.
-    #[cfg(unix)]
-    Fd,
-    /// `open_db`, right after schema init, before the companions are recorded.
-    SchemaInit,
     /// `registry::register`, once `<id>.lock` exists and before it is locked.
     Created,
     /// `registry::register`, after the `.json` rename and before the final split check, mutex
