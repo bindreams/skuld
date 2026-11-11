@@ -9,6 +9,9 @@ mod coordination_tests;
 mod db_dir;
 #[cfg(test)]
 mod db_dir_tests;
+mod file_identity;
+#[cfg(test)]
+mod file_identity_tests;
 mod lock;
 #[cfg(test)]
 mod lock_tests;

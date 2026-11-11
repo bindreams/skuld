@@ -59,7 +59,7 @@
 //!   is what tells the two groups apart: it records the held directory's
 //!   own `fstat` identity at acquisition and compares it against a fresh
 //!   `stat` of the same path on each check, the same dev+ino comparison
-//!   `super::moved_db::FileIdentity` does for the DB file itself — a mismatch means
+//!   `super::file_identity::FileIdentity` does for the DB file itself — a mismatch means
 //!   this handle no longer locks what a fresh opener would.
 //! - **Windows** locks a sibling [`lock_path`] file, opened with
 //!   `share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)` and, deliberately, no

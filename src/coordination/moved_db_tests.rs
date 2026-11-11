@@ -3,9 +3,9 @@
 //! else) turns the test red.
 
 use super::coordination_tests::temp_db;
-use super::moved_db::Failure;
 #[cfg(unix)]
-use super::moved_db::FileIdentity;
+use super::file_identity::FileIdentity;
+use super::moved_db::Failure;
 #[cfg(unix)]
 use super::moved_db::{companion_path, fd_identity, has_moved_via_fcntl, DbIdentity};
 #[cfg(unix)]
