@@ -332,11 +332,6 @@ impl Registration {
         &self.id
     }
 
-    /// Where this registration's `.json` entry lives.
-    pub(super) fn json_path(&self) -> PathBuf {
-        json_path(&running_dir(&self.coord_dir), &self.id)
-    }
-
     /// Remove the entry and the lock file, under the mutex. Panics, saying the coordination
     /// directory moved, if the mutex split or `running/<id>.lock` or `running/<id>.json` is no
     /// longer what this registration made. A second call, after success, does nothing.

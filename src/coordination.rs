@@ -133,14 +133,6 @@ pub(crate) struct TestRegistration {
     registration: registry::Registration,
 }
 
-impl TestRegistration {
-    /// For the unwind probe (`probe_drop_panic_during_unwind` in `lib.rs`): where this
-    /// registration's entry file lives.
-    pub(crate) fn probe_entry_path(&self) -> std::path::PathBuf {
-        self.registration.json_path()
-    }
-}
-
 impl Drop for TestRegistration {
     fn drop(&mut self) {
         // `unregister` panics on a moved directory, which should propagate. But if this drop

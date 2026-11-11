@@ -235,14 +235,27 @@ pub mod __private {
     }
 
     /// Probe hook for Skuld's own test suite: register in the coordination directory `coord_dir`,
-    /// sabotage the registration by deleting its own `<id>.json` so its cleanup fails later, then
-    /// panic while the guard is still alive, so unwinding drops it. Without a `catch_unwind` in
+    /// whose parent must be a directory symlink or junction; sabotage the registration by
+    /// retargeting that link at a fresh empty sibling directory `other`, so the registration's
+    /// cleanup finds the coordination directory moved (Windows refuses to delete a registration's
+    /// own files, but not to retarget an ancestor), then panic while the guard is still alive, so unwinding drops it. Without a `catch_unwind` in
     /// `Drop`, its panic during that unwind would `abort()` the whole process. Needs a genuine
     /// subprocess: aborting the caller is the point of the probe.
     pub fn probe_drop_panic_during_unwind(coord_dir: &std::path::Path) {
-        let registration = crate::coordination::coordinate(coord_dir, "probe", &[], "");
-        let path = registration.probe_entry_path();
-        std::fs::remove_file(&path).unwrap_or_else(|e| panic!("probe: could not delete {path:?}: {e}"));
+        let _registration = crate::coordination::coordinate(coord_dir, "probe", &[], "");
+        let link = coord_dir.parent().expect("probe: coord_dir must be inside a symlink");
+        let other = link.with_file_name("other");
+        std::fs::create_dir(&other).unwrap_or_else(|e| panic!("probe: could not create {other:?}: {e}"));
+        // A directory symlink is removed with `remove_dir` on Windows and `remove_file` on Unix.
+        #[cfg(unix)]
+        std::fs::remove_file(link).unwrap_or_else(|e| panic!("probe: could not remove {link:?}: {e}"));
+        #[cfg(windows)]
+        std::fs::remove_dir(link).unwrap_or_else(|e| panic!("probe: could not remove {link:?}: {e}"));
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&other, link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(&other, link);
+        made.unwrap_or_else(|e| panic!("probe: could not relink {link:?}: {e}"));
 
         panic!("probe: artificial panic to trigger unwind; TestRegistration::drop must not abort the process");
     }
