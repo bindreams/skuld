@@ -460,6 +460,69 @@ fn global_serial_prevents_concurrent_execution() {
 }
 
 #[test]
+fn non_serial_allows_concurrent_execution() {
+    const THREADS: usize = 8;
+    const { assert!(THREADS >= 2) };
+    let (_dir, coord) = temp_coord();
+
+    // Two rendezvous points: the first races every thread into `register` together; the second
+    // holds every thread's registration until all are registered, so the peak is THREADS
+    // whatever `register`'s latency. A live-but-stuck participant still hangs the rest; see the
+    // non-blocking counterpart below.
+    let peak = AtomicU32::new(0);
+    let running = AtomicU32::new(0);
+    let entry_points = rendezvous(THREADS);
+    let observation_points = rendezvous(THREADS);
+
+    std::thread::scope(|s| {
+        for (entry, observation) in entry_points.into_iter().zip(observation_points) {
+            s.spawn(|| {
+                entry.wait();
+                let mut reg = register(&coord, "parallel_test", &[], SERIAL_NONE);
+                let n = running.fetch_add(1, SeqCst) + 1;
+                peak.fetch_max(n, SeqCst);
+                observation.wait();
+                running.fetch_sub(1, SeqCst);
+                reg.unregister();
+            });
+        }
+    });
+
+    assert_eq!(
+        peak.load(SeqCst) as usize,
+        THREADS,
+        "non-serial tests should run concurrently"
+    );
+}
+
+/// Non-blocking counterpart to `non_serial_allows_concurrent_execution`: asks `try_register`
+/// against already-registered tests, so a regression fails instead of hanging. The registrations
+/// carry labels, and one serial entry holds a filter the candidate does not match: neither may
+/// block a non-serial test, while the same serial entry still blocks a matching one.
+#[test]
+fn non_serial_registrations_do_not_block_can_start_for_another_non_serial_test() {
+    const REGISTRATIONS: usize = 7;
+    let (_dir, coord) = temp_coord();
+    let docker = Label::__new("docker");
+    let network = Label::__new("network");
+    let cache = Label::__new("cache");
+
+    let _parallel: Vec<Registration> = (0..REGISTRATIONS)
+        .map(|i| running(&coord, &format!("parallel_test_{i}"), &[docker, network], SERIAL_NONE))
+        .collect();
+    let _serial_cache = running(&coord, "serial_cache", &[], "cache");
+
+    assert!(
+        can_start_now(&coord, &[docker, network], SERIAL_NONE),
+        "{REGISTRATIONS} labelled non-serial registrations and a serial entry with a non-matching          filter must not block another non-serial test from starting"
+    );
+    assert!(
+        !can_start_now(&coord, &[cache], SERIAL_NONE),
+        "the serial entry must still block a test its filter matches"
+    );
+}
+
+#[test]
 fn filtered_serial_blocks_only_matching_tests() {
     let (_dir, coord) = temp_coord();
     let docker = Label::__new("docker");

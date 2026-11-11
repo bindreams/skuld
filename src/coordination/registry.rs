@@ -321,10 +321,8 @@ impl Registration {
         with_init_lock(&mutex_base(&coord_dir), |held| {
             #[cfg(test)]
             test_hooks::run_seam(Seam::Unregistering);
-            if held.target_has_split()
-                || FileIdentity::of(&lock) != Some(self.lock_identity)
-                || !json.try_exists().unwrap_or(false)
-            {
+            let json_exists = or_panic("inspect", &json, json.try_exists());
+            if held.target_has_split() || FileIdentity::of(&lock) != Some(self.lock_identity) || !json_exists {
                 panic!("{}", moved_message(&coord_dir, "unregistering a test"));
             }
             or_panic("remove", &json, std::fs::remove_file(&json));
