@@ -150,6 +150,13 @@ pub(crate) enum Seam {
     Fd,
     /// `open_db`, right after schema init, before the companions are recorded.
     SchemaInit,
+    /// `registry::register`, once `<id>.lock` exists and before it is locked.
+    Created,
+    /// `registry::register`, after the `.json` rename and before the final split check, mutex
+    /// still held.
+    Published,
+    /// `Registration::unregister`, after the mutex is taken and before the checks.
+    Unregistering,
 }
 
 type SeamHook = (Seam, Box<dyn FnOnce()>);

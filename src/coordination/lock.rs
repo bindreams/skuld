@@ -352,8 +352,22 @@ pub(super) static EINTR_RETRIES: std::sync::atomic::AtomicU32 = std::sync::atomi
 /// `std::fs::File::lock` (`LockFileEx` under the hood) — Windows has no gap
 /// for this to work around, see the module doc.
 #[cfg(windows)]
-fn lock_exclusive(target: &File) -> std::io::Result<()> {
+pub(super) fn lock_exclusive(target: &File) -> std::io::Result<()> {
     target.lock()
+}
+
+/// Release `target`'s lock now, ahead of closing it. Closing alone releases it too, but Windows
+/// documents the release on close as taking "available system resources" to happen, so a holder
+/// whose release others wait on unlocks first.
+#[cfg(unix)]
+pub(super) fn unlock(target: &File) -> std::io::Result<()> {
+    rustix::fs::flock(target, rustix::fs::FlockOperation::Unlock).map_err(Into::into)
+}
+
+/// See the Unix variant.
+#[cfg(windows)]
+pub(super) fn unlock(target: &File) -> std::io::Result<()> {
+    target.unlock()
 }
 
 /// Attempt to acquire `target`'s exclusive advisory lock without blocking,

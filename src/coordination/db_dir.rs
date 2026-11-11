@@ -129,7 +129,7 @@ fn canonical_exe(exe: &Path) -> io::Result<PathBuf> {
 
 /// `create_dir_all`, but every directory it creates is mode 0777 regardless of umask (as
 /// `publish.rs` does for the DB), so whichever uid gets there first does not lock out the rest.
-fn create_dir_all_open(dir: &Path) -> io::Result<()> {
+pub(super) fn create_dir_all_open(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         create_dir_all_open_with(dir, |_, _| {})

@@ -24,6 +24,10 @@ mod moved_db_tests;
 mod publish;
 #[cfg(all(test, unix))]
 mod publish_tests;
+#[allow(dead_code)] // used from Task 3 on
+mod registry;
+#[cfg(test)]
+mod registry_tests;
 #[cfg(test)]
 mod rendezvous;
 #[cfg(test)]
