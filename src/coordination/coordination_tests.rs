@@ -1,17 +1,11 @@
 //! Tests for [`coordinate`] and [`TestRegistration`]. The registry's own rules are tested in
 //! `registry_tests.rs`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::registry::running_dir;
+use super::registry_tests::temp_coord;
 use super::{coordinate, SERIAL_ALL, SERIAL_NONE};
-
-/// A fresh coordination directory, `<temp>/.skuld`, which does not exist yet.
-fn temp_coord() -> (crate::TempDir, PathBuf) {
-    let dir = crate::TempDir::new().unwrap();
-    let coord = dir.path().join(".skuld");
-    (dir, coord)
-}
 
 /// The `.json` entries in `running/`, parsed.
 fn entries(coord: &Path) -> Vec<serde_json::Value> {

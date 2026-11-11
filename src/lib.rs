@@ -240,16 +240,9 @@ pub mod __private {
     /// `Drop`, its panic during that unwind would `abort()` the whole process. Needs a genuine
     /// subprocess: aborting the caller is the point of the probe.
     pub fn probe_drop_panic_during_unwind(coord_dir: &std::path::Path) {
-        let _registration = crate::coordination::coordinate(coord_dir, "probe", &[], "");
-        let running = coord_dir.join("running");
-        for entry in std::fs::read_dir(&running).unwrap_or_else(|e| panic!("probe: could not list {running:?}: {e}")) {
-            let path = entry
-                .unwrap_or_else(|e| panic!("probe: could not list {running:?}: {e}"))
-                .path();
-            if path.extension().is_some_and(|ext| ext == "json") {
-                std::fs::remove_file(&path).unwrap_or_else(|e| panic!("probe: could not delete {path:?}: {e}"));
-            }
-        }
+        let registration = crate::coordination::coordinate(coord_dir, "probe", &[], "");
+        let path = registration.probe_entry_path();
+        std::fs::remove_file(&path).unwrap_or_else(|e| panic!("probe: could not delete {path:?}: {e}"));
 
         panic!("probe: artificial panic to trigger unwind; TestRegistration::drop must not abort the process");
     }

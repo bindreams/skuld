@@ -212,6 +212,22 @@ jobs:
             exit 1
           fi
 
+      # `cargo tree -i` exits 0 when `cc` is in the graph and 101 with "did not match any
+      # packages" when it is not; any other failure is a real error.
+      - name: No cc in the dependency graph
+        run: |
+          status=0
+          out=$(cargo tree -p skuld -i cc --target all -e normal,build --all-features 2>&1) || status=$?
+          if [ "$status" -eq 0 ]; then
+            echo "cc is in skuld's dependency graph:" >&2
+            echo "$out" >&2
+            exit 1
+          fi
+          case "$out" in
+            *"did not match any packages"*) echo "cc is not in the dependency graph" ;;
+            *) echo "cargo tree failed:" >&2; echo "$out" >&2; exit 1 ;;
+          esac
+
       - name: Unit tests
         run: cargo nextest run --workspace --exclude xtask --target x86_64-unknown-linux-musl --no-fail-fast
 

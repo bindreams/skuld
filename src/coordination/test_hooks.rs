@@ -70,6 +70,15 @@ impl RetryTest {
         let _ = self.ack.try_send(());
     }
 
+    /// Let the worker retry `n` times while whatever makes it busy stays in
+    /// place: for each, wait for its signal and release it.
+    pub(crate) fn pass_retries(&self, n: usize) {
+        for _ in 0..n {
+            self.wait_for_retry();
+            self.release();
+        }
+    }
+
     /// Whether the worker has sent a signal not yet consumed by
     /// [`Self::wait_for_retry`], without blocking.
     #[cfg(test)]

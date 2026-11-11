@@ -14,7 +14,7 @@ use super::{SERIAL_ALL, SERIAL_NONE};
 use crate::label::Label;
 
 /// A fresh coordination directory, `<temp>/.skuld`, which does not exist yet.
-fn temp_coord() -> (crate::TempDir, PathBuf) {
+pub(super) fn temp_coord() -> (crate::TempDir, PathBuf) {
     let dir = crate::TempDir::new().unwrap();
     let coord = dir.path().join(".skuld");
     (dir, coord)
@@ -533,6 +533,10 @@ fn filtered_serial_blocks_only_matching_tests() {
     assert!(!can_start_now(&coord, &[docker], SERIAL_NONE));
 }
 
+/// Retries a blocked registrant must survive before the blocker leaves: more than any plausible
+/// cap, so a retry limit would fail the registration instead.
+const NO_CAP_RETRIES: usize = 8;
+
 #[test]
 fn blocked_registration_signals_retry_and_holds_no_files() {
     let (_dir, coord) = temp_coord();
@@ -546,6 +550,7 @@ fn blocked_registration_signals_retry_and_holds_no_files() {
             register(&coord, "waiter", &[], SERIAL_ALL)
         });
 
+        test.pass_retries(NO_CAP_RETRIES);
         test.wait_for_retry();
         assert_eq!(running_files(&coord), blocker_files, "a waiting test holds no files");
 
