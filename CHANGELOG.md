@@ -4,6 +4,34 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Breaking
+
+- **Update every skuld at once.** Serial-test coordination moved from a SQLite
+  database to OS file locks, and an old (SQLite) skuld and a new one running at
+  the same time do not exclude each other. Coordination now lives in `.skuld/`
+  next to where `.skuld.db` was (`SKULD_DB_DIR` still names that directory).
+  Leftover `.skuld.db*` files are unused and can be deleted.
+- **Deleting or replacing `.skuld/` mid-run is detected, not prevented.** On
+  Unix, each test registered in the old copy panics when it finishes, which
+  fails the run; tests that start in the new copy meanwhile may run alongside
+  the old ones. On Windows, deleting the directory fails while tests run. A
+  deliberate swap that is restored before a test next checks is not detected.
+
+### Fixed
+
+- **A dead test's stale entry is no longer fooled by PID reuse, PID
+  namespaces or Windows `Access denied`** (#66). Staleness is whether the dead
+  test's lock can be taken, not a PID lookup, so a reused PID can no longer
+  hang a later serial test.
+
+### Changed
+
+- **No C compiler is needed to build or cross-compile skuld.** The bundled
+  SQLite (`rusqlite`) is gone, so musl and other targets without a C toolchain
+  build.
+- **On Unix, `.skuld/` and `running/` are mode 0777 and the files in them 0644**,
+  whatever the umask, so runs under several uids can share one directory.
+
 ## [0.6.0] - 2026-10-01
 
 ### Breaking

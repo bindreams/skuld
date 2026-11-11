@@ -50,20 +50,20 @@ pub(super) fn resolve(
         }
         None => {
             let exe = exe().map_err(|e| {
-                format!("cannot locate the coordination DB: current_exe() failed: {e}; set {DB_DIR_ENV} to an absolute directory")
+                format!("cannot locate the coordination directory: current_exe() failed: {e}; set {DB_DIR_ENV} to an absolute directory")
             })?;
             let exe = canonical_exe(&exe).map_err(|e| {
                 format!("cannot canonicalize executable {exe:?}: {e}; set {DB_DIR_ENV} to an absolute directory")
             })?;
             layout_dir(&exe, has_cargo_marker).ok_or_else(|| {
-                format!("cannot derive the coordination DB directory from executable {exe:?}; set {DB_DIR_ENV} to an absolute directory")
+                format!("cannot derive the coordination directory from executable {exe:?}; set {DB_DIR_ENV} to an absolute directory")
             })?
         }
     };
     check_usable(&dir).map_err(|e| {
-        format!("coordination DB directory {dir:?} is unusable: {e}; set {DB_DIR_ENV} to a writable absolute path")
+        format!("coordination directory {dir:?} is unusable: {e}; set {DB_DIR_ENV} to a writable absolute path")
     })?;
-    created.map_err(|e| format!("cannot create coordination DB directory {dir:?} (from {DB_DIR_ENV}): {e}"))?;
+    created.map_err(|e| format!("cannot create coordination directory {dir:?} (from {DB_DIR_ENV}): {e}"))?;
     Ok(dir)
 }
 

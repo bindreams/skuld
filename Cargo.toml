@@ -37,7 +37,7 @@ serde_json = "1"
 # Cross-platform anonymous pipe primitive, used by the per-test FD capture in
 # src/capture.rs. Avoids reimplementing pipe()/CreatePipe() ourselves.
 os_pipe = "1.2"
-# Canonicalize without Windows verbatim (`\\?\`) prefixes, for the DB directory.
+# Canonicalize without Windows verbatim (`\\?\`) prefixes, for the coordination directory.
 dunce = "1"
 pest = "2"
 pest_derive = "2"

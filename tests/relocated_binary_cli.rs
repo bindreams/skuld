@@ -1,4 +1,4 @@
-//! A skuld test binary locates its coordination database at run time, from its
+//! A skuld test binary locates its coordination directory at run time, from its
 //! own path, so a moved or archived binary works. Uses the standard libtest
 //! harness because skuld is the subject. Spawns copies of `capture_fixture`.
 
@@ -120,7 +120,7 @@ fn new_build_dir_layout_resolves_to_the_profile_dir() {
 
 /// A trial that changes `SKULD_DB_DIR` mid-run must not move later trials to another coordination directory.
 #[test]
-fn db_path_is_resolved_once_per_process() {
+fn coordination_dir_is_resolved_once_per_process() {
     let tmp = skuld::TempDir::new().unwrap();
     let profile = tmp.path().join("debug");
     let exe = copy_bin_to(

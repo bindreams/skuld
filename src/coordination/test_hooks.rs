@@ -48,7 +48,7 @@ impl RetryTest {
     pub(crate) fn wait_for_retry(&self) {
         self.signal
             .recv()
-            .expect("the worker exited without hitting a retryable busy error — test setup is broken");
+            .expect("the worker exited without backing off to retry — test setup is broken");
     }
 
     /// Call after the final [`Self::release`], before joining the worker: the

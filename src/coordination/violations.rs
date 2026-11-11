@@ -4,7 +4,7 @@
 //! thread is already unwinding aborts the process, so during an unwind it
 //! downgrades to a warning. A warning does not fail the run: a `#[should_panic]`
 //! test, or a test whose own failure is reported first, would hide a coordination
-//! database that was moved or broken. So the downgraded failure is recorded
+//! directory that was moved or broken. So the downgraded failure is recorded
 //! here, and the runner, which owns the process's exit, fails the run with it.
 
 use std::sync::{Mutex, PoisonError};

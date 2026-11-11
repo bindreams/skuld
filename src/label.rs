@@ -589,6 +589,8 @@ impl LabelFilter {
     /// ```sql
     /// SELECT EXISTS (SELECT 1 FROM running r WHERE <result>)
     /// ```
+    ///
+    /// Skuld's own coordination no longer uses SQL; this is for external tooling.
     pub fn to_sql(&self) -> String {
         to_sql_expr(&self.expr)
     }
@@ -627,7 +629,7 @@ impl From<Label> for LabelFilter {
 
 // Compile-time assertion that LabelFilter remains thread-safe across crate
 // upgrades. The runtime carries filters across thread boundaries (test
-// runner, coordination DB queries) and must not silently lose Send/Sync.
+// runner, coordination registry) and must not silently lose Send/Sync.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<LabelFilter>();
