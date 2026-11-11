@@ -217,13 +217,14 @@ fn lock_exclusive_retries_past_eintr_from_a_non_restarting_handler() {
     let waiter_thread = std::thread::spawn(move || {
         // Report this thread's own id before doing anything blocking, so
         // the main thread never has to guess whether the id it has is
-        // still valid.
+        // still valid. Sent as usize: pthread_t is a raw pointer on musl,
+        // which is not Send.
         tid_tx
-            .send(unsafe { libc::pthread_self() })
+            .send(unsafe { libc::pthread_self() } as usize)
             .expect("main thread must still be waiting to receive the pthread id");
         lock_exclusive(&waiter)
     });
-    let waiter_pthread = tid_rx.recv().expect("waiter thread must report its pthread id");
+    let waiter_pthread = tid_rx.recv().expect("waiter thread must report its pthread id") as libc::pthread_t;
 
     // Bombard the blocked thread with the non-restarting signal until
     // there's direct evidence — lock_exclusive's own retry counter moving —

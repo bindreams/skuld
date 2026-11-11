@@ -150,20 +150,6 @@ jobs:
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 
-      # The cross-device moved-DB test needs two filesystems.
-      - name: Provision two filesystems
-        if: matrix.os == 'linux'
-        run: |
-          set -euo pipefail
-          for fs in a b; do
-            sudo mkdir -p "/mnt/skuld-fs-$fs"
-            sudo mount -t tmpfs -o mode=1777 tmpfs "/mnt/skuld-fs-$fs"
-          done
-          {
-            echo "SKULD_TEST_FS_A=/mnt/skuld-fs-a"
-            echo "SKULD_TEST_FS_B=/mnt/skuld-fs-b"
-          } >> "$GITHUB_ENV"
-
       - name: Build workspace
         # Exclude xtask from the matrix: it's a dev tool run only on the lint
         # host (Linux), and its deps aren't worth cross-compiling to 6 targets.
@@ -198,3 +184,39 @@ jobs:
       - name: Fixture lock is current
         if: matrix.os == 'linux' && matrix.arch == 'amd64'
         run: git diff --exit-code -- cargo-skuld/tests/fixtures/test-workspace/Cargo.lock
+
+  # skuld has no C dependency, so the musl target builds with no musl C compiler
+  # installed. A compiler on PATH would let a future C dependency slip in unnoticed.
+  musl:
+    name: Test (linux/amd64/musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          pin-file: .github/release-toolchain
+          targets: x86_64-unknown-linux-musl
+
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      # `command -v` succeeds if any name resolves, so this fails when either is present.
+      - name: No musl C compiler is installed
+        run: |
+          if command -v x86_64-linux-musl-gcc musl-gcc; then
+            echo "a musl C compiler is present; this job would prove nothing" >&2
+            exit 1
+          fi
+
+      - name: Unit tests
+        run: cargo nextest run --workspace --exclude xtask --target x86_64-unknown-linux-musl --no-fail-fast
+
+      - name: Doctests
+        run: cargo test --workspace --exclude xtask --doc --target x86_64-unknown-linux-musl
+
+      - name: Integration tests
+        run: cargo test -p skuld --test integration --target x86_64-unknown-linux-musl

@@ -39,8 +39,6 @@ serde_json = "1"
 os_pipe = "1.2"
 # Canonicalize without Windows verbatim (`\\?\`) prefixes, for the DB directory.
 dunce = "1"
-# Cross-process test coordination database for serial test scheduling.
-rusqlite = { version = "0.40", features = ["bundled"] }
 pest = "2"
 pest_derive = "2"
 # Boolean algebra primitives backing the canonical form of LabelFilter (BDD-based
@@ -68,10 +66,10 @@ rustix = { version = "1", features = ["fs"] }
 libc = "0.2"
 windows = { version = "0.62", features = [
     "Win32_System_Console",
-    "Win32_System_Threading",
-    # FILE_SHARE_READ/FILE_SHARE_WRITE, for src/coordination/lock.rs's
-    # Windows init lock file: opened without FILE_SHARE_DELETE so it can
-    # never be deleted or renamed out from under a holder.
+    # FILE_SHARE_READ/FILE_SHARE_WRITE, for the global lock and per-test lock
+    # files (src/coordination/lock.rs, registry.rs): opened without
+    # FILE_SHARE_DELETE so a holder's file can never be deleted or renamed
+    # out from under it.
     "Win32_Storage_FileSystem",
     # NtCreateFile (src/win_nt.rs) reports STATUS_DELETE_PENDING, which
     # CreateFileW folds into ERROR_ACCESS_DENIED.

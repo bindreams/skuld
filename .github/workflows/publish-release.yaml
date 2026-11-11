@@ -210,8 +210,8 @@ jobs:
 
       # The verification build runs here, before the token exists. `cargo
       # publish` would otherwise do it inside the credential's ~30-minute
-      # window, and on a cold cache compiling the publishable crates (rusqlite
-      # builds SQLite from C) can consume most of that.
+      # window, and on a cold cache compiling the publishable crates can consume
+      # most of that.
       #
       # The member list is built explicitly rather than using `--workspace`,
       # which packages `publish = false` members too. That is a superset of what
