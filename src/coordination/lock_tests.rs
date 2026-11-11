@@ -285,15 +285,13 @@ fn open_lock_target_rejects_a_relative_path() {
 
 #[cfg(unix)]
 #[test]
-fn a_failed_stat_of_the_lock_target_is_reported_not_swallowed() {
+fn a_lock_target_that_cannot_be_inspected_reads_as_a_split() {
     let tmp = crate::TempDir::new().unwrap();
     let dir = tmp.path().join("d");
     std::fs::create_dir(&dir).unwrap();
     with_global_lock(&dir, |held| {
-        assert!(held.stat_target().is_ok());
+        assert!(!held.target_has_split());
         std::fs::remove_dir(&dir).unwrap();
-        let err = held.stat_target().unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(held.target_has_split());
     });
 }

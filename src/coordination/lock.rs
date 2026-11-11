@@ -24,6 +24,7 @@
 //! naming the path: retrying the same open does not change the outcome. So does a filesystem whose
 //! `flock` refuses a directory (some network filesystems): there is no fallback mechanism.
 
+use super::file_identity::FileIdentity;
 use super::skuld_debug_eprintln;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -48,77 +49,27 @@ pub(super) fn lock_path(coord_dir: &Path) -> PathBuf {
 /// Obtainable only inside [`with_global_lock`]'s closure.
 pub(super) struct GlobalLockHeld<'a> {
     coord_dir: &'a Path,
-    /// dev+ino (Unix) or volume serial + file index (Windows) of the lock target this token's lock
-    /// is held on, recorded at acquisition; see [`Self::target_has_split`].
-    #[cfg(unix)]
-    target_identity: (u64, u64),
-    #[cfg(windows)]
-    target_identity: (u32, u64),
+    /// Of the lock target this token's lock is held on, recorded at acquisition; see
+    /// [`Self::target_has_split`].
+    target_identity: FileIdentity,
 }
 
 impl<'a> GlobalLockHeld<'a> {
-    /// True once the lock target this token holds no longer matches what `coord_dir`
-    /// resolves to: the lock has split, so a new opener locks the replacement while this handle
-    /// only excludes callers of the detached original. Unix compares `coord_dir`'s recorded
-    /// identity against a fresh `stat`.
-    #[cfg(unix)]
+    /// True once the lock target this token holds no longer matches what `coord_dir` resolves to:
+    /// the lock has split, so a new opener locks the replacement while this handle only excludes
+    /// callers of the detached original. Resolves [`lock_path`] afresh and compares it with the
+    /// identity recorded at acquisition. On Windows, withholding `FILE_SHARE_DELETE` stops the lock
+    /// file itself being deleted or renamed, but not a symlink or junction ancestor being
+    /// retargeted.
     pub(super) fn target_has_split(&self) -> bool {
-        match self.stat_target() {
-            Ok(identity) => identity != self.target_identity,
-            Err(e) => {
-                skuld_debug_eprintln!(
-                    "global lock target {:?} could not be inspected, treating as split: {e}",
-                    lock_path(self.coord_dir)
-                );
-                true
-            }
-        }
-    }
-
-    /// Fresh dev+ino of the lock target directory, for comparison with the identity recorded
-    /// at acquisition.
-    #[cfg(unix)]
-    pub(super) fn stat_target(&self) -> std::io::Result<(u64, u64)> {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(self.coord_dir).map(|m| (m.dev(), m.ino()))
-    }
-
-    /// Windows: compares a fresh open of `coord_dir/global.lock` against the recorded identity.
-    /// Withholding `FILE_SHARE_DELETE` stops the lock file itself being deleted or renamed, but
-    /// not a symlink or junction ancestor being retargeted.
-    #[cfg(windows)]
-    pub(super) fn target_has_split(&self) -> bool {
-        use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
-
-        let fresh = match std::fs::File::open(lock_path(self.coord_dir)) {
-            Ok(f) => f,
-            Err(e) => {
-                skuld_debug_eprintln!(
-                    "global lock file {:?} could not be reopened, treating as split: {e}",
-                    lock_path(self.coord_dir)
-                );
-                return true;
-            }
-        };
-        let handle = windows::Win32::Foundation::HANDLE(fresh.as_raw_handle());
-        let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        // Safety: `handle` is a valid, currently-open handle for as long as
-        // `fresh` is alive, which outlives this call; `&mut info` is a
-        // valid `*mut BY_HANDLE_FILE_INFORMATION` for the call to write
-        // into.
-        if let Err(e) = unsafe { GetFileInformationByHandle(handle, &mut info) } {
+        let fresh = FileIdentity::of(&lock_path(self.coord_dir));
+        if fresh.is_none() {
             skuld_debug_eprintln!(
-                "global lock file {:?} could not be inspected, treating as split: {e}",
+                "global lock target {:?} could not be inspected, treating as split",
                 lock_path(self.coord_dir)
             );
-            return true;
         }
-        let current = (
-            info.dwVolumeSerialNumber,
-            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-        );
-        current != self.target_identity
+        fresh != Some(self.target_identity)
     }
 }
 
@@ -148,38 +99,12 @@ pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnO
         }
     }
     let _release = Unlock(target);
-    #[cfg(unix)]
-    let target_identity = {
-        use std::os::unix::fs::MetadataExt;
-        target.metadata().map(|m| (m.dev(), m.ino())).unwrap_or_else(|e| {
-            panic!(
-                "skuld: failed to inspect the global lock {:?}: {e}",
-                lock_path(coord_dir)
-            )
-        })
-    };
-    #[cfg(windows)]
-    let target_identity = {
-        use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
-
-        let handle = windows::Win32::Foundation::HANDLE(target.as_raw_handle());
-        let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        // Safety: `handle` is a valid, currently-open handle for as long as
-        // `target` is alive, which outlives this call; `&mut info` is a
-        // valid `*mut BY_HANDLE_FILE_INFORMATION` for the call to write
-        // into.
-        unsafe { GetFileInformationByHandle(handle, &mut info) }.unwrap_or_else(|e| {
-            panic!(
-                "skuld: failed to inspect the global lock {:?}: {e}",
-                lock_path(coord_dir)
-            )
-        });
-        (
-            info.dwVolumeSerialNumber,
-            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    let target_identity = FileIdentity::of_file(target).unwrap_or_else(|e| {
+        panic!(
+            "skuld: failed to inspect the global lock {:?}: {e}",
+            lock_path(coord_dir)
         )
-    };
+    });
     f(&GlobalLockHeld {
         coord_dir,
         target_identity,
