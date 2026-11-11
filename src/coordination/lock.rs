@@ -31,6 +31,12 @@ use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
 
+/// The share mode of every file the coordination directory holds open: no `FILE_SHARE_DELETE`, so
+/// none can be deleted or renamed while open.
+#[cfg(windows)]
+pub(super) const WINDOWS_SHARE_MODE: u32 =
+    windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0 | windows::Win32::Storage::FileSystem::FILE_SHARE_WRITE.0;
+
 /// The lock file for `base` on Windows: `base` with `.lock` appended verbatim, so `<dir>/global`
 /// gets `<dir>/global.lock`. Unix has no lock file (see the module doc).
 #[cfg(windows)]
@@ -201,7 +207,6 @@ pub(super) fn open_lock_target(base: &Path) -> File {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
         let path = lock_path(base);
         OpenOptions::new()
@@ -212,7 +217,7 @@ pub(super) fn open_lock_target(base: &Path) -> File {
             .truncate(false)
             .read(true)
             // No FILE_SHARE_DELETE: keeps the file from being deleted or renamed while held.
-            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
+            .share_mode(WINDOWS_SHARE_MODE)
             .open(&path)
             .unwrap_or_else(|e| {
                 panic!(

@@ -670,6 +670,25 @@ fn running_lock_cannot_be_deleted_while_registered() {
     reg.unregister();
 }
 
+/// A recursive delete that carries on past errors would otherwise remove the live `.json` and
+/// leave its `.lock`, which the scan ignores: a serial test could then start beside this one.
+#[cfg(windows)]
+#[test]
+fn running_json_cannot_be_deleted_while_registered() {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    let (_dir, coord) = temp_coord();
+    let mut reg = running(&coord, "t", &[], SERIAL_ALL);
+    let err =
+        std::fs::remove_file(reg.json_path()).expect_err("Windows must refuse to delete an entry its owner holds open");
+    assert_eq!(err.raw_os_error(), Some(ERROR_SHARING_VIOLATION), "{err}");
+    assert!(
+        attempt(&coord, "second", &[], SERIAL_NONE).is_none(),
+        "the entry must still block a conflicting registration"
+    );
+    reg.unregister();
+    assert_eq!(running_files(&coord), Vec::<String>::new());
+}
+
 /// Rename `coord` aside and make a fresh one at its path.
 #[cfg(unix)]
 fn split(coord: &Path) {

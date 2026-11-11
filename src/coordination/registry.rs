@@ -118,8 +118,7 @@ fn create_new_file(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-        options.share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0);
+        options.share_mode(super::lock::WINDOWS_SHARE_MODE);
     }
     let file = options.open(path)?;
     #[cfg(unix)]
@@ -129,6 +128,27 @@ fn create_new_file(path: &Path) -> io::Result<File> {
         file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
     }
     Ok(file)
+}
+
+/// Windows: hold `path` open, read-only and without `FILE_SHARE_DELETE`, so it cannot be deleted
+/// or renamed. A recursive delete that carries on past errors would otherwise remove a live
+/// `.json` and leave its `.lock`, which the scan ignores. Readers (the scan) are unaffected. Unix
+/// has no such handle: a deleted entry is found at unregistration.
+fn hold_open(path: &Path) -> io::Result<Option<File>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .share_mode(super::lock::WINDOWS_SHARE_MODE)
+            .open(path)
+            .map(Some)
+    }
+    #[cfg(unix)]
+    {
+        let _ = path;
+        Ok(None)
+    }
 }
 
 fn remove_if_exists(path: &Path) {
@@ -301,6 +321,8 @@ pub(super) struct Registration {
     lock: Option<File>,
     /// Of the file `lock` has open, for checking that `running/<id>.lock` is still that file.
     lock_identity: FileIdentity,
+    /// Windows: `<id>.json`, held open until [`Self::unregister`] (see [`hold_open`]).
+    json_hold: Option<File>,
     /// The mutex's lock target, held open (and unlocked) since registration so that
     /// [`Self::unregister`] locks it again without opening anything: a test that has used up its
     /// file descriptors must still be able to unregister.
@@ -337,6 +359,7 @@ impl Registration {
             if held.target_has_split() || FileIdentity::of(&lock) != Some(self.lock_identity) || !json_exists {
                 panic!("{}", moved_message(&coord_dir, "unregistering a test"));
             }
+            drop(self.json_hold.take());
             or_panic("remove", &json, std::fs::remove_file(&json));
             let file = self.lock.take().expect("checked above");
             or_panic("unlock", &lock, unlock(&file));
@@ -372,7 +395,7 @@ pub(super) fn try_register(
     );
     let base = mutex_base(coord_dir);
     let mutex_target = open_lock_target(&base);
-    let (id, lock, lock_identity) = with_locked_target(&base, &mutex_target, |held| {
+    let (id, lock, lock_identity, json_hold) = with_locked_target(&base, &mutex_target, |held| {
         if held.target_has_split() {
             panic!("{}", moved_message(coord_dir, "registering a test"));
         }
@@ -387,12 +410,13 @@ pub(super) fn try_register(
         id,
         lock: Some(lock),
         lock_identity,
+        json_hold,
         mutex_target,
     })
 }
 
-/// Create, lock and publish the registration, returning its id, locked file and that file's
-/// identity. The caller holds the mutex and has decided the test can start.
+/// Create, lock and publish the registration, returning its id, locked file, that file's
+/// identity and the held `.json` (see [`hold_open`]). The caller holds the mutex and has decided the test can start.
 fn publish(
     held: &GlobalLockHeld<'_>,
     ids: &IdGenerator,
@@ -400,7 +424,7 @@ fn publish(
     name: &str,
     labels: &[Label],
     storage_filter: &str,
-) -> (String, File, FileIdentity) {
+) -> (String, File, FileIdentity, Option<File>) {
     let running = running_dir(coord_dir);
     let (id, file) = create_lock(ids, &running);
     let entry = Entry {
@@ -409,6 +433,7 @@ fn publish(
         filter: storage_filter.to_owned(),
     };
     publish_entry(&running, &id, &entry);
+    let json_hold = or_panic("hold", &json_path(&running, &id), hold_open(&json_path(&running, &id)));
     #[cfg(test)]
     test_hooks::run_seam(Seam::Published);
 
@@ -418,7 +443,7 @@ fn publish(
     if held.target_has_split() || FileIdentity::of(&lock_path(&running, &id)) != Some(lock_identity) {
         panic!("{}", moved_message(coord_dir, "registering a test"));
     }
-    (id, file, lock_identity)
+    (id, file, lock_identity, json_hold)
 }
 
 /// [`register`] with the ids from `ids`.
