@@ -325,8 +325,12 @@ const CHILD_UMASK_ENV: &str = "SKULD_REGISTRY_TEST_CHILD_UMASK";
 
 /// Name of [`registered_child`], as libtest's `--exact` wants it.
 fn child_test_name() -> String {
-    let module = module_path!().split_once("::").expect("module path has a crate").1;
-    format!("{module}::registered_child")
+    format!("{}::registered_child", module_tail())
+}
+
+/// This module's path without the crate name, as libtest's `--exact` wants it.
+fn module_tail() -> &'static str {
+    module_path!().split_once("::").expect("module path has a crate").1
 }
 
 /// Not a test of its own: the body of the process [`spawn_registered_child`] starts. Without
@@ -410,6 +414,84 @@ fn entry_of_a_dead_owner_is_removed() {
     let ours = vec![format!("{}.json", reg.id()), format!("{}.lock", reg.id())];
     assert_eq!(running_files(&coord), ours, "the child's files must be gone");
     reg.unregister();
+}
+
+#[cfg(unix)]
+const FD_CHILD_DIR_ENV: &str = "SKULD_REGISTRY_TEST_FD_CHILD_DIR";
+#[cfg(unix)]
+const FD_CHILD_DONE: &str = "child-unregistered";
+
+/// Not a test of its own: the body of the process [`unregister_needs_no_new_file_descriptor`]
+/// starts. Without `FD_CHILD_DIR_ENV` it passes. With it, it registers, spends every free file
+/// descriptor, then unregisters.
+#[cfg(unix)]
+#[test]
+fn unregistering_child() {
+    let Some(dir) = std::env::var_os(FD_CHILD_DIR_ENV) else {
+        return;
+    };
+    let mut reg = register(Path::new(&dir), "child", &[], SERIAL_NONE);
+    assert_eq!(
+        running_files(Path::new(&dir)).len(),
+        2,
+        "registered: a .lock and a .json"
+    );
+
+    // The next `open` returns the lowest free descriptor, so a soft limit at or below it makes
+    // every later `open` fail EMFILE.
+    // Safety: `fcntl(F_GETFD)` only inspects a descriptor and fails on a closed one.
+    let lowest_free = (0..)
+        .find(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1)
+        .unwrap();
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // Safety: `limit` is a valid rlimit for the call to read and write.
+    unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+        limit.rlim_cur = lowest_free as libc::rlim_t;
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+    }
+    std::fs::File::open(".").expect_err("no descriptor is free");
+
+    reg.unregister();
+    println!("{FD_CHILD_DONE}");
+}
+
+/// A test body can exhaust its descriptor table (`RLIMIT_NOFILE`); unregistration must then still
+/// succeed, so it may open nothing that registration did not already hold.
+#[cfg(unix)]
+#[test]
+fn unregister_needs_no_new_file_descriptor() {
+    let (_dir, coord) = temp_coord();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("{}::unregistering_child", module_tail()),
+            "--nocapture",
+        ])
+        .env(FD_CHILD_DIR_ENV, &coord)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        output.status.success() && stdout.contains(FD_CHILD_DONE),
+        "the child must unregister with no free descriptor: {}
+stdout:
+{stdout}
+stderr:
+{stderr}",
+        output.status
+    );
+    assert_eq!(
+        running_files(&coord),
+        Vec::<String>::new(),
+        "unregistration removes both files"
+    );
 }
 
 #[cfg(unix)]

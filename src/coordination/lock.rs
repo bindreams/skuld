@@ -121,8 +121,24 @@ impl<'a> GlobalLockHeld<'a> {
 /// Run `f` while holding the global mutex for `base` (see the module doc). Blocks with no
 /// timeout. The lock is released when the handle closes, on `f`'s return and on a panic in it.
 pub(super) fn with_global_lock<T>(base: &Path, f: impl FnOnce(&GlobalLockHeld<'_>) -> T) -> T {
-    let target = open_lock_target(base);
-    lock_exclusive(&target).unwrap_or_else(|e| panic!("skuld: failed to acquire the global lock for {base:?}: {e}"));
+    with_locked_target(base, &open_lock_target(base), f)
+}
+
+/// [`with_global_lock`] on a `target` the caller already opened with [`open_lock_target`] and
+/// keeps: the mutex is released by unlocking `target`, not closing it, when `f` returns or
+/// panics, so the caller can lock it again later without opening anything. A registration holds
+/// its `target` for that, because a test that has used up its file descriptors must still be able
+/// to unregister. `target` must not be locked already.
+pub(super) fn with_locked_target<T>(base: &Path, target: &File, f: impl FnOnce(&GlobalLockHeld<'_>) -> T) -> T {
+    lock_exclusive(target).unwrap_or_else(|e| panic!("skuld: failed to acquire the global lock for {base:?}: {e}"));
+    /// Unlocks on drop, so a panic in `f` does not leave the mutex held by a handle that outlives it.
+    struct Unlock<'a>(&'a File);
+    impl Drop for Unlock<'_> {
+        fn drop(&mut self) {
+            let _ = unlock(self.0);
+        }
+    }
+    let _release = Unlock(target);
     #[cfg(unix)]
     let target_identity = {
         use std::os::unix::fs::MetadataExt;

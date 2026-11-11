@@ -21,7 +21,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::file_identity::FileIdentity;
-use super::lock::{lock_exclusive, try_lock_exclusive, unlock, with_global_lock, GlobalLockHeld};
+use super::lock::{lock_exclusive, open_lock_target, try_lock_exclusive, unlock, with_locked_target, GlobalLockHeld};
 use super::{skuld_debug_eprintln, DB_DIR_HINT, SERIAL_ALL, SERIAL_NONE};
 use crate::label::{Label, LabelFilter};
 
@@ -301,6 +301,10 @@ pub(super) struct Registration {
     lock: Option<File>,
     /// Of the file `lock` has open, for checking that `running/<id>.lock` is still that file.
     lock_identity: FileIdentity,
+    /// The mutex's lock target, held open (and unlocked) since registration so that
+    /// [`Self::unregister`] locks it again without opening anything: a test that has used up its
+    /// file descriptors must still be able to unregister.
+    mutex_target: File,
 }
 
 impl Registration {
@@ -324,7 +328,9 @@ impl Registration {
         let coord_dir = self.coord_dir.clone();
         let running = running_dir(&coord_dir);
         let (lock, json) = (lock_path(&running, &self.id), json_path(&running, &self.id));
-        with_global_lock(&mutex_base(&coord_dir), |held| {
+        // Opens nothing on Unix: `stat`, `metadata` and `remove_file` need no descriptor. (Windows
+        // has no descriptor limit, and `target_has_split` there reopens the lock file.)
+        with_locked_target(&mutex_base(&coord_dir), &self.mutex_target, |held| {
             #[cfg(test)]
             test_hooks::run_seam(Seam::Unregistering);
             let json_exists = or_panic("inspect", &json, json.try_exists());
@@ -364,7 +370,9 @@ pub(super) fn try_register(
         &running,
         super::db_dir::create_dir_all_open(&running),
     );
-    with_global_lock(&mutex_base(coord_dir), |held| {
+    let base = mutex_base(coord_dir);
+    let mutex_target = open_lock_target(&base);
+    let (id, lock, lock_identity) = with_locked_target(&base, &mutex_target, |held| {
         if held.target_has_split() {
             panic!("{}", moved_message(coord_dir, "registering a test"));
         }
@@ -373,11 +381,18 @@ pub(super) fn try_register(
             return None;
         }
         Some(publish(held, ids, coord_dir, name, labels, storage_filter))
+    })?;
+    Some(Registration {
+        coord_dir: coord_dir.to_path_buf(),
+        id,
+        lock: Some(lock),
+        lock_identity,
+        mutex_target,
     })
 }
 
-/// Create, lock and publish the registration. The caller holds the mutex and has decided the
-/// test can start.
+/// Create, lock and publish the registration, returning its id, locked file and that file's
+/// identity. The caller holds the mutex and has decided the test can start.
 fn publish(
     held: &GlobalLockHeld<'_>,
     ids: &IdGenerator,
@@ -385,7 +400,7 @@ fn publish(
     name: &str,
     labels: &[Label],
     storage_filter: &str,
-) -> Registration {
+) -> (String, File, FileIdentity) {
     let running = running_dir(coord_dir);
     let (id, file) = create_lock(ids, &running);
     let entry = Entry {
@@ -403,12 +418,7 @@ fn publish(
     if held.target_has_split() || FileIdentity::of(&lock_path(&running, &id)) != Some(lock_identity) {
         panic!("{}", moved_message(coord_dir, "registering a test"));
     }
-    Registration {
-        coord_dir: coord_dir.to_path_buf(),
-        id,
-        lock: Some(file),
-        lock_identity,
-    }
+    (id, file, lock_identity)
 }
 
 /// [`register`] with the ids from `ids`.
