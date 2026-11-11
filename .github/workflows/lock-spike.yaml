@@ -1,0 +1,117 @@
+# Spike for #121; not merged. Runs spikes/locks (coordination on OS file locks,
+# no database) on every platform skuld's CI covers, plus musl (no musl C
+# compiler) and 32-bit Linux.
+#
+# `create-race` replays a flaw in the design as written and is expected to
+# FAIL there; LOCKS_SPIKE_FIX=1 applies the one-line fix and must pass.
+name: Lock spike
+
+on:
+  push:
+    branches: [azhukova/121]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  MANIFEST: spikes/locks/Cargo.toml
+
+jobs:
+  native:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      BIN: spikes/locks/target/release/locks-spike
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/setup-rust
+        with:
+          pin-file: .github/release-toolchain
+      - run: cargo build --release --manifest-path "$MANIFEST"
+      - name: All scenarios
+        run: $BIN all
+      - name: create-race, design as written (expected FAIL)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: $BIN create-race
+      - name: create-race, with the fix
+        if: ${{ !cancelled() }}
+        run: LOCKS_SPIKE_FIX=1 $BIN create-race
+      - name: All scenarios, with the fix
+        if: ${{ !cancelled() }}
+        run: LOCKS_SPIKE_FIX=1 $BIN all
+      - name: Kill anywhere, 30 x 11 gated and 300 free kills
+        if: ${{ !cancelled() }}
+        run: $BIN kill-anywhere 30 300
+      - name: Cold start, 300 rounds
+        if: ${{ !cancelled() }}
+        run: $BIN cold 300
+      - name: Contend, 8 x 1000
+        if: ${{ !cancelled() }}
+        run: $BIN contend 8 1000
+      - name: Churn, 8 x 1000
+        if: ${{ !cancelled() }}
+        run: $BIN churn 8 1000
+
+  cross:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            apt: ""
+          - target: i686-unknown-linux-gnu
+            # Linker support only; the spike builds no C.
+            apt: gcc-multilib
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BIN: spikes/locks/target/${{ matrix.target }}/release/locks-spike
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/setup-rust
+        with:
+          pin-file: .github/release-toolchain
+          targets: ${{ matrix.target }}
+      - if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+      - name: No musl C compiler is installed
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          if command -v x86_64-linux-musl-gcc musl-gcc; then
+            echo "a musl C compiler is present; this job would prove nothing" >&2
+            exit 1
+          fi
+      - run: cargo build --release --target ${{ matrix.target }} --manifest-path "$MANIFEST"
+      - name: All scenarios
+        run: $BIN all
+      - name: create-race, design as written (expected FAIL)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: $BIN create-race
+      - name: create-race, with the fix
+        if: ${{ !cancelled() }}
+        run: LOCKS_SPIKE_FIX=1 $BIN create-race
+      - name: All scenarios, with the fix
+        if: ${{ !cancelled() }}
+        run: LOCKS_SPIKE_FIX=1 $BIN all
+      - name: Kill anywhere, 30 x 11 gated and 300 free kills
+        if: ${{ !cancelled() }}
+        run: $BIN kill-anywhere 30 300
+      - name: Cold start, 300 rounds
+        if: ${{ !cancelled() }}
+        run: $BIN cold 300
+      - name: Contend, 8 x 1000
+        if: ${{ !cancelled() }}
+        run: $BIN contend 8 1000
+      - name: Churn, 8 x 1000
+        if: ${{ !cancelled() }}
+        run: $BIN churn 8 1000
