@@ -20,6 +20,38 @@ pub(super) fn temp_coord() -> (crate::TempDir, PathBuf) {
     (dir, coord)
 }
 
+/// A coordination directory `<temp>/link/.skuld` behind a directory symlink, and a function that
+/// retargets the link at another directory. A registration made before the retarget is then behind
+/// the old target, so unregistering it must fail, on every platform: Windows refuses to delete the
+/// registration's files, but not to retarget an ancestor.
+pub(super) fn linked_coord() -> (crate::TempDir, PathBuf, impl FnOnce()) {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink as symlink_dir;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_dir;
+
+    let dir = crate::TempDir::new().unwrap();
+    let (real1, real2, link) = (
+        dir.path().join("real1"),
+        dir.path().join("real2"),
+        dir.path().join("link"),
+    );
+    std::fs::create_dir(&real1).unwrap();
+    std::fs::create_dir(&real2).unwrap();
+    symlink_dir(&real1, &link).expect("creating a directory symlink must succeed in this CI environment");
+    let coord = link.join(".skuld");
+    let retarget = move || {
+        // A symlink directory is removed with `remove_dir` on Windows and `remove_file` on Unix;
+        // `symlink_dir` after either makes a fresh one.
+        #[cfg(unix)]
+        std::fs::remove_file(&link).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(&link).unwrap();
+        symlink_dir(&real2, &link).unwrap();
+    };
+    (dir, coord, retarget)
+}
+
 /// One registration attempt: `Some` means the test could start.
 fn attempt(coord: &Path, name: &str, labels: &[Label], filter: &str) -> Option<Registration> {
     try_register(&PROCESS_IDS, coord, name, labels, filter)
@@ -728,31 +760,9 @@ fn unregister_panics_when_the_mutex_has_split() {
 #[test]
 #[should_panic(expected = "moved")]
 fn unregister_panics_when_a_parent_symlink_is_retargeted_mid_run() {
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink as symlink_dir;
-    #[cfg(windows)]
-    use std::os::windows::fs::symlink_dir;
-
-    let dir = crate::TempDir::new().unwrap();
-    let (real1, real2, link) = (
-        dir.path().join("real1"),
-        dir.path().join("real2"),
-        dir.path().join("link"),
-    );
-    std::fs::create_dir(&real1).unwrap();
-    std::fs::create_dir(&real2).unwrap();
-    symlink_dir(&real1, &link).expect("creating a directory symlink must succeed in this CI environment");
-    let coord = link.join(".skuld");
-
+    let (_dir, coord, retarget) = linked_coord();
     let mut a = running(&coord, "a", &[], SERIAL_ALL);
-
-    // Retarget. A symlink directory is removed with `remove_dir` on Windows and `remove_file` on
-    // Unix; `symlink_dir` after either makes a fresh one.
-    #[cfg(unix)]
-    std::fs::remove_file(&link).unwrap();
-    #[cfg(windows)]
-    std::fs::remove_dir(&link).unwrap();
-    symlink_dir(&real2, &link).unwrap();
+    retarget();
 
     // `b` registers through the retargeted link, in a coordination directory `a` knows nothing
     // of, so it must not wait on `a`'s global-serial entry.
