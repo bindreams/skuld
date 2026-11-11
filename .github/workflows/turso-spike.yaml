@@ -1,0 +1,80 @@
+# Spike for #121; not merged. Runs spikes/turso on every platform skuld's CI
+# covers, plus musl (no musl C compiler) and 32-bit Linux.
+name: Turso spike
+
+on:
+  push:
+    branches: [azhukova/121]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  MANIFEST: spikes/turso/Cargo.toml
+
+jobs:
+  native:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/setup-rust
+        with:
+          pin-file: .github/release-toolchain
+      - run: cargo build --release --features interop --manifest-path "$MANIFEST"
+      - name: All scenarios
+        run: spikes/turso/target/release/turso-spike all
+      - name: Cold start, fresh file, 100 rounds
+        if: ${{ !cancelled() }}
+        run: spikes/turso/target/release/turso-spike cold fresh 100
+      - name: Cold start, init under an OS lock, 100 rounds
+        if: ${{ !cancelled() }}
+        run: spikes/turso/target/release/turso-spike cold init-locked 100
+      - name: Per-test open/close churn, 8 x 300
+        if: ${{ !cancelled() }}
+        run: spikes/turso/target/release/turso-spike churn 8 300
+
+  cross:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            apt: ""
+          - target: i686-unknown-linux-gnu
+            # Linker support only; the spike builds no C.
+            apt: gcc-multilib
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/setup-rust
+        with:
+          pin-file: .github/release-toolchain
+          targets: ${{ matrix.target }}
+      - if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+      - name: No musl C compiler is installed
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          if command -v x86_64-linux-musl-gcc musl-gcc; then
+            echo "a musl C compiler is present; this job would prove nothing" >&2
+            exit 1
+          fi
+      - run: cargo build --release --target ${{ matrix.target }} --manifest-path "$MANIFEST"
+      - name: All scenarios
+        run: spikes/turso/target/${{ matrix.target }}/release/turso-spike all
+      - name: Cold start, init under an OS lock, 100 rounds
+        if: ${{ !cancelled() }}
+        run: spikes/turso/target/${{ matrix.target }}/release/turso-spike cold init-locked 100
+      - name: Per-test open/close churn, 8 x 300
+        if: ${{ !cancelled() }}
+        run: spikes/turso/target/${{ matrix.target }}/release/turso-spike churn 8 300
