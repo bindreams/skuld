@@ -13,6 +13,7 @@
 //! step is where it is.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -229,6 +230,8 @@ fn scan(running: &Path) -> Vec<Entry> {
         // Not ours if not UTF-8.
         .filter_map(|n| n.into_string().ok())
         .collect();
+    // The ids that have a `.json`, built once so each `.lock` is checked in constant time.
+    let entry_ids: HashSet<&str> = names.iter().filter_map(|n| n.strip_suffix(".json")).collect();
     let mut live = Vec::new();
     for name in &names {
         let path = running.join(name);
@@ -246,7 +249,7 @@ fn scan(running: &Path) -> Vec<Entry> {
                 live.push(entry);
             }
         } else if let Some(id) = name.strip_suffix(".lock") {
-            if !names.contains(&format!("{id}.json")) && owner_gone(&path) {
+            if !entry_ids.contains(id) && owner_gone(&path) {
                 remove_if_exists(&path);
             }
         }
