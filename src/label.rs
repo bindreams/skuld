@@ -33,7 +33,7 @@ impl Label {
         validate_label_name(name);
         // Canonical-lowercase invariant is a hard contract, not a sanity
         // check: the `#[skuld::label]` macro lowercases at expansion time,
-        // and label matching everywhere else (SQL, hash buckets, filter
+        // and label matching everywhere else (hash buckets, filter
         // parsing) assumes stored names are already lowercase. A stray
         // uppercase name silently matches nothing — fail loud in release
         // builds too.
@@ -322,8 +322,8 @@ pub(crate) fn matches_expr(expr: &LabelExpr, labels: &[Label]) -> bool {
     expr.evaluate_with(|t: &String| labels.iter().any(|l| l.name() == t))
 }
 
-/// Compile `expr` to a SQL WHERE fragment for correlated subqueries on the
-/// `running` table (alias `r`) and `labels` table.
+/// Compile `expr` to a SQL boolean expression over a table `running` (alias `r`) and a table
+/// `labels` (`running_id`, `label`).
 pub(crate) fn to_sql_expr(expr: &LabelExpr) -> String {
     match expr {
         Expr::Terminal(name) => {
@@ -583,14 +583,11 @@ impl LabelFilter {
         self.expr.evaluate_with(|t: &String| names.contains(&t.as_str()))
     }
 
-    /// Compile the filter to a SQL WHERE fragment for correlated subqueries.
-    ///
-    /// The result is a SQL expression suitable for:
+    /// Compile the filter to a SQL boolean expression over a table `running` (alias `r`) and a
+    /// table `labels` (`running_id`, `label`), shaped to drop into:
     /// ```sql
     /// SELECT EXISTS (SELECT 1 FROM running r WHERE <result>)
     /// ```
-    ///
-    /// Skuld's own coordination no longer uses SQL; this is for external tooling.
     pub fn to_sql(&self) -> String {
         to_sql_expr(&self.expr)
     }

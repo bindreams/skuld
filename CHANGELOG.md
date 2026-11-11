@@ -11,11 +11,6 @@ All notable changes to this project are documented in this file.
   the same time do not exclude each other. Coordination now lives in `.skuld/`
   next to where `.skuld.db` was (`SKULD_DB_DIR` still names that directory).
   Leftover `.skuld.db*` files are unused and can be deleted.
-- **Deleting or replacing `.skuld/` mid-run is detected, not prevented.** On
-  Unix, each test registered in the old copy panics when it finishes, which
-  fails the run; tests that start in the new copy meanwhile may run alongside
-  the old ones. On Windows, deleting the directory fails while tests run. A
-  deliberate swap that is restored before a test next checks is not detected.
 
 ### Fixed
 
@@ -26,9 +21,15 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
-- **No C compiler is needed to build or cross-compile skuld.** The bundled
-  SQLite (`rusqlite`) is gone, so musl and other targets without a C toolchain
-  build.
+- **Deleting or replacing `.skuld/` mid-run is prevented on Windows and only
+  detected on Unix.** On Windows, deleting the directory fails while tests run.
+  On Unix, each test registered in the old copy panics when it finishes, which
+  fails the run; tests that start in the new copy meanwhile may run alongside
+  the old ones. A deliberate swap that is restored before a test next checks is
+  not detected.
+- **The `skuld` crate needs no C compiler to build or cross-compile.** The
+  bundled SQLite (`rusqlite`) is gone, so musl and other targets without a C
+  toolchain build it.
 - **On Unix, `.skuld/` and `running/` are mode 0777 and the files in them 0644**,
   whatever the umask, so runs under several uids can share one directory.
 
