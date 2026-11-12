@@ -128,18 +128,18 @@ fn moved_message(coord_dir: &Path, entry: Option<&Path>, doing: &str, inspect_er
         Some(entry) => format!("the mutex's target or the entry {entry:?}"),
         None => "the mutex's target".to_owned(),
     };
-    let (moved, why) = match inspect_error {
-        Some(e) => (
-            "moved or could not be inspected",
-            format!(" (inspecting the mutex's target failed: {e})"),
+    let consequence = "the mutex or the entries no longer guard what other tests see";
+    match inspect_error {
+        None => format!(
+            "skuld: the coordination directory {coord_dir:?} moved while {doing}: {lost} was deleted, \
+             replaced, or its directory moved, so {consequence} ({DB_DIR_HINT})"
         ),
-        None => ("moved", String::new()),
-    };
-    format!(
-        "skuld: the coordination directory {coord_dir:?} {moved} while {doing}{why}: {lost} was deleted, \
-         replaced, or its directory moved, so the mutex or the entries no longer guard what other tests \
-         see ({DB_DIR_HINT})"
-    )
+        Some(e) => format!(
+            "skuld: the coordination directory {coord_dir:?} could not be checked while {doing}: \
+             inspecting the mutex's target failed: {e}. If {lost} was deleted, replaced, or its directory \
+             moved, {consequence} ({DB_DIR_HINT})"
+        ),
+    }
 }
 
 /// Panic with [`moved_message`] if the mutex has split, or its target cannot be inspected.
@@ -262,15 +262,15 @@ fn entry_identity(held: &GlobalLockHeld<'_>, name: &str) -> io::Result<FileIdent
 /// `running/<name>` is no longer the file `identity` was taken of. An entry that cannot be
 /// inspected for any other reason panics with that error.
 fn assert_unmoved(held: &GlobalLockHeld<'_>, name: &str, identity: FileIdentity, doing: &str) {
-    let path = || entry_file(held, name);
-    assert_not_split(held, Some(&path()), doing);
+    let path = entry_file(held, name);
+    assert_not_split(held, Some(&path), doing);
     let moved = match entry_identity(held, name) {
         Ok(now) => now != identity,
         Err(e) if e.kind() == io::ErrorKind::NotFound => true,
-        Err(e) => or_panic("inspect", path, Err::<bool, _>(e)),
+        Err(e) => or_panic("inspect", || &path, Err::<bool, _>(e)),
     };
     if moved {
-        panic!("{}", moved_message(held.coord_dir(), Some(&path()), doing, None));
+        panic!("{}", moved_message(held.coord_dir(), Some(&path), doing, None));
     }
 }
 

@@ -21,9 +21,9 @@
 //! missing), and panics there. Windows uses `File::lock`/`try_lock` (`LockFileEx`).
 //!
 //! A failure to open the target (a missing directory, `EMFILE`, permissions) panics at once,
-//! naming the path. So does a filesystem whose `flock`
-//! refuses a directory (some network filesystems): there is no fallback mechanism. A failed unlock
-//! panics too (see [`report_unlock_failure`]).
+//! naming the path. So does a filesystem whose `flock` refuses a directory (some network
+//! filesystems): there is no fallback mechanism. A failed unlock panics too (see
+//! [`report_unlock_failure`]).
 
 use super::file_identity::FileIdentity;
 use std::fs::{File, OpenOptions};

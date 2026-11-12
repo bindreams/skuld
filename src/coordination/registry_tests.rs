@@ -1047,6 +1047,34 @@ fn a_directory_replaced_before_the_lock_is_taken_panics_naming_the_move() {
     assert!(msg.contains("deleted, replaced, or its directory moved"), "{msg}");
 }
 
+/// A mutex target that cannot be inspected fails the check naming the error, without claiming
+/// the directory moved.
+#[cfg(unix)]
+#[test]
+fn an_uninspectable_mutex_target_fails_unregistration_naming_the_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert_ne!(
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() },
+        0,
+        "root ignores the permission this test removes"
+    );
+    let (dir, coord) = temp_coord();
+    let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    let parent = coord.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reg.unregister())).err();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    drop((reg, dir));
+    let payload = payload.expect("an uninspectable mutex target must panic");
+    let msg = crate::coordination::panic_payload_message(payload.as_ref());
+    assert!(
+        msg.contains("could not be checked") && msg.contains("Permission denied") && msg.contains("SKULD_DB_DIR"),
+        "{msg}"
+    );
+}
+
 /// A `running/` that cannot be listed (here a dangling symlink, which directory creation accepts
 /// as present) fails with the error.
 #[cfg(unix)]

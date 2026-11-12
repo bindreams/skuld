@@ -67,6 +67,7 @@ Deleting or replacing `.skuld/` while tests run is prevented on Windows and only
 
 - **Windows:** a running test's entry cannot be deleted, so deleting the directory (for example `cargo clean`) fails while tests run.
 - **Unix:** if `.skuld/` or `running/` is deleted or replaced mid-run, each test registered in the old copy panics when it finishes, which fails the run. Until then, tests that start in the new copy do not see the old ones and may run alongside them.
+- **Both:** a test that is registering at the moment `.skuld/` or `running/` is deleted or replaced panics, naming the directory.
 - **Not detected:** a deliberate swap that is restored before a test next checks.
 
 ## Serial fixtures
