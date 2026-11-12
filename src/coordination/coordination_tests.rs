@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use super::registry::running_dir;
-use super::registry_tests::{linked_coord, temp_coord};
+use super::registry_tests::temp_coord;
 use super::{coordinate, SERIAL_ALL, SERIAL_NONE};
 
 /// The `.json` entries in `running/`, parsed.
@@ -15,6 +15,17 @@ fn entries(coord: &Path) -> Vec<serde_json::Value> {
         .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
         .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
         .collect()
+}
+
+/// Delete every entry in `running/`, so the registration made there no longer matches what its
+/// owner recorded.
+fn delete_entries(coord: &Path) {
+    for entry in std::fs::read_dir(running_dir(coord)).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 }
 
 // TestRegistration guard =====
@@ -168,9 +179,9 @@ fn downgraded_warning_message_carries_the_real_panic_message_through_the_box() {
 /// downgrading unconditionally would silently swallow every such failure.
 #[test]
 fn drop_panics_loudly_when_nothing_else_is_unwinding() {
-    let (_dir, coord, retarget) = linked_coord();
+    let (_dir, coord) = temp_coord();
     let reg = coordinate(&coord, "normal_drop_broken_entry", &[], SERIAL_NONE);
-    retarget();
+    delete_entries(&coord);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(reg)));
     assert!(
@@ -185,9 +196,9 @@ fn drop_panics_loudly_when_nothing_else_is_unwinding() {
 /// unregister a broken registration is recorded process-wide for the runner to fail the run with.
 #[test]
 fn drop_during_an_unwind_records_the_downgraded_failure() {
-    let (_dir, coord, retarget) = linked_coord();
+    let (_dir, coord) = temp_coord();
     let a = coordinate(&coord, "a", &[], SERIAL_NONE);
-    retarget();
+    delete_entries(&coord);
 
     let result = std::thread::spawn(move || {
         let _held = a;

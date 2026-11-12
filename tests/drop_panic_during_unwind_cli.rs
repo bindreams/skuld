@@ -1,7 +1,7 @@
 //! End-to-end subprocess test for the panic-during-unwind hazard in
 //! `TestRegistration::drop`, via the `drop_panic_during_unwind_probe`
 //! binary. `Drop::drop`'s own cleanup panics loudly when the coordination directory no longer
-//! matches what the registration made (its directory was retargeted) — so a test that panics for an
+//! matches what the registration made (its `<id>.json` is gone) — so a test that panics for an
 //! unrelated reason, while its registration has independently been broken, causes a *second*
 //! panic during the first one's unwind. An uncaught panic during an active unwind is Rust's
 //! "double panic": `std::process::abort()` (`SIGABRT` on Unix), killing the
@@ -11,10 +11,8 @@
 //!
 //! Runs on every platform: the `Drop::drop` fix it exercises is not
 //! platform-gated, and Skuld's CI has a Windows lane. The probe's sabotage
-//! (retargeting the directory symlink above the coordination directory, which
-//! Windows allows although it refuses to delete the registration's files) fails
-//! its cleanup on both platforms (see `probe_drop_panic_during_unwind` in
-//! `src/lib.rs`). The test
+//! (deleting the registration's own `<id>.json`) fails its cleanup on both
+//! platforms (see `probe_drop_panic_during_unwind` in `src/lib.rs`). The test
 //! asserts that the process exits via a single ordinary panic (not an abort),
 //! and that the downgraded warning names the coordination directory and the
 //! cause rather than the `panic_payload_message` fallback placeholder: during
@@ -24,18 +22,8 @@ use std::process::Command;
 
 #[test]
 fn a_second_panic_during_drop_does_not_abort_the_process() {
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink as symlink_dir;
-    #[cfg(windows)]
-    use std::os::windows::fs::symlink_dir;
-
     let dir = skuld::TempDir::new().unwrap();
-    // Mirrors `linked_coord` in `src/coordination/registry_tests.rs`, which a test of the library
-    // cannot share with this one.
-    let (real, link) = (dir.path().join("real"), dir.path().join("link"));
-    std::fs::create_dir(&real).unwrap();
-    symlink_dir(&real, &link).expect("creating a directory symlink must succeed in this CI environment");
-    let coord_dir = link.join(".skuld");
+    let coord_dir = dir.path().join(".skuld");
 
     let out = Command::new(env!("CARGO_BIN_EXE_drop_panic_during_unwind_probe"))
         .env("SKULD_DROP_PANIC_PROBE_COORD_DIR", &coord_dir)
