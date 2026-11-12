@@ -1,6 +1,8 @@
 //! Tests for the file-lock registry.
 
 use std::fs::File;
+#[cfg(windows)]
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 
@@ -20,16 +22,19 @@ pub(super) fn temp_coord() -> (crate::TempDir, PathBuf) {
     (dir, coord)
 }
 
-/// A coordination directory `<temp>/link/.skuld` behind a directory symlink, and a function that
-/// retargets the link at another directory. A registration made before the retarget is then behind
+/// A coordination directory `<temp>/link/.skuld` behind a directory link (a symlink on Unix, a
+/// junction on Windows, which needs no privilege), and a function that retargets the link at
+/// another directory. A registration made before the retarget is then behind
 /// the old target, so unregistering it must fail. This is the one way to break a registration on
 /// every platform: Windows refuses to delete a running test's entry, but not to retarget an
 /// ancestor.
 pub(super) fn linked_coord() -> (crate::TempDir, PathBuf, impl FnOnce()) {
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink as symlink_dir;
-    #[cfg(windows)]
-    use std::os::windows::fs::symlink_dir;
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        junction::create(target, link).unwrap();
+    }
 
     let dir = crate::TempDir::new().unwrap();
     let (real1, real2, link) = (
@@ -39,16 +44,16 @@ pub(super) fn linked_coord() -> (crate::TempDir, PathBuf, impl FnOnce()) {
     );
     std::fs::create_dir(&real1).unwrap();
     std::fs::create_dir(&real2).unwrap();
-    symlink_dir(&real1, &link).expect("creating a directory symlink must succeed in this CI environment");
+    link_dir(&real1, &link);
     let coord = link.join(".skuld");
     let retarget = move || {
-        // A symlink directory is removed with `remove_dir` on Windows and `remove_file` on Unix;
-        // `symlink_dir` after either makes a fresh one.
+        // A symlink is removed with `remove_file` on Unix, a junction with `remove_dir` on Windows;
+        // `link_dir` after either makes a fresh one.
         #[cfg(unix)]
         std::fs::remove_file(&link).unwrap();
         #[cfg(windows)]
         std::fs::remove_dir(&link).unwrap();
-        symlink_dir(&real2, &link).unwrap();
+        link_dir(&real2, &link);
     };
     (dir, coord, retarget)
 }
@@ -337,6 +342,76 @@ fn register_with_uses_ids_from_its_generator() {
     let mut reg = register_with(&ids, &coord, "t", &[], SERIAL_NONE);
     assert_eq!(reg.id(), ids.id_at(0));
     reg.unregister();
+}
+
+/// What the Windows scan makes of a delete attempt on an entry and, when that was denied, of the
+/// delete-pending check.
+#[cfg(windows)]
+#[test]
+fn delete_attempts_are_classified() {
+    use super::registry::{classify_delete, Verdict};
+
+    let os = |code| io::Error::from_raw_os_error(code);
+    let (denied, sharing) = (os(5), os(32));
+    let not_found = || io::Error::from(io::ErrorKind::NotFound);
+    let unreached = || -> io::Result<bool> { panic!("the delete-pending check is only for a denied delete") };
+
+    assert!(matches!(classify_delete(Ok(()), unreached), Verdict::Gone));
+    assert!(matches!(classify_delete(Err(not_found()), unreached), Verdict::Gone));
+    assert!(matches!(classify_delete(Err(sharing), unreached), Verdict::Live));
+    assert!(matches!(classify_delete(Err(os(5)), || Ok(true)), Verdict::Gone));
+    // Denied and not delete-pending: the scanner may not delete it, which says nothing of its owner.
+    assert!(matches!(classify_delete(Err(os(5)), || Ok(false)), Verdict::Live));
+    // The last handle closed between the delete and the check.
+    assert!(matches!(
+        classify_delete(Err(os(5)), || Err(not_found())),
+        Verdict::Gone
+    ));
+    let Verdict::Fail(e) = classify_delete(Err(denied), || Err(os(1117))) else {
+        panic!("a failed check must fail the scan");
+    };
+    let msg = e.to_string();
+    assert!(
+        msg.contains("os error 5") && msg.contains("os error 1117"),
+        "both errors must be named: {msg}"
+    );
+    let Verdict::Fail(e) = classify_delete(Err(os(123)), unreached) else {
+        panic!("any other delete error fails the scan");
+    };
+    assert!(e.to_string().contains("os error 123"), "{e}");
+}
+
+/// A forked child shares its parent's open file description, so closing the parent's descriptor
+/// alone would leave the entry locked: dropping a registration unlocks explicitly.
+#[cfg(unix)]
+#[test]
+fn dropping_a_registration_unlocks_its_entry_though_the_description_is_shared() {
+    use std::os::unix::io::FromRawFd;
+
+    use super::file_identity::FileIdentity;
+
+    let (_dir, coord) = temp_coord();
+    let reg = running(&coord, "t", &[], SERIAL_NONE);
+    let entry = running_dir(&coord).join(format!("{}.json", reg.id()));
+    let identity = FileIdentity::of(&entry).unwrap();
+    let hold_fd = (0..4096)
+        .find(|&fd| FileIdentity::of_fd(fd).ok() == Some(identity))
+        .expect("the registration holds its entry open");
+    // Safety: `dup` of a descriptor this process holds; the result is owned by the `File`.
+    let shared = unsafe {
+        let fd = libc::dup(hold_fd);
+        assert!(fd >= 0, "dup: {}", std::io::Error::last_os_error());
+        File::from_raw_fd(fd)
+    };
+
+    drop(reg);
+
+    let probe = File::open(&entry).unwrap();
+    assert!(
+        try_lock_exclusive(&probe).is_ok(),
+        "the entry must be unlocked once its registration is dropped"
+    );
+    drop(shared);
 }
 
 // Mutex =====

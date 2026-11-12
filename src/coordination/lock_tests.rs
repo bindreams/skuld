@@ -318,7 +318,7 @@ fn target_has_split_detects_a_wholesale_directory_replacement() {
     );
 }
 
-/// A symlink ancestor retargeted underneath the held lock target splits the lock on every
+/// A symlink or junction ancestor retargeted underneath the held lock target splits the lock on every
 /// platform. On Windows it is the only way: the lock file itself cannot be deleted while held.
 #[test]
 fn target_has_split_detects_a_retargeted_symlink_ancestor() {

@@ -80,6 +80,10 @@ windows = { version = "0.62", features = [
     "Win32_System_IO",
 ] }
 
+# Tests retarget a directory ancestor with a junction, which needs no privilege on Windows.
+[target.'cfg(windows)'.dev-dependencies]
+junction = "2.1.0"
+
 [dev-dependencies]
 skuld = { path = ".", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "time", "net", "io-util", "test-util"] }

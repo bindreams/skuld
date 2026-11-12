@@ -10,37 +10,79 @@
 //! test binary down with it.
 //!
 //! Runs on every platform: the `Drop::drop` fix it exercises is not
-//! platform-gated, and Skuld's CI has a Windows lane. The probe's sabotage
-//! (retargeting the directory symlink above the coordination directory, which
-//! Windows allows although it refuses to delete the registration's files) fails
-//! its cleanup on both platforms (see `probe_drop_panic_during_unwind` in
-//! `src/lib.rs`). The test
+//! platform-gated, and Skuld's CI has a Windows lane. The driver sabotages the probe's
+//! registration while the probe waits for it: it retargets the directory link above the
+//! coordination directory (a symlink on Unix, a junction on Windows, which needs no privilege),
+//! which Windows allows although it refuses to delete a running test's entry. That fails the
+//! cleanup on both platforms. The test
 //! asserts that the process exits via a single ordinary panic (not an abort),
 //! and that the downgraded warning names the coordination directory and the
 //! cause rather than the `panic_payload_message` fallback placeholder: during
 //! an unwind the warning is the only signal left of the failure.
 
-use std::process::Command;
+use std::io::{Read, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+/// Make `link` a directory link to `target`: a symlink on Unix, a junction on Windows.
+fn link_dir(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    junction::create(target, link).unwrap();
+}
 
 #[test]
 fn a_second_panic_during_drop_does_not_abort_the_process() {
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink as symlink_dir;
-    #[cfg(windows)]
-    use std::os::windows::fs::symlink_dir;
-
     let dir = skuld::TempDir::new().unwrap();
     // Mirrors `linked_coord` in `src/coordination/registry_tests.rs`, which a test of the library
     // cannot share with this one.
-    let (real, link) = (dir.path().join("real"), dir.path().join("link"));
-    std::fs::create_dir(&real).unwrap();
-    symlink_dir(&real, &link).expect("creating a directory symlink must succeed in this CI environment");
+    let (real1, real2, link) = (
+        dir.path().join("real1"),
+        dir.path().join("real2"),
+        dir.path().join("link"),
+    );
+    std::fs::create_dir(&real1).unwrap();
+    std::fs::create_dir(&real2).unwrap();
+    link_dir(&real1, &link);
     let coord_dir = link.join(".skuld");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_drop_panic_during_unwind_probe"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_drop_panic_during_unwind_probe"))
         .env("SKULD_DROP_PANIC_PROBE_COORD_DIR", &coord_dir)
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("spawn drop_panic_during_unwind_probe");
+
+    // The probe signals once registered and then waits to be released: a blocking-I/O handshake.
+    let mut signal = [0u8; 1];
+    let ready = child.stdout.as_mut().expect("stdout was piped").read_exact(&mut signal);
+    if ready.is_err() || signal[0] != b'R' {
+        drop(child.stdin.take());
+        let out = child.wait_with_output().expect("wait the probe");
+        panic!(
+            "the probe must signal registered with 'R', got {ready:?} {signal:?} (exit: {})
+stderr:
+{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // Retarget the link: the probe's registration is now behind the old target.
+    #[cfg(unix)]
+    std::fs::remove_file(&link).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_dir(&link).unwrap();
+    link_dir(&real2, &link);
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin was piped")
+        .write_all(b"G")
+        .expect("release the probe");
+
+    let out = child.wait_with_output().expect("wait the probe");
 
     let stderr = String::from_utf8_lossy(&out.stderr);
 
