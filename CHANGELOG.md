@@ -27,6 +27,10 @@ All notable changes to this project are documented in this file.
   test registered in the old copy panics when it finishes, which fails the run;
   tests that start in the new copy meanwhile may run alongside the old ones. A
   deliberate swap that is restored before a test next checks is not detected.
+- **A running test is one file, `.skuld/running/<id>.json`.** On Unix a test is
+  alive while it holds a lock on its entry; on Windows, while it holds the entry
+  open, which refuses deletion. On Windows, another program that keeps a dead
+  test's entry open delays other tests until it closes it.
 - **The `skuld` crate needs no C compiler to build or cross-compile.** The
   bundled SQLite (`rusqlite`) is gone, so musl and other targets without a C
   toolchain build it.
