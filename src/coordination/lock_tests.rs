@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicI64, Ordering::SeqCst};
 #[cfg(unix)]
 use super::lock::{lock_exclusive, EINTR_RETRIES};
 use super::lock::{lock_path, open_lock_target, try_lock_exclusive, with_global_lock};
+use super::registry_tests::linked_coord;
 use super::rendezvous::rendezvous;
 
 /// The path the mutex locks, which every message about it names.
@@ -319,24 +320,14 @@ fn target_has_split_detects_a_wholesale_directory_replacement() {
 
 /// Windows refuses to delete the lock file while held, but a symlink ancestor can still be
 /// retargeted underneath it.
-#[cfg(windows)]
 #[test]
 fn target_has_split_detects_a_retargeted_symlink_ancestor() {
-    let dir = crate::TempDir::new().unwrap();
-    let (real1, real2, link) = (
-        dir.path().join("real1"),
-        dir.path().join("real2"),
-        dir.path().join("link"),
-    );
-    std::fs::create_dir(&real1).unwrap();
-    std::fs::create_dir(&real2).unwrap();
-    std::os::windows::fs::symlink_dir(&real1, &link)
-        .expect("creating a directory symlink must succeed in this CI environment");
+    let (_dir, coord, retarget) = linked_coord();
+    std::fs::create_dir(&coord).unwrap();
 
     let mut split_detected = false;
-    with_global_lock(&link, |held| {
-        std::fs::remove_dir(&link).unwrap();
-        std::os::windows::fs::symlink_dir(&real2, &link).unwrap();
+    with_global_lock(&coord, |held| {
+        retarget();
         split_detected = held.target_has_split();
     });
     assert!(
