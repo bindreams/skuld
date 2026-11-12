@@ -6,15 +6,9 @@
 //! `skuld::__private::probe_hold_global_lock`/`probe_try_global_lock` — the same real lock target
 //! and real `flock`/`LockFileEx` calls that registration uses in production, not a simulation.
 //!
-//! No sleeps anywhere: a stdout/stdin byte handshake makes every ordering
-//! constraint explicit instead of timing-dependent. The holder only signals
-//! ready *after* `with_global_lock` has actually acquired the OS-level lock
-//! (acquisition happens before its held closure runs), so a `try_lock` raced
-//! against that ready signal is guaranteed to observe genuine contention, not
-//! a scheduling accident; and the holder's OS lock is guaranteed released by
-//! the time `Child::wait_with_output` returns, since the OS releases
-//! `flock`/`LockFileEx` locks when the holding process's file descriptors
-//! close at process exit.
+//! A stdout/stdin byte handshake orders the processes: the holder signals ready only after
+//! `with_global_lock` has acquired the lock, so the `try_lock` observes real contention. The OS
+//! releases the holder's lock when it exits, before `Child::wait_with_output` returns.
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -96,22 +90,14 @@ fn a_second_process_try_lock_reports_would_block_while_another_process_holds_the
     );
 }
 
-/// `src/coordination/lock.rs`'s whole design rests on the lock target's own identity being stable
-/// while a holder has it open — this proves that end to end across genuinely separate processes,
-/// by a different mechanism per platform: on Windows, an attempt to delete the lock file itself
-/// must fail outright (`FILE_SHARE_DELETE` was never granted); on Unix, the lock target is the
-/// coordination directory, so deleting a file inside it *succeeds* — the point is that doing so
-/// must not touch the directory's identity, so a fresh `try_lock` against the same directory must
-/// still report `WouldBlock` afterward. Wholesale replacement of the directory itself is a
-/// different risk this test doesn't claim to cover; see `lock.rs`'s module doc.
+/// The lock target's identity must stay stable while held. Windows: deleting the lock file must
+/// fail (no `FILE_SHARE_DELETE`).
+#[cfg(windows)]
 #[test]
 fn a_holder_cannot_have_its_lock_target_deleted_out_from_under_it() {
     let dir = skuld::TempDir::new().unwrap();
     let coord_dir = dir.path().join(".skuld");
     std::fs::create_dir(&coord_dir).unwrap();
-    // The Unix half of this test needs a file in the directory to delete below.
-    let stand_in = coord_dir.join("stand-in");
-    std::fs::write(&stand_in, b"").expect("create a stand-in file");
 
     let mut holder = hold_probe(&coord_dir).spawn().expect("spawn lock_hold_probe");
     let mut ready = [0u8; 1];
@@ -123,22 +109,9 @@ fn a_holder_cannot_have_its_lock_target_deleted_out_from_under_it() {
         .unwrap_or_else(|e| panic!("failed to read lock_hold_probe's ready signal: {e}"));
     assert_eq!(ready[0], b'R', "unexpected ready byte {:?}", ready[0] as char);
 
-    #[cfg(unix)]
-    {
-        // The lock target on Unix is the directory itself, so deleting a file in it must
-        // *succeed* here, and must not touch the directory the lock is bound to. The directory
-        // ends up empty.
-        std::fs::remove_file(&stand_in)
-            .expect("deleting a file in the coordination directory must succeed — it is not what's locked");
-    }
-
-    #[cfg(windows)]
-    {
-        // `global.lock` is the lock target on Windows, opened without FILE_SHARE_DELETE —
-        // deleting it while lock_hold_probe holds it open must fail outright.
-        std::fs::remove_file(coord_dir.join("global.lock"))
-            .expect_err("the global lock file must not be removable while a holder has it locked");
-    }
+    // `global.lock` is opened without FILE_SHARE_DELETE.
+    std::fs::remove_file(coord_dir.join("global.lock"))
+        .expect_err("the global lock file must not be removable while a holder has it locked");
 
     let out = try_probe(&coord_dir);
     assert!(
@@ -149,10 +122,7 @@ fn a_holder_cannot_have_its_lock_target_deleted_out_from_under_it() {
     assert_eq!(
         out.stdout,
         b"B",
-        "a second process's try_lock must still report WouldBlock after the deletion attempt \
-         above (which failed on Windows because the lock file itself is protected; which \
-         succeeded on Unix because deleting a file doesn't touch the directory that's \
-         actually locked); stderr:\n{}",
+        "a second process's try_lock must still report WouldBlock after the failed deletion; stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 

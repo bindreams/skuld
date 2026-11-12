@@ -3,14 +3,10 @@
 //! binary. `Drop::drop`'s own cleanup panics loudly when the coordination directory no longer
 //! matches what the registration made (its directory was retargeted) — so a test that panics for an
 //! unrelated reason, while its registration has independently been broken, causes a *second*
-//! panic during the first one's unwind. An uncaught panic during an active unwind is Rust's
-//! "double panic": `std::process::abort()` (`SIGABRT` on Unix), killing the
-//! whole test process rather than just failing the one test. This needs a
-//! genuine subprocess: the abort, if it happens, must not take this driver
-//! test binary down with it.
+//! panic during the first one's unwind. A panic during an unwind aborts the process, so this needs a
+//! subprocess that cannot take the driver down.
 //!
-//! Runs on every platform: the `Drop::drop` fix it exercises is not
-//! platform-gated, and Skuld's CI has a Windows lane. The driver sabotages the probe's
+//! Runs on every platform: the cleanup it exercises is not platform-gated. The driver sabotages the probe's
 //! registration while the probe waits for it: it retargets the directory link above the
 //! coordination directory (a symlink on Unix, a junction on Windows, which needs no privilege),
 //! which Windows allows although it refuses to delete a running test's entry. That fails the

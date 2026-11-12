@@ -16,9 +16,8 @@
 //! path, never the real shared workspace `.skuld/`, whose parent is a directory link). Once
 //! registered it writes one `b"R"` byte to stdout and blocks reading one byte from stdin: the
 //! driver sabotages the registration in between, by retargeting that link. It then panics. Exits via a single
-//! propagated panic (code 101, no signal) once `TestRegistration::drop` is
-//! fixed to never let its own panic escape an active unwind; exits via
-//! `SIGABRT` before that fix.
+//! propagated panic (code 101, no signal); a `Drop` panic escaping the unwind would instead abort
+//! with `SIGABRT`.
 use std::io::{Read, Write};
 
 fn main() {
