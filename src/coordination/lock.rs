@@ -20,9 +20,12 @@
 //! implement `lock` on every Unix target it otherwise treats as `flock`-capable (Android is
 //! missing), and panics there. Windows uses `File::lock`/`try_lock` (`LockFileEx`).
 //!
-//! Any failure to open the target (a missing directory, `EMFILE`, permissions) panics at once,
-//! naming the path: retrying the same open does not change the outcome. So does a filesystem whose
-//! `flock` refuses a directory (some network filesystems): there is no fallback mechanism.
+//! A target that does not exist (its directory is missing) is reported by
+//! [`open_lock_target_if_present`] as `None`, for a caller that creates the directory to do so and
+//! try again. Any other failure to open it (`EMFILE`, permissions) panics at once, naming the
+//! path, as does [`open_lock_target`] for a missing directory. So does a filesystem whose `flock`
+//! refuses a directory (some network filesystems): there is no fallback mechanism. A failed unlock
+//! leaves the mutex held, so it panics too (see [`report_unlock_failure`]).
 
 use super::file_identity::FileIdentity;
 use super::skuld_debug_eprintln;
@@ -88,7 +91,7 @@ impl<'a> GlobalLockHeld<'a> {
 }
 
 /// Run `f` while holding the global mutex of `coord_dir` (see the module doc). Blocks with no
-/// timeout. The lock is released when the handle closes, on `f`'s return and on a panic in it.
+/// timeout. The lock is released on `f`'s return and on a panic in it, and when the handle closes.
 pub(super) fn with_global_lock<T>(coord_dir: &Path, f: impl FnOnce(&GlobalLockHeld<'_>) -> T) -> T {
     with_locked_target(coord_dir, &open_lock_target(coord_dir), f)
 }
@@ -97,7 +100,8 @@ pub(super) fn with_global_lock<T>(coord_dir: &Path, f: impl FnOnce(&GlobalLockHe
 /// keeps: the mutex is released by unlocking `target`, not closing it, when `f` returns or
 /// panics, so the caller can lock it again later without opening anything. A registration holds
 /// its `target` for that, because a test that has used up its file descriptors must still be able
-/// to unregister. `target` must not be locked already.
+/// to unregister. `target` must not be locked already. An unlock that fails panics after `f`
+/// returns, since the mutex stays held; see [`report_unlock_failure`].
 pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnOnce(&GlobalLockHeld<'_>) -> T) -> T {
     lock_exclusive(target).unwrap_or_else(|e| {
         panic!(
@@ -105,28 +109,63 @@ pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnO
             lock_path(coord_dir)
         )
     });
-    /// Unlocks on drop, so a panic in `f` does not leave the mutex held by a handle that outlives it.
-    struct Unlock<'a>(&'a File);
-    impl Drop for Unlock<'_> {
-        fn drop(&mut self) {
-            if let Err(e) = unlock(self.0) {
-                skuld_debug_eprintln!("failed to unlock the global lock: {e}");
+    /// Unlocks on drop, so a panic in `f` does not leave the mutex held by a handle that outlives
+    /// it. [`Self::release`] unlocks on `f`'s return instead.
+    struct Unlock<'a> {
+        target: &'a File,
+        coord_dir: &'a Path,
+        released: bool,
+    }
+    impl Unlock<'_> {
+        fn release(&mut self) {
+            self.released = true;
+            if let Err(e) = unlock(self.target) {
+                report_unlock_failure(self.coord_dir, &e, std::thread::panicking());
             }
         }
     }
-    let _release = Unlock(target);
+    impl Drop for Unlock<'_> {
+        fn drop(&mut self) {
+            if !self.released {
+                self.release();
+            }
+        }
+    }
+    let mut release = Unlock {
+        target,
+        coord_dir,
+        released: false,
+    };
     let target_identity = FileIdentity::of_file(target).unwrap_or_else(|e| {
         panic!(
             "skuld: failed to inspect the global lock {:?}: {e}",
             lock_path(coord_dir)
         )
     });
-    f(&GlobalLockHeld {
+    let result = f(&GlobalLockHeld {
         coord_dir,
         #[cfg(unix)]
         target,
         target_identity,
-    })
+    });
+    release.release();
+    result
+}
+
+/// What a failed unlock of `coord_dir`'s mutex means: it stays held (a registration keeps the
+/// target open), so every other test waits. Panics saying so, unless `unwinding`, when a second
+/// panic would abort the process: then it only warns.
+pub(super) fn report_unlock_failure(coord_dir: &Path, e: &std::io::Error, unwinding: bool) {
+    let message = format!(
+        "failed to unlock the global lock {:?}, so other tests wait until this process exits: {e} ({})",
+        lock_path(coord_dir),
+        super::DB_DIR_HINT
+    );
+    if unwinding {
+        eprintln!("[skuld] warning: {message}");
+    } else {
+        panic!("skuld: {message}");
+    }
 }
 
 /// Open `coord_dir`'s lock target ([`lock_path`]), ready to be locked or try-locked. Panics if it

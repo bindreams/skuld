@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicI64, Ordering::SeqCst};
 
 #[cfg(unix)]
 use super::lock::{lock_exclusive, EINTR_RETRIES};
-use super::lock::{lock_path, open_lock_target, try_lock_exclusive, with_global_lock};
+use super::lock::{lock_path, open_lock_target, report_unlock_failure, try_lock_exclusive, with_global_lock};
 use super::registry_tests::linked_coord;
 use super::rendezvous::rendezvous;
 
@@ -275,6 +275,20 @@ fn open_lock_target_failure_names_the_real_path_and_the_override() {
     });
     assert!(msg.contains(&format!("{:?}", lock_path(&missing))), "{msg}");
     assert!(msg.contains("SKULD_DB_DIR"), "{msg}");
+}
+
+/// A failed unlock leaves the mutex held, so it panics, naming the lock and the override; while
+/// already unwinding it only warns, as a second panic would abort.
+#[test]
+fn an_unlock_failure_panics_unless_already_unwinding() {
+    let dir = std::path::Path::new("coord");
+    let err = std::io::Error::other("boom");
+    let msg = panic_message(std::panic::AssertUnwindSafe(|| report_unlock_failure(dir, &err, false)));
+    assert!(
+        msg.contains(&format!("{:?}", lock_path(dir))) && msg.contains("boom") && msg.contains("SKULD_DB_DIR"),
+        "{msg}"
+    );
+    report_unlock_failure(dir, &err, true);
 }
 
 #[cfg(all(unix, debug_assertions))]
