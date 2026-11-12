@@ -627,8 +627,9 @@ impl Interrupted {
 /// must wait.
 ///
 /// A directory deleted or replaced after this call made it, before anything is written, is made
-/// again and the attempt repeated. A repeat that created nothing and opened the same directory
-/// as the pass before it cannot do better, so it fails with the cause instead.
+/// again and the attempt repeated, without a cap. It fails with the cause instead when a retry
+/// cannot do better: `running/` names something that is not a directory and cannot become one
+/// (a dangling symlink), or the same mutex target split on two passes in a row.
 pub(super) fn try_register(
     ids: &IdGenerator,
     coord_dir: &Path,
@@ -637,27 +638,38 @@ pub(super) fn try_register(
     storage_filter: &str,
 ) -> Option<Registration> {
     let running = running_dir(coord_dir);
-    let mut previous: Option<Option<FileIdentity>> = None;
+    let mut previous_split: Option<FileIdentity> = None;
     loop {
-        let existed = running.symlink_metadata().is_ok();
         or_panic(
             "create the coordination directory",
             || &running,
             super::db_dir::create_dir_all_open(&running),
         );
-        let created = !existed && running.is_dir();
         #[cfg(test)]
         test_hooks::run_seam(Seam::RunningCreated);
         match register_pass(ids, coord_dir, &running, name, labels, storage_filter) {
             Ok(registered) => return registered,
             Err(interrupted) => {
-                if !created && previous == Some(interrupted.seen) {
+                let permanent = match interrupted.cause {
+                    Cause::NoRunning(_) => is_dangling(&running),
+                    Cause::Split => interrupted.seen.is_some() && interrupted.seen == previous_split,
+                };
+                if permanent {
                     interrupted.give_up(coord_dir, &running);
                 }
-                previous = Some(interrupted.seen);
+                previous_split = match interrupted.cause {
+                    Cause::Split => interrupted.seen,
+                    Cause::NoRunning(_) => None,
+                };
             }
         }
     }
+}
+
+/// `path` names something (a symlink, say) that does not resolve to a directory, so creating the
+/// directory there cannot succeed. Nothing at `path` is not dangling: it can be made.
+fn is_dangling(path: &Path) -> bool {
+    path.symlink_metadata().is_ok() && !path.is_dir()
 }
 
 /// [`try_register`]'s attempt on directories that were in place a moment ago.

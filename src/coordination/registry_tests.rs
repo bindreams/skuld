@@ -11,7 +11,7 @@ use super::lock::lock_exclusive;
 use super::lock::{open_lock_target, try_lock_exclusive};
 use super::registry::{register, register_with, running_dir, try_register, IdGenerator, Registration, PROCESS_IDS};
 use super::rendezvous::rendezvous;
-use super::test_hooks::{retry_rendezvous, set_test_retry_hook, set_test_seam_hook, Seam};
+use super::test_hooks::{retry_rendezvous, set_test_retry_hook, set_test_seam_hook, Seam, SeamHookGuard};
 use super::{SERIAL_ALL, SERIAL_NONE};
 use crate::label::Label;
 
@@ -1022,6 +1022,34 @@ fn a_running_dir_deleted_before_the_lock_is_recreated() {
         move || std::fs::remove_dir(running_dir(&coord)).unwrap()
     });
     let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
+    reg.unregister();
+}
+
+/// A `running/` that existed and is deleted on several passes in a row is made again each time,
+/// with no cap, and the test registers once the deletions stop.
+#[test]
+fn a_running_dir_deleted_on_consecutive_passes_is_recreated_each_time() {
+    use std::{cell::Cell, rc::Rc};
+
+    /// Delete `running/` at the next `RunningCreated`, re-arming until `left` deletions are done.
+    /// A re-armed hook's guard is forgotten; the test's guard clears the slot at its end.
+    fn delete_running(coord: PathBuf, left: usize, done: Rc<Cell<usize>>) -> SeamHookGuard {
+        set_test_seam_hook(Seam::RunningCreated, move || {
+            std::fs::remove_dir(running_dir(&coord)).unwrap();
+            done.set(done.get() + 1);
+            if left > 1 {
+                std::mem::forget(delete_running(coord, left - 1, done));
+            }
+        })
+    }
+
+    let (_dir, coord) = temp_coord();
+    std::fs::create_dir_all(running_dir(&coord)).unwrap();
+    let done = Rc::new(Cell::new(0));
+    let _hook = delete_running(coord.clone(), 3, done.clone());
+    let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    assert_eq!(done.get(), 3);
     assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
     reg.unregister();
 }
