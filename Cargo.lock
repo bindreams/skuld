@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-skuld"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1897,7 +1897,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "skuld"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "boolean_expression",
  "clap",
@@ -1930,7 +1930,7 @@ dependencies = [
 
 [[package]]
 name = "skuld-macros"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proc-macro2",
  "quote",
