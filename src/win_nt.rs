@@ -55,6 +55,26 @@ pub(crate) fn open_dir(dir: &Path) -> io::Result<File> {
     Ok(handle)
 }
 
+/// Whether the file `path` names is delete-pending: deleted, its name held until the last handle
+/// to it closes. Win32 reports such a name as `ERROR_ACCESS_DENIED`, like an ACL denial.
+pub(crate) fn is_delete_pending(path: &Path) -> io::Result<bool> {
+    let full = std::path::absolute(path).map_err(|e| io::Error::new(e.kind(), format!("{e}: {path:?}")))?;
+    let opened = nt_create(
+        None,
+        &nt_path(&full)?,
+        FILE_READ_ATTRIBUTES,
+        FILE_FLAGS_AND_ATTRIBUTES(0),
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        NTCREATEFILE_CREATE_OPTIONS(0),
+    );
+    match opened {
+        Ok(_) => Ok(false),
+        Err(STATUS_DELETE_PENDING) => Ok(true),
+        Err(status) => Err(nt_error(status, &full)),
+    }
+}
+
 /// The NT object name Win32 gives the absolute path `full`: `\??\` followed by the path. A
 /// verbatim (`\\?\`) path is taken literally, so each of its components must be a plain name.
 fn nt_path(full: &Path) -> io::Result<Vec<u16>> {

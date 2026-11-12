@@ -4,7 +4,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 
-use super::lock::{lock_exclusive, open_lock_target, try_lock_exclusive};
+#[cfg(unix)]
+use super::lock::lock_exclusive;
+use super::lock::{open_lock_target, try_lock_exclusive};
 use super::registry::{register, register_with, running_dir, try_register, IdGenerator, Registration, PROCESS_IDS};
 use super::rendezvous::rendezvous;
 use super::test_hooks::{retry_rendezvous, set_test_retry_hook, set_test_seam_hook, Seam};
@@ -20,8 +22,9 @@ pub(super) fn temp_coord() -> (crate::TempDir, PathBuf) {
 
 /// A coordination directory `<temp>/link/.skuld` behind a directory symlink, and a function that
 /// retargets the link at another directory. A registration made before the retarget is then behind
-/// the old target, so unregistering it must fail, on every platform: Windows refuses to delete the
-/// registration's files, but not to retarget an ancestor.
+/// the old target, so unregistering it must fail. This is the one way to break a registration on
+/// every platform: Windows refuses to delete a running test's entry, but not to retarget an
+/// ancestor.
 pub(super) fn linked_coord() -> (crate::TempDir, PathBuf, impl FnOnce()) {
     #[cfg(unix)]
     use std::os::unix::fs::symlink as symlink_dir;
@@ -94,9 +97,18 @@ fn entry_json(filter: &str) -> String {
     format!(r#"{{"name":"hand_made","labels":[],"filter":"{filter}"}}"#)
 }
 
-/// Another handle holding `path`'s lock, as a registered test in another process would.
+/// Another handle holding the entry `path`, as a registered test in another process would: a lock
+/// on Unix, an open handle that refuses deletion on Windows.
 fn hold(path: &Path) -> File {
-    let file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(super::lock::WINDOWS_SHARE_MODE);
+    }
+    let file = options.open(path).unwrap();
+    #[cfg(unix)]
     lock_exclusive(&file).unwrap();
     file
 }
@@ -184,7 +196,7 @@ fn filtered_serial_not_semantics() {
 fn an_unparseable_filter_in_an_entry_is_skipped() {
     let (_dir, coord) = temp_coord();
     let json = hand_made(&coord, "legacy.json", &entry_json("((("));
-    let _owner = hold(&hand_made(&coord, "legacy.lock", ""));
+    let _owner = hold(&json);
     assert!(can_start_now(&coord, &[Label::__new("docker")], SERIAL_NONE));
     assert!(json.exists(), "a live entry stays");
 }
@@ -203,14 +215,11 @@ fn registration_publishes_the_documented_entry() {
         value,
         serde_json::json!({"name": "my_test", "labels": ["docker"], "filter": "docker"})
     );
-    assert_eq!(
-        running_files(&coord),
-        vec![format!("{}.json", reg.id()), format!("{}.lock", reg.id())]
-    );
+    assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
 }
 
 #[test]
-fn unregister_removes_both_files_and_is_idempotent() {
+fn unregister_removes_the_entry_and_is_idempotent() {
     let (_dir, coord) = temp_coord();
     let mut reg = running(&coord, "my_test", &[], SERIAL_NONE);
     reg.unregister();
@@ -221,7 +230,7 @@ fn unregister_removes_both_files_and_is_idempotent() {
 // Scan =====
 
 #[test]
-fn json_without_lock_is_removed() {
+fn an_entry_nobody_holds_is_removed() {
     let (_dir, coord) = temp_coord();
     let json = hand_made(&coord, "orphan.json", &entry_json("*"));
     assert!(
@@ -232,77 +241,58 @@ fn json_without_lock_is_removed() {
 }
 
 #[test]
-fn orphan_unheld_lock_is_removed() {
+fn a_live_entry_blocks_per_its_filter() {
     let (_dir, coord) = temp_coord();
-    let lock = hand_made(&coord, "orphan.lock", "");
+    let json = hand_made(&coord, "live.json", &entry_json("docker"));
+    let _owner = hold(&json);
+    assert!(!can_start_now(&coord, &[Label::__new("docker")], SERIAL_NONE));
     assert!(can_start_now(&coord, &[], SERIAL_NONE));
-    assert!(!lock.exists());
-}
-
-#[test]
-fn held_lock_without_json_is_kept_and_blocks() {
-    let (_dir, coord) = temp_coord();
-    let lock = hand_made(&coord, "held.lock", "");
-    let _owner = hold(&lock);
-    assert!(
-        !can_start_now(&coord, &[], SERIAL_NONE),
-        "an owner with unknown constraints blocks"
-    );
-    assert!(lock.exists());
-}
-
-/// A `.json` deleted behind its owner's back (a recursive delete that carries on past errors)
-/// leaves a live `.lock` whose constraints are unknown. Registration writes both under the mutex
-/// and scans run under it, so only something outside skuld produces this: every registration
-/// waits for the owner to end, which then fails its own run at unregistration.
-#[test]
-fn held_lock_without_json_blocks_every_registration() {
-    let (_dir, coord) = temp_coord();
-    let a = running(&coord, "a", &[], SERIAL_NONE);
-    std::fs::remove_file(running_dir(&coord).join(format!("{}.json", a.id()))).unwrap();
-
-    assert!(
-        attempt(&coord, "b", &[], SERIAL_NONE).is_none(),
-        "a live lock with no entry must block even a non-serial test"
-    );
-
-    drop(a);
-    let mut b = attempt(&coord, "b", &[], SERIAL_NONE).expect("the owner ended, so its orphan lock is dead");
-    b.unregister();
+    assert!(json.exists(), "a live entry stays");
 }
 
 #[test]
 fn tmp_files_are_removed() {
     let (_dir, coord) = temp_coord();
-    let json_tmp = hand_made(&coord, "a.json.tmp", &entry_json("*"));
-    let lock_tmp = hand_made(&coord, "b.lock.tmp", "");
+    let tmp = hand_made(&coord, "a.json.tmp", &entry_json("*"));
     assert!(can_start_now(&coord, &[], SERIAL_ALL));
-    assert!(!json_tmp.exists() && !lock_tmp.exists());
+    assert!(!tmp.exists());
 }
 
 #[cfg(unix)]
 #[test]
-fn foreign_0644_lock_is_try_locked_read_only() {
+fn foreign_0644_entry_is_try_locked_read_only() {
     use std::os::unix::fs::PermissionsExt;
 
     let (_dir, coord) = temp_coord();
-    hand_made(&coord, "foreign.json", &entry_json("*"));
-    let lock = hand_made(&coord, "foreign.lock", "");
+    let json = hand_made(&coord, "foreign.json", &entry_json("*"));
     // Read-only, like another uid's 0644 file: the scan must not open it for writing.
-    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
-    let owner = File::open(&lock).unwrap();
+    std::fs::set_permissions(&json, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let owner = File::open(&json).unwrap();
     lock_exclusive(&owner).unwrap();
 
-    assert!(
-        !can_start_now(&coord, &[], SERIAL_NONE),
-        "the held lock marks the entry live"
-    );
+    assert!(!can_start_now(&coord, &[], SERIAL_NONE), "the held entry is live");
 
     drop(owner);
     assert!(
         can_start_now(&coord, &[], SERIAL_NONE),
         "released, the entry is dead and removed"
     );
+}
+
+/// An entry whose owner has deleted it while another process still has it open is gone, not live
+/// and not an error: its name only lingers until that process closes it.
+#[cfg(windows)]
+#[test]
+fn a_delete_pending_entry_is_skipped() {
+    let (_dir, coord) = temp_coord();
+    let json = hand_made(&coord, "pending.json", &entry_json("*"));
+    let marked = crate::win_nt::test_support::mark_for_deletion(&json, false);
+    assert!(
+        can_start_now(&coord, &[], SERIAL_NONE),
+        "a delete-pending entry must not block"
+    );
+    drop(marked);
+    assert!(!json.exists());
 }
 
 #[test]
@@ -313,7 +303,7 @@ fn entry_with_unknown_fields_is_read() {
         "future.json",
         r#"{"name":"future","labels":[],"filter":"*","added_later":{"x":1}}"#,
     );
-    let _owner = hold(&hand_made(&coord, "future.lock", ""));
+    let _owner = hold(&running_dir(&coord).join("future.json"));
     assert!(!can_start_now(&coord, &[], SERIAL_NONE));
 }
 
@@ -321,8 +311,8 @@ fn entry_with_unknown_fields_is_read() {
 #[should_panic(expected = "broken.json")]
 fn unparseable_entry_panics_naming_the_file() {
     let (_dir, coord) = temp_coord();
-    hand_made(&coord, "broken.json", "not json");
-    let _owner = hold(&hand_made(&coord, "broken.lock", ""));
+    let json = hand_made(&coord, "broken.json", "not json");
+    let _owner = hold(&json);
     let _ = attempt(&coord, "t", &[], SERIAL_NONE);
 }
 
@@ -331,13 +321,12 @@ fn colliding_id_retries_with_a_new_id() {
     let (_dir, coord) = temp_coord();
     let ids = IdGenerator::new();
     let colliding = ids.id_at(0);
-    hand_made(&coord, &format!("{colliding}.json"), &entry_json(""));
-    let lock = hand_made(&coord, &format!("{colliding}.lock"), "");
-    let _owner = hold(&lock);
+    let json = hand_made(&coord, &format!("{colliding}.json"), &entry_json(""));
+    let _owner = hold(&json);
 
     let mut reg = try_register(&ids, &coord, "t", &[], SERIAL_NONE).expect("nothing blocks it");
     assert_eq!(reg.id(), ids.id_at(1));
-    assert!(lock.exists(), "the live lock of the colliding id is not replaced");
+    assert!(json.exists(), "the live entry of the colliding id is not replaced");
     reg.unregister();
 }
 
@@ -353,7 +342,7 @@ fn register_with_uses_ids_from_its_generator() {
 // Mutex =====
 
 #[test]
-fn lock_file_is_created_under_the_mutex() {
+fn entry_is_created_under_the_mutex() {
     let (_dir, coord) = temp_coord();
     let _hook = set_test_seam_hook(Seam::Created, {
         let coord = coord.clone();
@@ -361,7 +350,7 @@ fn lock_file_is_created_under_the_mutex() {
             let fresh = open_lock_target(&coord);
             assert!(
                 matches!(try_lock_exclusive(&fresh), Err(std::fs::TryLockError::WouldBlock)),
-                "the mutex must be held while the lock file is created"
+                "the mutex must be held while the entry is created"
             );
         }
     });
@@ -449,11 +438,7 @@ fn entry_of_a_dead_owner_is_removed() {
     let (_dir, coord) = temp_coord();
     let mut child = spawn_registered_child(&coord, None);
     let child_files = running_files(&coord);
-    assert_eq!(
-        child_files.len(),
-        2,
-        "the child holds a .lock and a .json: {child_files:?}"
-    );
+    assert_eq!(child_files.len(), 1, "the child holds one entry: {child_files:?}");
     assert!(
         !can_start_now(&coord, &[], SERIAL_NONE),
         "a live SERIAL_ALL child blocks"
@@ -465,8 +450,11 @@ fn entry_of_a_dead_owner_is_removed() {
     // Not `attempt`: Windows releases a dead process's locks asynchronously, so the first scans may
     // still see the lock held.
     let mut reg = register(&coord, "parent", &[], SERIAL_ALL);
-    let ours = vec![format!("{}.json", reg.id()), format!("{}.lock", reg.id())];
-    assert_eq!(running_files(&coord), ours, "the child's files must be gone");
+    assert_eq!(
+        running_files(&coord),
+        vec![format!("{}.json", reg.id())],
+        "the child's entry must be gone"
+    );
     reg.unregister();
 }
 
@@ -485,11 +473,7 @@ fn unregistering_child() {
         return;
     };
     let mut reg = register(Path::new(&dir), "child", &[], SERIAL_NONE);
-    assert_eq!(
-        running_files(Path::new(&dir)).len(),
-        2,
-        "registered: a .lock and a .json"
-    );
+    assert_eq!(running_files(Path::new(&dir)).len(), 1, "registered: one entry");
 
     // The next `open` returns the lowest free descriptor, so a soft limit at or below it makes
     // every later `open` fail EMFILE.
@@ -544,7 +528,7 @@ stderr:
     assert_eq!(
         running_files(&coord),
         Vec::<String>::new(),
-        "unregistration removes both files"
+        "unregistration removes the entry"
     );
 }
 
@@ -700,27 +684,44 @@ fn blocked_registration_signals_retry_and_holds_no_files() {
 
 // Moved directories =====
 
+/// The panic of unregistering `reg`, as its message.
+fn unregister_panic(reg: &mut Registration) -> String {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reg.unregister()))
+        .expect_err("unregistering a moved registration must panic");
+    crate::coordination::panic_payload_message(payload.as_ref()).to_owned()
+}
+
 #[cfg(unix)]
 #[test]
-#[should_panic(expected = "moved")]
-fn drop_panics_when_running_dir_was_replaced() {
+fn unregister_panics_naming_the_entry_when_running_dir_was_replaced() {
     let (_dir, coord) = temp_coord();
     let mut reg = running(&coord, "t", &[], SERIAL_NONE);
     let aside = coord.join("running.aside");
     std::fs::rename(running_dir(&coord), &aside).unwrap();
     std::fs::create_dir(running_dir(&coord)).unwrap();
-    reg.unregister();
+
+    let msg = unregister_panic(&mut reg);
+    assert!(
+        msg.contains(&format!("{}.json", reg.id())) && msg.contains("deleted, replaced, or its directory moved"),
+        "{msg}"
+    );
 }
 
+/// A running test's entry cannot be deleted, so deleting `.skuld/` fails instead of splitting the
+/// run; a registration that conflicts with it still waits.
 #[cfg(windows)]
 #[test]
-fn running_lock_cannot_be_deleted_while_registered() {
+fn entry_cannot_be_deleted_while_registered() {
     const ERROR_SHARING_VIOLATION: i32 = 32;
     let (_dir, coord) = temp_coord();
     let mut reg = running(&coord, "t", &[], SERIAL_NONE);
-    let err = std::fs::remove_file(running_dir(&coord).join(format!("{}.lock", reg.id())))
-        .expect_err("Windows must refuse to delete a lock file its owner holds open");
+    let err = std::fs::remove_file(running_dir(&coord).join(format!("{}.json", reg.id())))
+        .expect_err("Windows must refuse to delete an entry its owner holds open");
     assert_eq!(err.raw_os_error(), Some(ERROR_SHARING_VIOLATION), "{err}");
+    assert!(
+        attempt(&coord, "global", &[], SERIAL_ALL).is_none(),
+        "the entry survived the delete attempt, so it still blocks"
+    );
     reg.unregister();
 }
 
@@ -756,12 +757,11 @@ fn unregister_panics_when_the_mutex_has_split() {
     reg.unregister();
 }
 
-/// A symlink ancestor of `coord` retargeted mid-run leaves the registration's files behind the
+/// A symlink ancestor of `coord` retargeted mid-run leaves the registration's entry behind the
 /// old target, so unregistering must fail rather than report success against whatever the path
-/// names now. Windows withholds `FILE_SHARE_DELETE` from the lock file, but that does not stop an
+/// names now. Windows withholds `FILE_SHARE_DELETE` from the entry, but that does not stop an
 /// ancestor being retargeted.
 #[test]
-#[should_panic(expected = "moved")]
 fn unregister_panics_when_a_parent_symlink_is_retargeted_mid_run() {
     let (_dir, coord, retarget) = linked_coord();
     let mut a = running(&coord, "a", &[], SERIAL_ALL);
@@ -771,5 +771,6 @@ fn unregister_panics_when_a_parent_symlink_is_retargeted_mid_run() {
     // of, so it must not wait on `a`'s global-serial entry.
     let _b = running(&coord, "b", &[], SERIAL_ALL);
 
-    a.unregister();
+    let msg = unregister_panic(&mut a);
+    assert!(msg.contains("deleted, replaced, or its directory moved"), "{msg}");
 }

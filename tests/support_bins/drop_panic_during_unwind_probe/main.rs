@@ -13,7 +13,8 @@
 //! `probe_drop_panic_during_unwind`.
 //!
 //! Reads `SKULD_DROP_PANIC_PROBE_COORD_DIR` (required: an isolated coordination directory
-//! path — never the real shared workspace `.skuld/`). Exits via a single
+//! path, never the real shared workspace `.skuld/`, whose parent is a directory symlink: the probe
+//! sabotages its registration by retargeting that link). Exits via a single
 //! propagated panic (code 101, no signal) once `TestRegistration::drop` is
 //! fixed to never let its own panic escape an active unwind; exits via
 //! `SIGABRT` before that fix.

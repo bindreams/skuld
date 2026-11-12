@@ -1,28 +1,33 @@
 //! The registry of running tests, kept on OS file locks.
 //!
 //! `coord_dir` (`<resolved>/.skuld`) holds the global mutex (see [`super::lock`]) and `running/`,
-//! which holds per registered test:
+//! which holds one file per registered test: `<id>.json`, the [`Entry`]. The owner keeps it open
+//! for the registration's lifetime, and that is its liveness: whether another process can still
+//! see it held, not a PID.
 //!
-//! - `<id>.lock`, created and locked by its owner for the registration's lifetime. The kernel
-//!   releases the lock when the owner dies, so liveness is whether the lock can be taken, not a
-//!   PID.
-//! - `<id>.json`, the [`Entry`], published by rename.
+//! - Unix: the owner holds an exclusive `flock` on it, taken before it is renamed into place from
+//!   `<id>.json.tmp`, so a scan never finds a complete entry that is not held. The kernel releases
+//!   the lock when the owner dies.
+//! - Windows: the owner holds a handle opened without `FILE_SHARE_DELETE`, so the entry cannot be
+//!   deleted while its test runs. There is no lock: Windows locks are mandatory and would block a
+//!   scan's read.
 //!
 //! Everything that creates or deletes in `running/` does so holding the mutex. A waiting test
 //! holds no files. See the "Layout", "Register" and "Unregister" sections of the spec for why each
 //! step is where it is.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::file_identity::FileIdentity;
-use super::lock::{lock_exclusive, open_lock_target, try_lock_exclusive, unlock, with_locked_target, GlobalLockHeld};
+#[cfg(unix)]
+use super::lock::{lock_exclusive, try_lock_exclusive};
+use super::lock::{open_lock_target, with_locked_target, GlobalLockHeld};
 use super::{skuld_debug_eprintln, DB_DIR_HINT, SERIAL_ALL, SERIAL_NONE};
 use crate::label::{Label, LabelFilter};
 
@@ -35,11 +40,8 @@ pub(super) fn running_dir(coord_dir: &Path) -> PathBuf {
     coord_dir.join("running")
 }
 
-fn lock_path(running: &Path, id: &str) -> PathBuf {
-    running.join(format!("{id}.lock"))
-}
-
-fn json_path(running: &Path, id: &str) -> PathBuf {
+/// Where the entry of `id` lives.
+fn entry_path(running: &Path, id: &str) -> PathBuf {
     running.join(format!("{id}.json"))
 }
 
@@ -90,10 +92,15 @@ fn or_panic<T>(action: &str, path: &Path, result: io::Result<T>) -> T {
     result.unwrap_or_else(|e| panic!("skuld: failed to {action} {path:?}: {e} ({DB_DIR_HINT})"))
 }
 
-fn moved_message(coord_dir: &Path, doing: &str) -> String {
+/// `entry` is the registration's entry, when there is one yet.
+fn moved_message(coord_dir: &Path, entry: Option<&Path>, doing: &str) -> String {
+    let lost = match entry {
+        Some(entry) => format!("the mutex's target or the entry {entry:?}"),
+        None => "the mutex's target".to_owned(),
+    };
     format!(
-        "skuld: the coordination directory {coord_dir:?} moved while {doing}: it, or running/ in it, was \
-         deleted or replaced, so the mutex or the entries no longer guard what other tests see ({DB_DIR_HINT})"
+        "skuld: the coordination directory {coord_dir:?} moved while {doing}: {lost} was deleted, replaced, \
+         or its directory moved, so the mutex or the entries no longer guard what other tests see ({DB_DIR_HINT})"
     )
 }
 
@@ -132,116 +139,123 @@ fn remove_if_exists(path: &Path) {
     }
 }
 
-/// Create `<id>.lock` in `running`. `AlreadyExists` if the id is taken.
+/// Create the entry of `id` in `running` holding `bytes`, and keep it held. `AlreadyExists` if the
+/// id is taken.
 ///
-/// Unix: through a `.lock.tmp` at 0644, so a crash never leaves a `.lock` another uid cannot
-/// open. The existence check is race-free because every creator holds the mutex.
-fn create_lock_file(running: &Path, id: &str) -> io::Result<File> {
-    let lock = lock_path(running, id);
+/// Unix: written to `<id>.json.tmp` at 0644 and locked, then renamed into place, so a crash never
+/// leaves an entry another uid cannot open or one that is not held. The existence check is
+/// race-free because every creator holds the mutex.
+fn create_entry_file(running: &Path, id: &str, bytes: &[u8]) -> io::Result<File> {
+    let path = entry_path(running, id);
     #[cfg(unix)]
-    {
-        match lock.symlink_metadata() {
+    let (mut file, written) = {
+        match path.symlink_metadata() {
             Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let tmp = running.join(format!("{id}.lock.tmp"));
-        let file = create_new_file(&tmp)?;
-        std::fs::rename(&tmp, &lock)?;
-        Ok(file)
-    }
+        let tmp = running.join(format!("{id}.json.tmp"));
+        (create_new_file(&tmp)?, tmp)
+    };
     #[cfg(windows)]
+    let (mut file, written) = (create_new_file(&path)?, path.clone());
+
+    #[cfg(test)]
+    test_hooks::run_seam(Seam::Created);
+    or_panic("write", &written, file.write_all(bytes));
+    #[cfg(unix)]
     {
-        create_new_file(&lock)
+        or_panic("lock", &written, lock_exclusive(&file));
+        or_panic("publish", &path, std::fs::rename(&written, &path));
     }
+    Ok(file)
 }
 
-/// Create and lock the lock file under a fresh id; returns the id and the locked file.
-fn create_lock(ids: &IdGenerator, running: &Path) -> (String, File) {
+/// Create the entry under a fresh id; returns the id and the held file.
+fn create_entry(ids: &IdGenerator, running: &Path, entry: &Entry) -> (String, File) {
+    let bytes = serde_json::to_vec(entry).expect("an entry of strings serializes");
     loop {
         let id = ids.next();
-        match create_lock_file(running, &id) {
-            Ok(file) => {
-                #[cfg(test)]
-                test_hooks::run_seam(Seam::Created);
-                or_panic("lock", &lock_path(running, &id), lock_exclusive(&file));
-                return (id, file);
-            }
+        match create_entry_file(running, &id, &bytes) {
+            Ok(file) => return (id, file),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => or_panic("create", &lock_path(running, &id), Err(e)),
+            Err(e) => or_panic("create", &entry_path(running, &id), Err(e)),
         }
     }
 }
 
-/// Write the entry to `<id>.json.tmp`, then rename it into place.
-fn publish_entry(running: &Path, id: &str, entry: &Entry) {
-    use std::io::Write;
-
-    let tmp = running.join(format!("{id}.json.tmp"));
-    let target = json_path(running, id);
-    let bytes = serde_json::to_vec(entry).expect("an entry of strings serializes");
-    let mut file = or_panic("create", &tmp, create_new_file(&tmp));
-    or_panic("write", &tmp, file.write_all(&bytes));
-    drop(file);
-    or_panic("publish", &target, std::fs::rename(&tmp, &target));
-}
-
 // Scan =====
 
-/// True when nobody holds `lock`, or it does not exist. Opened read-only: a 0644 lock owned by
-/// another uid can still be try-locked, and the handle is closed before the caller deletes.
-fn owner_gone(lock: &Path) -> bool {
-    match File::open(lock) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
-        Err(e) => or_panic("open", lock, Err(e)),
-        Ok(file) => match try_lock_exclusive(&file) {
-            Ok(()) => true,
-            Err(std::fs::TryLockError::WouldBlock) => false,
-            Err(std::fs::TryLockError::Error(e)) => or_panic("try-lock", lock, Err(e)),
-        },
+/// The bytes of the entry at `path` if its owner is alive; if it is dead, delete it and return
+/// `None`. The caller holds the mutex.
+///
+/// Unix: open read-only (so another uid's 0644 entry works too) and try-lock; only a dead owner's
+/// entry can be locked.
+#[cfg(unix)]
+fn read_if_live(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let mut file = match File::open(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => or_panic("open", path, Err(e)),
+        Ok(file) => file,
+    };
+    match try_lock_exclusive(&file) {
+        Ok(()) => {
+            remove_if_exists(path);
+            None
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let mut bytes = Vec::new();
+            or_panic("read", path, file.read_to_end(&mut bytes));
+            Some(bytes)
+        }
+        Err(std::fs::TryLockError::Error(e)) => or_panic("try-lock", path, Err(e)),
     }
 }
 
-/// Delete what dead owners left and return the live entries (a live lock whose `.json` is gone
-/// counts as a global-serial one). The caller holds the mutex.
+/// See the Unix variant. Windows: try to delete it. An entry nobody holds is deleted, so its owner
+/// was dead; a live owner's handle refuses deletion with a sharing violation. An entry that is
+/// already delete-pending (deleted, but some process still has it open, which Win32 reports as
+/// `ERROR_ACCESS_DENIED`) is being torn down: neither live nor an error.
+#[cfg(windows)]
+fn read_if_live(path: &Path) -> Option<Vec<u8>> {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+    match std::fs::remove_file(path) {
+        Ok(()) => None,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION.0 as i32) => {
+            Some(or_panic("read", path, std::fs::read(path)))
+        }
+        Err(e)
+            if e.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32)
+                && matches!(crate::win_nt::is_delete_pending(path), Ok(true)) =>
+        {
+            None
+        }
+        Err(e) => or_panic("remove", path, Err(e)),
+    }
+}
+
+/// Delete what dead owners left and return the live entries. The caller holds the mutex.
 fn scan(running: &Path) -> Vec<Entry> {
+    // Not ours if not UTF-8.
     let names: Vec<String> = or_panic("list", running, std::fs::read_dir(running))
         .map(|e| or_panic("list", running, e).file_name())
-        // Not ours if not UTF-8.
         .filter_map(|n| n.into_string().ok())
         .collect();
-    // The ids that have a `.json`, built once so each `.lock` is checked in constant time.
-    let entry_ids: HashSet<&str> = names.iter().filter_map(|n| n.strip_suffix(".json")).collect();
     let mut live = Vec::new();
     for name in &names {
         let path = running.join(name);
         if name.ends_with(".tmp") {
+            // Only an owner holding the mutex has one, so a scan seeing it means a crash left it.
             remove_if_exists(&path);
-        } else if let Some(id) = name.strip_suffix(".json") {
-            let lock = lock_path(running, id);
-            if owner_gone(&lock) {
-                remove_if_exists(&path);
-                remove_if_exists(&lock);
-            } else {
-                let bytes = or_panic("read", &path, std::fs::read(&path));
+        } else if name.ends_with(".json") {
+            if let Some(bytes) = read_if_live(&path) {
                 let entry = serde_json::from_slice(&bytes)
                     .unwrap_or_else(|e| panic!("skuld: unparseable coordination entry {path:?}: {e} ({DB_DIR_HINT})"));
                 live.push(entry);
-            }
-        } else if let Some(id) = name.strip_suffix(".lock") {
-            if !entry_ids.contains(id) {
-                if owner_gone(&path) {
-                    remove_if_exists(&path);
-                } else {
-                    // Registration writes both files under the mutex, so a live lock with no
-                    // entry means something outside skuld deleted the entry. Its owner's
-                    // constraints are unknown: wait for it to end, as for a global-serial test.
-                    live.push(Entry {
-                        name: name.clone(),
-                        labels: Vec::new(),
-                        filter: SERIAL_ALL.to_owned(),
-                    });
-                }
             }
         }
     }
@@ -300,15 +314,15 @@ fn can_start(entries: &[Entry], my_labels: &[Label], my_serial_filter: &str) -> 
 
 // Registration =====
 
-/// A registered test. [`Self::unregister`] ends it; dropping without it only closes the handle,
+/// A registered test. [`Self::unregister`] ends it; dropping without it only closes the hold,
 /// which marks the entry dead for the next scan.
 pub(super) struct Registration {
     coord_dir: PathBuf,
     id: String,
-    /// `None` once unregistered.
-    lock: Option<File>,
-    /// Of the file `lock` has open, for checking that `running/<id>.lock` is still that file.
-    lock_identity: FileIdentity,
+    /// The entry, held open (and on Unix locked); `None` once unregistered.
+    hold: Option<File>,
+    /// Of the file `hold` has open, for checking that `running/<id>.json` is still that file.
+    entry_identity: FileIdentity,
     /// The mutex's lock target, held open (and unlocked) since registration so that
     /// [`Self::unregister`] locks it again without opening anything: a test that has used up its
     /// file descriptors must still be able to unregister.
@@ -321,45 +335,27 @@ impl Registration {
         &self.id
     }
 
-    /// Where this registration's `.json` entry lives.
-    pub(super) fn json_path(&self) -> PathBuf {
-        json_path(&running_dir(&self.coord_dir), &self.id)
-    }
-
-    /// Remove the entry and the lock file, under the mutex. Panics, saying the coordination
-    /// directory moved, if the mutex split or `running/<id>.lock` or `running/<id>.json` is no
-    /// longer what this registration made. A second call, after success, does nothing.
+    /// Remove the entry, under the mutex. Panics, saying the coordination directory moved, if the
+    /// mutex split or `running/<id>.json` is no longer the file this registration made. A second
+    /// call, after success, does nothing.
     pub(super) fn unregister(&mut self) {
-        if self.lock.is_none() {
+        if self.hold.is_none() {
             return;
         }
         let coord_dir = self.coord_dir.clone();
-        let running = running_dir(&coord_dir);
-        let (lock, json) = (lock_path(&running, &self.id), json_path(&running, &self.id));
-        // Opens nothing on Unix: `stat`, `metadata` and `remove_file` need no descriptor. (Windows
-        // has no descriptor limit, and `target_has_split` there reopens the lock file.)
+        let entry = entry_path(&running_dir(&coord_dir), &self.id);
+        // Opens nothing on Unix: `stat` and `remove_file` need no descriptor. (Windows has no
+        // descriptor limit, and `target_has_split` there reopens the lock file.)
         with_locked_target(&coord_dir, &self.mutex_target, |held| {
             #[cfg(test)]
             test_hooks::run_seam(Seam::Unregistering);
-            let json_exists = or_panic("inspect", &json, json.try_exists());
-            if held.target_has_split() || FileIdentity::of(&lock) != Some(self.lock_identity) || !json_exists {
-                panic!("{}", moved_message(&coord_dir, "unregistering a test"));
+            if held.target_has_split() || FileIdentity::of(&entry) != Some(self.entry_identity) {
+                panic!("{}", moved_message(&coord_dir, Some(&entry), "unregistering a test"));
             }
-            or_panic("remove", &json, std::fs::remove_file(&json));
-            let file = self.lock.take().expect("checked above");
-            or_panic("unlock", &lock, unlock(&file));
-            drop(file);
-            or_panic("remove", &lock, std::fs::remove_file(&lock));
+            // Closed first: Windows refuses to delete a file its own handle holds open.
+            drop(self.hold.take().expect("checked above"));
+            or_panic("remove", &entry, std::fs::remove_file(&entry));
         });
-    }
-}
-
-impl Drop for Registration {
-    fn drop(&mut self) {
-        if let Some(file) = self.lock.take() {
-            // Never panics. Unlocking first only hastens what closing does anyway.
-            let _ = unlock(&file);
-        }
     }
 }
 
@@ -379,9 +375,9 @@ pub(super) fn try_register(
         super::db_dir::create_dir_all_open(&running),
     );
     let mutex_target = open_lock_target(coord_dir);
-    let (id, lock, lock_identity) = with_locked_target(coord_dir, &mutex_target, |held| {
+    let (id, hold, entry_identity) = with_locked_target(coord_dir, &mutex_target, |held| {
         if held.target_has_split() {
-            panic!("{}", moved_message(coord_dir, "registering a test"));
+            panic!("{}", moved_message(coord_dir, None, "registering a test"));
         }
         let entries = scan(&running);
         if !can_start(&entries, labels, storage_filter) {
@@ -392,14 +388,14 @@ pub(super) fn try_register(
     Some(Registration {
         coord_dir: coord_dir.to_path_buf(),
         id,
-        lock: Some(lock),
-        lock_identity,
+        hold: Some(hold),
+        entry_identity,
         mutex_target,
     })
 }
 
-/// Create, lock and publish the registration, returning its id, locked file and that file's
-/// identity. The caller holds the mutex and has decided the test can start.
+/// Create, hold and publish the entry, returning its id, held file and that file's identity. The
+/// caller holds the mutex and has decided the test can start.
 fn publish(
     held: &GlobalLockHeld<'_>,
     ids: &IdGenerator,
@@ -409,24 +405,23 @@ fn publish(
     storage_filter: &str,
 ) -> (String, File, FileIdentity) {
     let running = running_dir(coord_dir);
-    let (id, file) = create_lock(ids, &running);
     let entry = Entry {
         name: name.to_owned(),
         labels: labels.iter().map(|l| l.name().to_owned()).collect(),
         filter: storage_filter.to_owned(),
     };
-    publish_entry(&running, &id, &entry);
+    let (id, file) = create_entry(ids, &running, &entry);
     #[cfg(test)]
     test_hooks::run_seam(Seam::Published);
 
     // A split after `try_register`'s check would have put the entry in a directory the mutex no
     // longer guards.
-    let lock = lock_path(&running, &id);
-    let lock_identity = or_panic("inspect", &lock, FileIdentity::of_file(&file));
-    if held.target_has_split() || FileIdentity::of(&lock) != Some(lock_identity) {
-        panic!("{}", moved_message(coord_dir, "registering a test"));
+    let path = entry_path(&running, &id);
+    let identity = or_panic("inspect", &path, FileIdentity::of_file(&file));
+    if held.target_has_split() || FileIdentity::of(&path) != Some(identity) {
+        panic!("{}", moved_message(coord_dir, Some(&path), "registering a test"));
     }
-    (id, file, lock_identity)
+    (id, file, identity)
 }
 
 /// [`register`] with the ids from `ids`.

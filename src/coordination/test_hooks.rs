@@ -137,9 +137,10 @@ pub(super) fn signal_retry() {
 /// change: the one place no contention can open deterministically.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Seam {
-    /// `registry::register`, once `<id>.lock` exists and before it is locked.
+    /// `registry::register`, once the entry (on Unix, its `.json.tmp`) exists and before it is
+    /// written or locked.
     Created,
-    /// `registry::register`, after the `.json` rename and before the final split check, mutex
+    /// `registry::register`, after the entry is in place and before the final split check, mutex
     /// still held.
     Published,
     /// `Registration::unregister`, after the mutex is taken and before the checks.

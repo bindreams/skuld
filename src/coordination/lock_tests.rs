@@ -318,8 +318,8 @@ fn target_has_split_detects_a_wholesale_directory_replacement() {
     );
 }
 
-/// Windows refuses to delete the lock file while held, but a symlink ancestor can still be
-/// retargeted underneath it.
+/// A symlink ancestor retargeted underneath the held lock target splits the lock on every
+/// platform. On Windows it is the only way: the lock file itself cannot be deleted while held.
 #[test]
 fn target_has_split_detects_a_retargeted_symlink_ancestor() {
     let (_dir, coord, retarget) = linked_coord();

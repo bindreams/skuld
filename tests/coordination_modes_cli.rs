@@ -1,6 +1,6 @@
 //! End-to-end subprocess tests for the modes of what the coordination directory is made of, via
 //! the `register_probe` binary: `.skuld/` and `running/` are 0777 and a registration's
-//! `<id>.lock` and `<id>.json` are 0644, whatever the umask, so that whichever uid gets there
+//! `<id>.json` is 0644, whatever the umask, so that whichever uid gets there
 //! first does not lock out the rest.
 //!
 //! Both cases need genuine subprocesses, for different reasons:
@@ -80,28 +80,25 @@ fn mode(path: &Path) -> u32 {
         & 0o777
 }
 
-/// Assert the directory modes, and that `running/` holds `registered` registrations, each with a
-/// 0644 `<id>.lock` and `<id>.json`.
+/// Assert the directory modes, and that `running/` holds exactly `registered` entries, each a 0644
+/// `<id>.json`.
 fn assert_modes(coord_dir: &Path, registered: usize) {
     assert_eq!(mode(coord_dir), 0o777, "{coord_dir:?} must be 0777");
     let running = coord_dir.join("running");
     assert_eq!(mode(&running), 0o777, "{running:?} must be 0777");
 
-    let (mut locks, mut jsons) = (0, 0);
+    let mut entries = 0;
     for entry in std::fs::read_dir(&running).unwrap() {
         let path = entry.unwrap().path();
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("lock") => locks += 1,
-            Some("json") => jsons += 1,
-            _ => panic!("unexpected file {path:?} in {running:?} while every probe is registered"),
-        }
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("json"),
+            "unexpected file {path:?} in {running:?} while every probe is registered"
+        );
         assert_eq!(mode(&path), 0o644, "{path:?} must be 0644");
+        entries += 1;
     }
-    assert_eq!(
-        (locks, jsons),
-        (registered, registered),
-        "one .lock and one .json per registration"
-    );
+    assert_eq!(entries, registered, "one entry per registration");
 }
 
 /// umask 077 (tighter than a typical dev/CI default of 022) gives a umask-driven regression the
