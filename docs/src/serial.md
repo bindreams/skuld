@@ -59,7 +59,7 @@ Serial tests are coordinated through OS file locks in a `.skuld/` directory, aut
 
 Only binaries that resolve to the same directory coordinate with each other, and every run sharing a `SKULD_DB_DIR` shares coordination, including unrelated workspaces. A skuld that coordinated through SQLite (0.6.0 and earlier) does not coordinate with this one; see the upgrade note in the changelog. The directory must exist and be readable and writable (for example, not a read-only mount); otherwise the run panics naming the directory and `SKULD_DB_DIR`. Directories skuld creates for `SKULD_DB_DIR` are published atomically at mode 0777, whatever the umask. Skuld never falls back to per-process coordination.
 
-On Unix, `.skuld/` and `running/` are mode 0777 and the entries in them 0644, whatever the umask, so runs under several uids can share one directory. On Windows, every account sharing the directory must be able to read and delete the files the others create in it; otherwise skuld fails, naming the file.
+On Unix, `.skuld/` and `running/` are mode 0777 and the entries in them 0644, whatever the umask, so runs under several uids can share one directory. On Windows, every account sharing the directory must be able to read and delete the files the others create in it, and to write `global.lock`, which every test opens for writing; otherwise skuld fails, naming the file.
 
 ### Moving or deleting `.skuld/` during a run
 
