@@ -111,7 +111,6 @@ pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnO
         fn drop(&mut self) {
             if let Err(e) = unlock(self.0) {
                 skuld_debug_eprintln!("failed to unlock the global lock: {e}");
-                debug_assert!(false, "failed to unlock the global lock: {e}");
             }
         }
     }
