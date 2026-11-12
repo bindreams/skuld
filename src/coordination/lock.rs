@@ -49,12 +49,26 @@ pub(super) fn lock_path(coord_dir: &Path) -> PathBuf {
 /// Obtainable only inside [`with_global_lock`]'s closure.
 pub(super) struct GlobalLockHeld<'a> {
     coord_dir: &'a Path,
+    /// The open lock target, which on Unix is `coord_dir` itself: what the holder does inside the
+    /// directory goes through it, so a holder whose lock has split cannot touch the replacement.
+    #[cfg(unix)]
+    target: &'a File,
     /// Of the lock target this token's lock is held on, recorded at acquisition; see
     /// [`Self::target_has_split`].
     target_identity: FileIdentity,
 }
 
 impl<'a> GlobalLockHeld<'a> {
+    pub(super) fn coord_dir(&self) -> &'a Path {
+        self.coord_dir
+    }
+
+    /// The open directory `coord_dir` was when the lock was taken, whatever its path names now.
+    #[cfg(unix)]
+    pub(super) fn dir(&self) -> &'a File {
+        self.target
+    }
+
     /// True once the lock target this token holds no longer matches what `coord_dir` resolves to:
     /// the lock has split, so a new opener locks the replacement while this handle only excludes
     /// callers of the detached original. Resolves [`lock_path`] afresh and compares it with the
@@ -95,7 +109,10 @@ pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnO
     struct Unlock<'a>(&'a File);
     impl Drop for Unlock<'_> {
         fn drop(&mut self) {
-            let _ = unlock(self.0);
+            if let Err(e) = unlock(self.0) {
+                skuld_debug_eprintln!("failed to unlock the global lock: {e}");
+                debug_assert!(false, "failed to unlock the global lock: {e}");
+            }
         }
     }
     let _release = Unlock(target);
@@ -107,6 +124,8 @@ pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnO
     });
     f(&GlobalLockHeld {
         coord_dir,
+        #[cfg(unix)]
+        target,
         target_identity,
     })
 }
@@ -114,6 +133,33 @@ pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnO
 /// Open `coord_dir`'s lock target ([`lock_path`]), ready to be locked or try-locked. Panics if it
 /// cannot be opened.
 pub(super) fn open_lock_target(coord_dir: &Path) -> File {
+    open_target(coord_dir).unwrap_or_else(|e| open_failed(coord_dir, &e))
+}
+
+/// [`open_lock_target`], except that `None` means the target does not exist (its directory is
+/// missing), which a caller that creates the directory can retry.
+pub(super) fn open_lock_target_if_present(coord_dir: &Path) -> Option<File> {
+    match open_target(coord_dir) {
+        Ok(target) => Some(target),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => open_failed(coord_dir, &e),
+    }
+}
+
+fn open_failed(coord_dir: &Path, e: &std::io::Error) -> ! {
+    let what = if cfg!(windows) {
+        "the global lock file"
+    } else {
+        "the coordination directory"
+    };
+    panic!(
+        "skuld: failed to open {what} {:?} for locking: {e} ({})",
+        lock_path(coord_dir),
+        super::DB_DIR_HINT
+    )
+}
+
+fn open_target(coord_dir: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -126,18 +172,11 @@ pub(super) fn open_lock_target(coord_dir: &Path) -> File {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(coord_dir)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "skuld: failed to open the coordination directory {coord_dir:?} for locking: {e} ({})",
-                    super::DB_DIR_HINT
-                )
-            })
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
 
-        let path = lock_path(coord_dir);
         OpenOptions::new()
             .create(true)
             .write(true)
@@ -147,13 +186,7 @@ pub(super) fn open_lock_target(coord_dir: &Path) -> File {
             .read(true)
             // No FILE_SHARE_DELETE: keeps the file from being deleted or renamed while held.
             .share_mode(WINDOWS_SHARE_MODE)
-            .open(&path)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "skuld: failed to open the global lock file {path:?}: {e} ({})",
-                    super::DB_DIR_HINT
-                )
-            })
+            .open(lock_path(coord_dir))
     }
 }
 

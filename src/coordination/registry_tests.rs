@@ -196,6 +196,34 @@ fn an_unparseable_filter_in_an_entry_is_skipped() {
     assert!(json.exists(), "a live entry stays");
 }
 
+const WARN_CHILD_DIR_ENV: &str = "SKULD_REGISTRY_TEST_WARN_CHILD_DIR";
+const UNPARSEABLE_WARNING: &str = "skipping unparseable serial_filter";
+
+/// The body of the process [`an_unparseable_filter_warns_once_per_process`] starts: scans three
+/// times past one live entry with an unparseable filter.
+#[test]
+#[ignore = "a child body: run by an_unparseable_filter_warns_once_per_process"]
+fn unparseable_filter_child() {
+    let coord = PathBuf::from(std::env::var_os(WARN_CHILD_DIR_ENV).expect("run by its parent test"));
+    let json = hand_made(&coord, "legacy.json", &entry_json("((("));
+    let _owner = hold(&json);
+    for _ in 0..3 {
+        assert!(can_start_now(&coord, &[Label::__new("docker")], SERIAL_NONE));
+    }
+}
+
+#[test]
+fn an_unparseable_filter_warns_once_per_process() {
+    let (_dir, coord) = temp_coord();
+    let output = child_command("unparseable_filter_child")
+        .env(WARN_CHILD_DIR_ENV, &coord)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{}: {stderr}", output.status);
+    assert_eq!(stderr.matches(UNPARSEABLE_WARNING).count(), 1, "{stderr}");
+}
+
 // Entry format and unregistration =====
 
 #[test]
@@ -406,26 +434,30 @@ fn a_locked_running_entry_blocks_every_registration() {
     reg.unregister();
 }
 
-/// The warning for an entry that cannot be read is printed once per path, and names the file and
-/// what to do about it.
+/// The warning for an entry that cannot be read names the file and what to do about it.
 #[cfg(windows)]
 #[test]
-fn the_unreadable_entry_warning_is_once_per_path() {
-    use super::registry::unreadable_warning_once;
-    use std::collections::HashSet;
+fn the_unreadable_entry_warning_names_the_file() {
+    let warning = super::registry::unreadable_warning(Path::new(r"C:\x\a.json"));
+    assert!(
+        warning.starts_with("[skuld] warning:")
+            && warning.contains(r"C:\x\a.json")
+            && warning.contains("every test waits"),
+        "{warning}"
+    );
+}
 
-    let mut warned = HashSet::new();
-    let (a, b) = (Path::new(r"C:\x\a.json"), Path::new(r"C:\x\b.json"));
-    let first = unreadable_warning_once(&mut warned, a).expect("the first time warns");
+#[test]
+fn a_warning_text_is_printed_once() {
+    use super::registry::warning_once;
+
+    let mut warned = std::collections::HashSet::new();
+    assert_eq!(warning_once(&mut warned, "a".to_owned()).as_deref(), Some("a"));
+    assert_eq!(warning_once(&mut warned, "a".to_owned()), None, "not twice");
     assert!(
-        first.starts_with("[skuld] warning:") && first.contains(r"C:\x\a.json") && first.contains("every test waits"),
-        "{first}"
+        warning_once(&mut warned, "b".to_owned()).is_some(),
+        "another text warns"
     );
-    assert!(
-        unreadable_warning_once(&mut warned, a).is_none(),
-        "not twice for one path"
-    );
-    assert!(unreadable_warning_once(&mut warned, b).is_some(), "another path warns");
 }
 
 /// Another program holding an entry open with share mode 0 (no sharing at all) refuses the scan's
@@ -538,26 +570,23 @@ const CHILD_DIR_ENV: &str = "SKULD_REGISTRY_TEST_CHILD_DIR";
 #[cfg(unix)]
 const CHILD_UMASK_ENV: &str = "SKULD_REGISTRY_TEST_CHILD_UMASK";
 
-/// Name of [`registered_child`], as libtest's `--exact` wants it.
-fn child_test_name() -> String {
-    format!("{}::registered_child", module_tail())
+/// This test binary, set to run the ignored child body `test` of this module and nothing else.
+/// Child bodies are `#[ignore]`d so that they never run as tests of their own.
+fn child_command(test: &str) -> std::process::Command {
+    let module = module_path!().split_once("::").expect("module path has a crate").1;
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--ignored", "--exact", &format!("{module}::{test}"), "--nocapture"]);
+    cmd
 }
 
-/// This module's path without the crate name, as libtest's `--exact` wants it.
-fn module_tail() -> &'static str {
-    module_path!().split_once("::").expect("module path has a crate").1
-}
-
-/// Not a test of its own: the body of the process [`spawn_registered_child`] starts. Without
-/// `CHILD_DIR_ENV` it has nothing to do and passes. With it, it registers `SERIAL_ALL` in that
-/// directory, reports, and holds the registration until killed.
+/// The body of the process [`spawn_registered_child`] starts: registers `SERIAL_ALL` in
+/// `CHILD_DIR_ENV`, reports, and holds the registration until killed.
 #[test]
+#[ignore = "a child body: run by spawn_registered_child"]
 fn registered_child() {
     use std::io::{BufRead, Write};
 
-    let Some(dir) = std::env::var_os(CHILD_DIR_ENV) else {
-        return;
-    };
+    let dir = std::env::var_os(CHILD_DIR_ENV).expect("run by spawn_registered_child");
     #[cfg(unix)]
     if let Ok(mask) = std::env::var(CHILD_UMASK_ENV) {
         // Safety: `umask` only sets this process's creation mask.
@@ -576,11 +605,10 @@ fn registered_child() {
 #[allow(clippy::zombie_processes)] // the caller kills and waits for the child it is handed
 fn spawn_registered_child(coord: &Path, umask: Option<&str>) -> std::process::Child {
     use std::io::BufRead;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args(["--exact", &child_test_name(), "--nocapture", "--test-threads=1"])
-        .env(CHILD_DIR_ENV, coord)
+    let mut cmd = child_command("registered_child");
+    cmd.env(CHILD_DIR_ENV, coord)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
     #[cfg(unix)]
@@ -635,15 +663,13 @@ const FD_CHILD_DIR_ENV: &str = "SKULD_REGISTRY_TEST_FD_CHILD_DIR";
 #[cfg(unix)]
 const FD_CHILD_DONE: &str = "child-unregistered";
 
-/// Not a test of its own: the body of the process [`unregister_needs_no_new_file_descriptor`]
-/// starts. Without `FD_CHILD_DIR_ENV` it passes. With it, it registers, spends every free file
-/// descriptor, then unregisters.
+/// The body of the process [`unregister_needs_no_new_file_descriptor`] starts: registers, spends
+/// every free file descriptor, then unregisters.
 #[cfg(unix)]
 #[test]
+#[ignore = "a child body: run by unregister_needs_no_new_file_descriptor"]
 fn unregistering_child() {
-    let Some(dir) = std::env::var_os(FD_CHILD_DIR_ENV) else {
-        return;
-    };
+    let dir = std::env::var_os(FD_CHILD_DIR_ENV).expect("run by unregister_needs_no_new_file_descriptor");
     let mut reg = register(Path::new(&dir), "child", &[], SERIAL_NONE);
     assert_eq!(running_files(Path::new(&dir)).len(), 1, "registered: one entry");
 
@@ -675,12 +701,7 @@ fn unregistering_child() {
 #[test]
 fn unregister_needs_no_new_file_descriptor() {
     let (_dir, coord) = temp_coord();
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            &format!("{}::unregistering_child", module_tail()),
-            "--nocapture",
-        ])
+    let output = child_command("unregistering_child")
         .env(FD_CHILD_DIR_ENV, &coord)
         .output()
         .unwrap();
@@ -926,6 +947,88 @@ fn unregister_panics_when_the_mutex_has_split() {
         let coord = coord.clone();
         move || split(&coord)
     });
+    reg.unregister();
+}
+
+/// A scanner whose mutex has split (it holds the lock on the replaced directory) must not list,
+/// delete or create anything in the new copy; the final check then reports the move.
+#[cfg(unix)]
+#[test]
+fn a_split_scanner_leaves_the_new_directory_untouched() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let (_dir, coord) = temp_coord();
+    let holds = Rc::new(RefCell::new(Vec::new()));
+    let _hook = set_test_seam_hook(Seam::Scanning, {
+        let (coord, holds) = (coord.clone(), holds.clone());
+        move || {
+            split(&coord);
+            std::fs::create_dir(running_dir(&coord)).unwrap();
+            hand_made(&coord, "stale.json.tmp", "partial");
+            hand_made(&coord, "dead.json", &entry_json("*"));
+            let live = hand_made(&coord, "live.json", &entry_json(""));
+            holds.borrow_mut().push(hold(&live));
+        }
+    });
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| attempt(&coord, "t", &[], SERIAL_NONE)))
+        .err()
+        .expect("a split scanner must panic");
+    let msg = crate::coordination::panic_payload_message(payload.as_ref());
+    assert!(msg.contains("deleted, replaced, or its directory moved"), "{msg}");
+
+    assert_eq!(running_files(&coord), ["dead.json", "live.json", "stale.json.tmp"]);
+    assert_eq!(
+        std::fs::read_to_string(running_dir(&coord).join("dead.json")).unwrap(),
+        entry_json("*")
+    );
+}
+
+/// An entry that cannot be inspected (here, `running/` became a file) is reported with the error,
+/// not as a move.
+#[cfg(unix)]
+#[test]
+fn unregister_panics_with_the_error_when_the_entry_cannot_be_inspected() {
+    let (_dir, coord) = temp_coord();
+    let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    std::fs::rename(running_dir(&coord), coord.join("running.aside")).unwrap();
+    std::fs::write(running_dir(&coord), "").unwrap();
+
+    let msg = unregister_panic(&mut reg);
+    assert!(
+        msg.contains("failed to inspect")
+            && msg.contains(&format!("{}.json", reg.id()))
+            && msg.contains("Not a directory")
+            && !msg.contains("deleted, replaced"),
+        "{msg}"
+    );
+}
+
+// Directories deleted between creation and locking =====
+
+/// `running/` deleted after `try_register` created it is created again, not a panic.
+#[test]
+fn a_running_dir_deleted_before_the_lock_is_recreated() {
+    let (_dir, coord) = temp_coord();
+    let _hook = set_test_seam_hook(Seam::RunningCreated, {
+        let coord = coord.clone();
+        move || std::fs::remove_dir(running_dir(&coord)).unwrap()
+    });
+    let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
+    reg.unregister();
+}
+
+/// The same for the whole coordination directory.
+#[test]
+fn a_coordination_dir_deleted_before_the_lock_is_recreated() {
+    let (_dir, coord) = temp_coord();
+    let _hook = set_test_seam_hook(Seam::RunningCreated, {
+        let coord = coord.clone();
+        move || std::fs::remove_dir_all(&coord).unwrap()
+    });
+    let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
     reg.unregister();
 }
 

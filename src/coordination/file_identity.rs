@@ -37,14 +37,22 @@ impl FileIdentity {
         })
     }
 
+    /// [`Self::try_of`] for `path` resolved relative to the open directory `dir`, so it names the
+    /// directory `dir` is, not whatever now sits at its path.
+    #[cfg(unix)]
+    pub(super) fn try_of_at(dir: &File, path: &Path) -> io::Result<Self> {
+        let st = rustix::fs::statat(dir, path, rustix::fs::AtFlags::empty())?;
+        // The same widening `std::os::unix::fs::MetadataExt::{dev, ino}` does.
+        #[allow(clippy::unnecessary_cast)]
+        Ok(Self {
+            dev: st.st_dev as u64,
+            ino: st.st_ino as u64,
+        })
+    }
+
     #[cfg(windows)]
     pub(super) fn try_of(path: &Path) -> io::Result<Self> {
         Self::of_file(&File::open(path)?)
-    }
-
-    /// [`Self::try_of`], with the reason dropped.
-    pub(super) fn of(path: &Path) -> Option<Self> {
-        Self::try_of(path).ok()
     }
 
     /// The identity of the file `file` has open, whatever its path now names.

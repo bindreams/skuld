@@ -8,7 +8,7 @@ fn try_of_a_missing_path_reports_not_found() {
         FileIdentity::try_of(&missing).unwrap_err().kind(),
         std::io::ErrorKind::NotFound
     );
-    assert_eq!(FileIdentity::of(&missing), None);
+    assert_eq!(FileIdentity::try_of(&missing).ok(), None);
 }
 
 #[test]
@@ -23,7 +23,10 @@ fn of_file_matches_of_path() {
     let opened_b = std::fs::File::open(&b).unwrap();
 
     let id_a = FileIdentity::of_file(&opened_a).unwrap();
-    assert_eq!(Some(id_a), FileIdentity::of(&a));
-    assert_ne!(Some(id_a), FileIdentity::of(&b));
-    assert_eq!(Some(FileIdentity::of_file(&opened_b).unwrap()), FileIdentity::of(&b));
+    assert_eq!(Some(id_a), FileIdentity::try_of(&a).ok());
+    assert_ne!(Some(id_a), FileIdentity::try_of(&b).ok());
+    assert_eq!(
+        Some(FileIdentity::of_file(&opened_b).unwrap()),
+        FileIdentity::try_of(&b).ok()
+    );
 }
