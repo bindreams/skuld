@@ -11,6 +11,7 @@ All notable changes to this project are documented in this file.
   the same time do not exclude each other. Coordination now lives in `.skuld/`
   next to where `.skuld.db` was (`SKULD_DB_DIR` still names that directory).
   Leftover `.skuld.db*` files are unused and can be deleted.
+- **`LabelFilter::to_sql` is removed.** skuld no longer uses SQL.
 
 ### Fixed
 

@@ -322,21 +322,6 @@ pub(crate) fn matches_expr(expr: &LabelExpr, labels: &[Label]) -> bool {
     expr.evaluate_with(|t: &String| labels.iter().any(|l| l.name() == t))
 }
 
-/// Compile `expr` to a SQL boolean expression over a table `running` (alias `r`) and a table
-/// `labels` (`running_id`, `label`).
-pub(crate) fn to_sql_expr(expr: &LabelExpr) -> String {
-    match expr {
-        Expr::Terminal(name) => {
-            format!("EXISTS (SELECT 1 FROM labels WHERE running_id = r.id AND label = '{name}')")
-        }
-        Expr::Const(true) => "1=1".to_string(),
-        Expr::Const(false) => "1=0".to_string(),
-        Expr::Not(inner) => format!("NOT ({})", to_sql_expr(inner)),
-        Expr::And(a, b) => format!("({} AND {})", to_sql_expr(a), to_sql_expr(b)),
-        Expr::Or(a, b) => format!("({} OR {})", to_sql_expr(a), to_sql_expr(b)),
-    }
-}
-
 /// Write `expr` in human-readable form, adding parentheses only where required
 /// by operator precedence (OR=0, AND=1, NOT/leaf=2).
 fn fmt_expr(expr: &LabelExpr, f: &mut std::fmt::Formatter<'_>, min_prec: u8) -> std::fmt::Result {
@@ -581,15 +566,6 @@ impl LabelFilter {
     /// serialized dump, not live `Label` instances.
     pub fn matches_names(&self, names: &[&str]) -> bool {
         self.expr.evaluate_with(|t: &String| names.contains(&t.as_str()))
-    }
-
-    /// Compile the filter to a SQL boolean expression over a table `running` (alias `r`) and a
-    /// table `labels` (`running_id`, `label`), shaped to drop into:
-    /// ```sql
-    /// SELECT EXISTS (SELECT 1 FROM running r WHERE <result>)
-    /// ```
-    pub fn to_sql(&self) -> String {
-        to_sql_expr(&self.expr)
     }
 
     /// Whether the canonical form of this filter is `Const(true)` — i.e. the
