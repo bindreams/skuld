@@ -21,6 +21,8 @@
 //! step is where it is.
 
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -243,6 +245,43 @@ fn is_os_error(e: &io::Error, code: windows::Win32::Foundation::WIN32_ERROR) -> 
     e.raw_os_error() == Some(code.0 as i32)
 }
 
+#[cfg(windows)]
+impl Entry {
+    /// What the scan makes of a live entry it cannot read, another program holding it open or
+    /// locked: its constraints are unknown, so it blocks every registration, like a global-serial
+    /// test.
+    fn unreadable(path: &Path) -> Self {
+        Self {
+            name: path.display().to_string(),
+            labels: Vec::new(),
+            filter: SERIAL_ALL.to_owned(),
+        }
+    }
+}
+
+/// The warning for the unreadable entry `path`, the first time `warned` sees that path.
+#[cfg(windows)]
+pub(super) fn unreadable_warning_once(warned: &mut HashSet<PathBuf>, path: &Path) -> Option<String> {
+    warned.insert(path.to_owned()).then(|| {
+        format!(
+            "[skuld] warning: another program holds the coordination entry {} open or locked, so every test \
+             waits until it closes it",
+            path.display()
+        )
+    })
+}
+
+/// Print [`unreadable_warning_once`] for `path`, once per path per process.
+#[cfg(windows)]
+fn warn_unreadable(path: &Path) {
+    static WARNED: std::sync::Mutex<Option<HashSet<PathBuf>>> = std::sync::Mutex::new(None);
+
+    let mut warned = WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(warning) = unreadable_warning_once(warned.get_or_insert_with(HashSet::new), path) {
+        eprintln!("{warning}");
+    }
+}
+
 /// Classify `result`, the result of one filesystem attempt on an entry: the scan's probe, an open
 /// for reading with `FILE_SHARE_READ` only (a write handle, which only a live owner has, refuses
 /// it with a sharing violation, so an `Ok` proves there is no owner), or the delete of an entry
@@ -252,7 +291,7 @@ fn is_os_error(e: &io::Error, code: windows::Win32::Foundation::WIN32_ERROR) -> 
 /// still has it open), which `pending` tells, so it is being torn down and gone; or this account
 /// has no permission to the entry, which fails loudly.
 #[cfg(windows)]
-pub(super) fn classify(
+fn classify(
     result: io::Result<()>,
     on_ok: Verdict,
     on_sharing_violation: Verdict,
@@ -283,14 +322,26 @@ pub(super) fn classify(
     }
 }
 
+/// [`classify`] for the probe: no error means nobody has the entry open for writing (`Dead`), a
+/// sharing violation that somebody does (`Live`).
+#[cfg(windows)]
+pub(super) fn classify_probe(result: io::Result<()>, pending: impl FnOnce() -> io::Result<bool>) -> Verdict {
+    classify(result, Verdict::Dead, Verdict::Live, pending)
+}
+
+/// [`classify`] for deleting an entry nobody has open for writing: deleted, or kept open by
+/// another program (a sharing violation), it is `Gone` for this scan.
+#[cfg(windows)]
+pub(super) fn classify_removal(result: io::Result<()>, pending: impl FnOnce() -> io::Result<bool>) -> Verdict {
+    classify(result, Verdict::Gone, Verdict::Gone, pending)
+}
+
 /// Delete the entry `path`, which has no write handle open: its registration closed its hold, or
 /// its owner died. Another program holding it open (an antivirus scanner, say) is not a failure:
 /// the entry is dead all the same and the next scan deletes it.
 #[cfg(windows)]
 fn remove_entry(path: &Path) {
-    let removed = classify(std::fs::remove_file(path), Verdict::Gone, Verdict::Gone, || {
-        crate::win_nt::is_delete_pending(path)
-    });
+    let removed = classify_removal(std::fs::remove_file(path), || crate::win_nt::is_delete_pending(path));
     if let Verdict::Fail(e) = removed {
         or_panic("remove", path, Err::<(), _>(e));
     }
@@ -305,13 +356,13 @@ fn remove_entry(path: &Path) {
 /// (see [`classify`]). An owner's write handle is what makes an entry live, so the entry of a
 /// crashed owner opens and is deleted; a live one is read and parsed.
 ///
-/// Another program may hold an entry open with no sharing, which refuses the probe like an owner
-/// does and refuses the read too. Its constraints are unknown, so it counts as a live
+/// Another program may hold an entry open with no sharing, or lock it, which refuses the probe
+/// like an owner does and refuses the read too. Its constraints are unknown, so it counts as a live
 /// global-serial entry until that program closes it.
 #[cfg(windows)]
 fn read_if_live(path: &Path) -> Option<Entry> {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
+    use windows::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
     use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
     let probe = OpenOptions::new()
@@ -320,17 +371,14 @@ fn read_if_live(path: &Path) -> Option<Entry> {
         .open(path)
         // Closed here, before the delete.
         .map(drop);
-    match classify(probe, Verdict::Dead, Verdict::Live, || {
-        crate::win_nt::is_delete_pending(path)
-    }) {
+    match classify_probe(probe, || crate::win_nt::is_delete_pending(path)) {
         Verdict::Gone => None,
         Verdict::Live => match std::fs::read(path) {
             Ok(bytes) => Some(parse_entry(path, &bytes)),
-            Err(e) if is_os_error(&e, ERROR_SHARING_VIOLATION) => Some(Entry {
-                name: path.display().to_string(),
-                labels: Vec::new(),
-                filter: SERIAL_ALL.to_owned(),
-            }),
+            Err(e) if is_os_error(&e, ERROR_SHARING_VIOLATION) || is_os_error(&e, ERROR_LOCK_VIOLATION) => {
+                warn_unreadable(path);
+                Some(Entry::unreadable(path))
+            }
             Err(e) => or_panic("read", path, Err(e)),
         },
         Verdict::Dead => {
@@ -414,8 +462,7 @@ fn can_start(entries: &[Entry], my_labels: &[Label], my_serial_filter: &str) -> 
 // Registration =====
 
 /// A registered test. [`Self::unregister`] ends it; dropping without it closes the hold, which
-/// marks the entry dead for the next scan: closing the file is the only release, so a forked
-/// child's copy, dropped, cannot release its parent's live entry.
+/// marks the entry dead for the next scan once every fd sharing its lock has closed.
 pub(super) struct Registration {
     coord_dir: PathBuf,
     id: String,

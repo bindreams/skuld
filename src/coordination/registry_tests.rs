@@ -342,14 +342,14 @@ fn register_with_uses_ids_from_its_generator() {
 #[cfg(windows)]
 #[test]
 fn filesystem_results_are_classified() {
-    use super::registry::{classify, Verdict};
+    use super::registry::{classify_probe, classify_removal, Verdict};
 
     let os = io::Error::from_raw_os_error;
     let not_found = || io::Error::from(io::ErrorKind::NotFound);
     let unreached = || -> io::Result<bool> { panic!("the delete-pending check is only for a denied attempt") };
     type Attempt = dyn Fn(io::Result<()>, &dyn Fn() -> io::Result<bool>) -> Verdict;
-    let probe: &Attempt = &|result, pending| classify(result, Verdict::Dead, Verdict::Live, pending);
-    let removal: &Attempt = &|result, pending| classify(result, Verdict::Gone, Verdict::Gone, pending);
+    let probe: &Attempt = &|result, pending| classify_probe(result, pending);
+    let removal: &Attempt = &|result, pending| classify_removal(result, pending);
 
     assert!(matches!(probe(Ok(()), &unreached), Verdict::Dead));
     assert!(matches!(removal(Ok(()), &unreached), Verdict::Gone));
@@ -378,6 +378,54 @@ fn filesystem_results_are_classified() {
         };
         assert!(e.to_string().contains("os error 123"), "{e}");
     }
+}
+
+/// Another program that locks the whole of a running test's entry (`LockFileEx`, which is mandatory
+/// on Windows) makes the scan's read fail with a lock violation. As with a sharing violation, the
+/// entry's constraints are unknown, so it blocks every registration for now rather than panicking.
+#[cfg(windows)]
+#[test]
+fn a_locked_running_entry_blocks_every_registration() {
+    let (_dir, coord) = temp_coord();
+    let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    let entry = running_dir(&coord).join(format!("{}.json", reg.id()));
+    let other_program = std::fs::OpenOptions::new().read(true).open(&entry).unwrap();
+    other_program.lock().unwrap();
+
+    assert!(
+        attempt(&coord, "u", &[], SERIAL_NONE).is_none(),
+        "an entry that cannot be read blocks even a non-serial test"
+    );
+
+    other_program.unlock().unwrap();
+    drop(other_program);
+    assert!(
+        can_start_now(&coord, &[], SERIAL_NONE),
+        "readable again, it blocks nothing"
+    );
+    reg.unregister();
+}
+
+/// The warning for an entry that cannot be read is printed once per path, and names the file and
+/// what to do about it.
+#[cfg(windows)]
+#[test]
+fn the_unreadable_entry_warning_is_once_per_path() {
+    use super::registry::unreadable_warning_once;
+    use std::collections::HashSet;
+
+    let mut warned = HashSet::new();
+    let (a, b) = (Path::new(r"C:\x\a.json"), Path::new(r"C:\x\b.json"));
+    let first = unreadable_warning_once(&mut warned, a).expect("the first time warns");
+    assert!(
+        first.starts_with("[skuld] warning:") && first.contains(r"C:\x\a.json") && first.contains("every test waits"),
+        "{first}"
+    );
+    assert!(
+        unreadable_warning_once(&mut warned, a).is_none(),
+        "not twice for one path"
+    );
+    assert!(unreadable_warning_once(&mut warned, b).is_some(), "another path warns");
 }
 
 /// Another program holding an entry open with share mode 0 (no sharing at all) refuses the scan's
