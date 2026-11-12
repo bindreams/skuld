@@ -28,7 +28,6 @@
 //! leaves the mutex held, so it panics too (see [`report_unlock_failure`]).
 
 use super::file_identity::FileIdentity;
-use super::skuld_debug_eprintln;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -78,14 +77,17 @@ impl<'a> GlobalLockHeld<'a> {
     /// identity recorded at acquisition. On Windows, withholding `FILE_SHARE_DELETE` stops the lock
     /// file itself being deleted or renamed, but not a symlink or junction ancestor being
     /// retargeted.
+    ///
+    /// Nothing at the path is a split too. Any other failure to inspect it panics with the error.
     pub(super) fn target_has_split(&self) -> bool {
         let lock = lock_path(self.coord_dir);
         match FileIdentity::try_of(&lock) {
             Ok(fresh) => fresh != self.target_identity,
-            Err(e) => {
-                skuld_debug_eprintln!("global lock target {lock:?} could not be inspected, treating as split: {e}");
-                true
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => panic!(
+                "skuld: failed to inspect the global lock {lock:?}: {e} ({})",
+                super::DB_DIR_HINT
+            ),
         }
     }
 }
@@ -101,7 +103,7 @@ pub(super) fn with_global_lock<T>(coord_dir: &Path, f: impl FnOnce(&GlobalLockHe
 /// panics, so the caller can lock it again later without opening anything. A registration holds
 /// its `target` for that, because a test that has used up its file descriptors must still be able
 /// to unregister. `target` must not be locked already. An unlock that fails panics after `f`
-/// returns, since the mutex stays held; see [`report_unlock_failure`].
+/// returns; see [`report_unlock_failure`].
 pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnOnce(&GlobalLockHeld<'_>) -> T) -> T {
     lock_exclusive(target).unwrap_or_else(|e| {
         panic!(
@@ -152,12 +154,12 @@ pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnO
     result
 }
 
-/// What a failed unlock of `coord_dir`'s mutex means: it stays held (a registration keeps the
-/// target open), so every other test waits. Panics saying so, unless `unwinding`, when a second
-/// panic would abort the process: then it only warns.
+/// Report a failed unlock of `coord_dir`'s mutex: a panic, like any I/O failure, unless
+/// `unwinding`, when a second panic would abort the process: then a warning. Either way the lock is
+/// released when its handle closes.
 pub(super) fn report_unlock_failure(coord_dir: &Path, e: &std::io::Error, unwinding: bool) {
     let message = format!(
-        "failed to unlock the global lock {:?}, so other tests wait until this process exits: {e} ({})",
+        "failed to unlock the global lock {:?}: {e} ({})",
         lock_path(coord_dir),
         super::DB_DIR_HINT
     );
@@ -264,9 +266,16 @@ pub(super) fn lock_exclusive(target: &File) -> std::io::Result<()> {
 /// Release `target`'s lock now, ahead of closing it. Closing alone releases it too, but Windows
 /// documents the release on close as taking "available system resources" to happen, so a holder
 /// whose release others wait on unlocks first.
+///
+/// Retries on `EINTR`, uncapped, as [`lock_exclusive`] does.
 #[cfg(unix)]
 pub(super) fn unlock(target: &File) -> std::io::Result<()> {
-    rustix::fs::flock(target, rustix::fs::FlockOperation::Unlock).map_err(Into::into)
+    loop {
+        match rustix::fs::flock(target, rustix::fs::FlockOperation::Unlock) {
+            Err(rustix::io::Errno::INTR) => continue,
+            result => return result.map_err(Into::into),
+        }
+    }
 }
 
 /// See the Unix variant.

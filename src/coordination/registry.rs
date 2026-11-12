@@ -608,28 +608,12 @@ enum Cause {
     NoRunning(io::Error),
 }
 
-/// A pass that was cut short by `cause`, having opened the mutex target of identity `seen`.
-struct Interrupted {
-    seen: Option<FileIdentity>,
-    cause: Cause,
-}
-
-impl Interrupted {
-    fn give_up(self, coord_dir: &Path, running: &Path) -> ! {
-        match self.cause {
-            Cause::Split => panic!("{}", moved_message(coord_dir, None, "registering a test")),
-            Cause::NoRunning(e) => panic!("skuld: failed to list {running:?}: {e} ({DB_DIR_HINT})"),
-        }
-    }
-}
-
 /// One attempt, under the mutex: `Some` if the test can start (now registered), `None` if it
 /// must wait.
 ///
 /// A directory deleted or replaced after this call made it, before anything is written, is made
-/// again and the attempt repeated, without a cap. It fails with the cause instead when a retry
-/// cannot do better: `running/` names something that is not a directory and cannot become one
-/// (a dangling symlink), or the same mutex target split on two passes in a row.
+/// again and the attempt repeated, without a cap. It fails instead when a retry cannot do better:
+/// `running/` names something that is not a directory and cannot become one (a dangling symlink).
 pub(super) fn try_register(
     ids: &IdGenerator,
     coord_dir: &Path,
@@ -638,7 +622,6 @@ pub(super) fn try_register(
     storage_filter: &str,
 ) -> Option<Registration> {
     let running = running_dir(coord_dir);
-    let mut previous_split: Option<FileIdentity> = None;
     loop {
         or_panic(
             "create the coordination directory",
@@ -649,19 +632,10 @@ pub(super) fn try_register(
         test_hooks::run_seam(Seam::RunningCreated);
         match register_pass(ids, coord_dir, &running, name, labels, storage_filter) {
             Ok(registered) => return registered,
-            Err(interrupted) => {
-                let permanent = match interrupted.cause {
-                    Cause::NoRunning(_) => is_dangling(&running),
-                    Cause::Split => interrupted.seen.is_some() && interrupted.seen == previous_split,
-                };
-                if permanent {
-                    interrupted.give_up(coord_dir, &running);
-                }
-                previous_split = match interrupted.cause {
-                    Cause::Split => interrupted.seen,
-                    Cause::NoRunning(_) => None,
-                };
+            Err(Cause::NoRunning(e)) if is_dangling(&running) => {
+                panic!("skuld: failed to list {running:?}: {e} ({DB_DIR_HINT})")
             }
+            Err(Cause::Split | Cause::NoRunning(_)) => {}
         }
     }
 }
@@ -680,16 +654,12 @@ fn register_pass(
     name: &str,
     labels: &[Label],
     storage_filter: &str,
-) -> Result<Option<Registration>, Interrupted> {
+) -> Result<Option<Registration>, Cause> {
     let Some(mutex_target) = open_lock_target_if_present(coord_dir) else {
-        return Err(Interrupted {
-            seen: None,
-            cause: Cause::Split,
-        });
+        return Err(Cause::Split);
     };
     #[cfg(test)]
     test_hooks::run_seam(Seam::TargetOpened);
-    let seen = FileIdentity::of_file(&mutex_target).ok();
     let started = with_locked_target(coord_dir, &mutex_target, |held| {
         if held.target_has_split() {
             return Err(Cause::Split);
@@ -706,17 +676,13 @@ fn register_pass(
         }
         Ok(Some(publish(held, ids, name, labels, storage_filter)))
     });
-    match started {
-        Ok(Some((id, hold, entry_identity))) => Ok(Some(Registration {
-            coord_dir: coord_dir.to_path_buf(),
-            id,
-            hold: Some(hold),
-            entry_identity,
-            mutex_target,
-        })),
-        Ok(None) => Ok(None),
-        Err(cause) => Err(Interrupted { seen, cause }),
-    }
+    Ok(started?.map(|(id, hold, entry_identity)| Registration {
+        coord_dir: coord_dir.to_path_buf(),
+        id,
+        hold: Some(hold),
+        entry_identity,
+        mutex_target,
+    }))
 }
 
 /// Create, hold and publish the entry, returning its id, held file and that file's identity. The
