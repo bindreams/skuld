@@ -31,8 +31,10 @@ All notable changes to this project are documented in this file.
 - **A running test is one file, `.skuld/running/<id>.json`.** On Unix a test is
   alive while it holds a lock on its entry; on Windows, while it holds a write
   handle on it, which also stops the entry being deleted. A crashed test's entry
-  is removed by the next test to look; on Windows, an entry that another account
-  may not delete fails the run, naming the path.
+  is removed by the next test to look. On Windows, accounts sharing the directory
+  must be able to read and delete each other's files in it, or the run fails
+  naming the file, and another program holding a running or dead test's entry
+  open can delay other tests until it closes it.
 - **The `skuld` crate needs no C compiler to build or cross-compile.** The
   bundled SQLite (`rusqlite`) is gone, so musl and other targets without a C
   toolchain build it.
