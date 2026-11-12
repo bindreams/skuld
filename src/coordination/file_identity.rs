@@ -26,20 +26,25 @@ pub(super) struct FileIdentity {
 }
 
 impl FileIdentity {
-    /// `None` means nothing resolvable exists at `path` right now, which is as
-    /// much "moved" as a mismatched identity.
+    /// `Err` means nothing resolvable exists at `path` right now (or it cannot be inspected),
+    /// which is as much "moved" as a mismatched identity.
     #[cfg(unix)]
-    pub(super) fn of(path: &Path) -> Option<Self> {
+    pub(super) fn try_of(path: &Path) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).ok().map(|m| Self {
+        std::fs::metadata(path).map(|m| Self {
             dev: m.dev(),
             ino: m.ino(),
         })
     }
 
     #[cfg(windows)]
+    pub(super) fn try_of(path: &Path) -> io::Result<Self> {
+        Self::of_file(&File::open(path)?)
+    }
+
+    /// [`Self::try_of`], with the reason dropped.
     pub(super) fn of(path: &Path) -> Option<Self> {
-        Self::of_file(&File::open(path).ok()?).ok()
+        Self::try_of(path).ok()
     }
 
     /// The identity of the file `file` has open, whatever its path now names.

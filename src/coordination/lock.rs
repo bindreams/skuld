@@ -62,14 +62,14 @@ impl<'a> GlobalLockHeld<'a> {
     /// file itself being deleted or renamed, but not a symlink or junction ancestor being
     /// retargeted.
     pub(super) fn target_has_split(&self) -> bool {
-        let fresh = FileIdentity::of(&lock_path(self.coord_dir));
-        if fresh.is_none() {
-            skuld_debug_eprintln!(
-                "global lock target {:?} could not be inspected, treating as split",
-                lock_path(self.coord_dir)
-            );
+        let lock = lock_path(self.coord_dir);
+        match FileIdentity::try_of(&lock) {
+            Ok(fresh) => fresh != self.target_identity,
+            Err(e) => {
+                skuld_debug_eprintln!("global lock target {lock:?} could not be inspected, treating as split: {e}");
+                true
+            }
         }
-        fresh != Some(self.target_identity)
     }
 }
 

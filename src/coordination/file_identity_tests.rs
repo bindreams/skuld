@@ -1,6 +1,17 @@
 use super::file_identity::FileIdentity;
 
 #[test]
+fn try_of_a_missing_path_reports_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+    assert_eq!(
+        FileIdentity::try_of(&missing).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_eq!(FileIdentity::of(&missing), None);
+}
+
+#[test]
 fn of_file_matches_of_path() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a");
