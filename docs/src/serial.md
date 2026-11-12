@@ -49,7 +49,7 @@ Labels used in serial expressions must be `Label` constants in scope (defined wi
 
 Serial tests are coordinated through OS file locks in a `.skuld/` directory, automatically managed by skuld. This works across multiple test processes — if two test binaries run concurrently, their serial constraints are respected across process boundaries.
 
-`.skuld/` holds a global lock and `running/`, which has two files per running test: `<id>.lock`, which the test holds for as long as it runs, and `<id>.json`, which records its name, labels and serial filter. A test that must wait holds nothing. The kernel releases a lock when its owner dies, so a crashed test never blocks others; the next test to look removes its leftover files.
+`.skuld/` holds a global lock and `running/`, which has one file per running test: `<id>.json`, which records its name, labels and serial filter, and which the test keeps held (locked on Unix, open on Windows) for as long as it runs. A test that must wait holds nothing. The kernel releases the hold when its owner dies, so a crashed test never blocks others; the next test to look removes its leftover file.
 
 `.skuld/` is created inside a directory located at run time from the test executable's path, so a moved or archived test binary keeps working:
 
@@ -59,13 +59,13 @@ Serial tests are coordinated through OS file locks in a `.skuld/` directory, aut
 
 Only binaries that resolve to the same directory coordinate with each other, and every run sharing a `SKULD_DB_DIR` shares coordination, including unrelated workspaces. A skuld that coordinated through SQLite (0.6.0 and earlier) does not coordinate with this one; see the upgrade note in the changelog. The directory must exist and be readable and writable (for example, not a read-only mount); otherwise the run panics naming the directory and `SKULD_DB_DIR`. Directories skuld creates for `SKULD_DB_DIR` are published atomically at mode 0777, whatever the umask. Skuld never falls back to per-process coordination.
 
-On Unix, `.skuld/` and `running/` are mode 0777 and the files in them 0644, whatever the umask, so runs under several uids can share one directory.
+On Unix, `.skuld/` and `running/` are mode 0777 and the entries in them 0644, whatever the umask, so runs under several uids can share one directory.
 
 ### Moving or deleting `.skuld/` during a run
 
 Deleting or replacing `.skuld/` while tests run is prevented on Windows and only detected on Unix:
 
-- **Windows:** a running test's lock file cannot be deleted, so deleting the directory (for example `cargo clean`) fails while tests run. If its `.json` entry is deleted anyway, other tests wait until that test ends, and the run then fails.
+- **Windows:** a running test's entry cannot be deleted, so deleting the directory (for example `cargo clean`) fails while tests run.
 - **Unix:** if `.skuld/` or `running/` is deleted or replaced mid-run, each test registered in the old copy panics when it finishes, which fails the run. Until then, tests that start in the new copy do not see the old ones and may run alongside them.
 - **Not detected:** a deliberate swap that is restored before a test next checks.
 

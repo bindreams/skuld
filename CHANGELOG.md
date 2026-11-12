@@ -22,16 +22,15 @@ All notable changes to this project are documented in this file.
 ### Changed
 
 - **Deleting or replacing `.skuld/` mid-run is prevented on Windows and only
-  detected on Unix.** On Windows, a running test's `.lock` cannot be deleted,
-  so deleting the directory fails while tests run; if its `.json` is deleted
-  anyway, other tests wait until it ends and the run then fails. On Unix, each
+  detected on Unix.** On Windows, a running test's entry (`.skuld/running/<id>.json`)
+  cannot be deleted, so deleting the directory fails while tests run. On Unix, each
   test registered in the old copy panics when it finishes, which fails the run;
   tests that start in the new copy meanwhile may run alongside the old ones. A
   deliberate swap that is restored before a test next checks is not detected.
 - **The `skuld` crate needs no C compiler to build or cross-compile.** The
   bundled SQLite (`rusqlite`) is gone, so musl and other targets without a C
   toolchain build it.
-- **On Unix, `.skuld/` and `running/` are mode 0777 and the files in them 0644**,
+- **On Unix, `.skuld/` and `running/` are mode 0777 and the entries in them 0644**,
   whatever the umask, so runs under several uids can share one directory.
 
 ## [0.6.0] - 2026-10-01
