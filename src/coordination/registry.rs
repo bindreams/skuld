@@ -136,8 +136,8 @@ fn moved_message(coord_dir: &Path, entry: Option<&Path>, doing: &str, inspect_er
         ),
         Some(e) => format!(
             "skuld: the coordination directory {coord_dir:?} could not be checked while {doing}: \
-             inspecting the mutex's target failed: {e}. If {lost} was deleted, replaced, or its directory \
-             moved, {consequence} ({DB_DIR_HINT})"
+             inspecting the mutex's target {:?} failed: {e} ({DB_DIR_HINT})",
+            super::lock::lock_path(coord_dir)
         ),
     }
 }
@@ -259,8 +259,8 @@ fn entry_identity(held: &GlobalLockHeld<'_>, name: &str) -> io::Result<FileIdent
 }
 
 /// Panic, saying the coordination directory moved while `doing`, if the mutex has split or
-/// `running/<name>` is no longer the file `identity` was taken of. An entry that cannot be
-/// inspected for any other reason panics with that error.
+/// `running/<name>` is no longer the file `identity` was taken of. A mutex target or entry that
+/// cannot be inspected for any other reason panics with that error.
 fn assert_unmoved(held: &GlobalLockHeld<'_>, name: &str, identity: FileIdentity, doing: &str) {
     let path = entry_file(held, name);
     assert_not_split(held, Some(&path), doing);

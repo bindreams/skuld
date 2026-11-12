@@ -28,7 +28,7 @@ All notable changes to this project are documented in this file.
   cannot be deleted, so deleting the directory fails while tests run. On Unix, each
   test registered in the old copy panics when it finishes, which fails the run;
   tests that start in the new copy meanwhile may run alongside the old ones. On
-  both, a test registering at that moment panics, naming the directory. A
+  both, a test starting to register at that moment may panic, naming the directory. A
   deliberate swap that is restored before a test next checks is not detected.
 - **A running test is one file, `.skuld/running/<id>.json`.** On Unix a test is
   alive while it holds a lock on its entry; on Windows, while it holds a write

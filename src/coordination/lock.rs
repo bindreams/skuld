@@ -76,10 +76,14 @@ impl<'a> GlobalLockHeld<'a> {
     /// file itself being deleted or renamed, but not a symlink or junction ancestor being
     /// retargeted.
     ///
-    /// `Err` if the path could not be inspected: a caller treats that as a split too, since it
-    /// cannot show otherwise, and reports the error.
+    /// Nothing at the path is a split. `Err` if the path could not be inspected for another reason:
+    /// the caller cannot show the lock is intact, so it fails, reporting the error.
     pub(super) fn target_has_split(&self) -> std::io::Result<bool> {
-        Ok(FileIdentity::try_of(&lock_path(self.coord_dir))? != self.target_identity)
+        match FileIdentity::try_of(&lock_path(self.coord_dir)) {
+            Ok(fresh) => Ok(fresh != self.target_identity),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e),
+        }
     }
 }
 

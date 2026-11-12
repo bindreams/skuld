@@ -1044,7 +1044,10 @@ fn a_directory_replaced_before_the_lock_is_taken_panics_naming_the_move() {
     let (_dir, coord, retarget) = linked_coord();
     let _hook = set_test_seam_hook(Seam::TargetOpened, retarget);
     let msg = attempt_panic(&coord);
-    assert!(msg.contains("deleted, replaced, or its directory moved"), "{msg}");
+    assert!(
+        msg.contains(" moved while registering") && msg.contains("deleted, replaced, or its directory moved"),
+        "{msg}"
+    );
 }
 
 /// A mutex target that cannot be inspected fails the check naming the error, without claiming
@@ -1070,7 +1073,10 @@ fn an_uninspectable_mutex_target_fails_unregistration_naming_the_error() {
     let payload = payload.expect("an uninspectable mutex target must panic");
     let msg = crate::coordination::panic_payload_message(payload.as_ref());
     assert!(
-        msg.contains("could not be checked") && msg.contains("Permission denied") && msg.contains("SKULD_DB_DIR"),
+        msg.contains("could not be checked")
+            && msg.contains("Permission denied")
+            && msg.contains("SKULD_DB_DIR")
+            && !msg.contains("moved"),
         "{msg}"
     );
 }

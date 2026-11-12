@@ -300,14 +300,14 @@ fn open_lock_target_rejects_a_relative_path() {
 
 #[cfg(unix)]
 #[test]
-fn a_deleted_lock_target_cannot_be_inspected() {
+fn a_deleted_lock_target_reads_as_a_split() {
     let tmp = crate::TempDir::new().unwrap();
     let dir = tmp.path().join("d");
     std::fs::create_dir(&dir).unwrap();
     with_global_lock(&dir, |held| {
         assert!(!held.target_has_split().unwrap());
         std::fs::remove_dir(&dir).unwrap();
-        assert!(held.target_has_split().is_err());
+        assert!(held.target_has_split().unwrap());
     });
 }
 

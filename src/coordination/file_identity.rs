@@ -26,8 +26,8 @@ pub(super) struct FileIdentity {
 }
 
 impl FileIdentity {
-    /// `Err` means nothing resolvable exists at `path` right now (or it cannot be inspected),
-    /// which is as much "moved" as a mismatched identity.
+    /// `Err` with `NotFound` means nothing exists at `path` right now; any other `Err`, that it
+    /// cannot be inspected.
     #[cfg(unix)]
     pub(super) fn try_of(path: &Path) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
