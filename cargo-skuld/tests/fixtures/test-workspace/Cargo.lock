@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "skuld"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "boolean_expression",
  "clap",
@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "skuld-macros"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proc-macro2",
  "quote",
