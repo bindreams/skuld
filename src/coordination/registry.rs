@@ -44,7 +44,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::file_identity::FileIdentity;
 #[cfg(unix)]
 use super::lock::{lock_exclusive, try_lock_exclusive};
-use super::lock::{open_lock_target_if_present, with_locked_target, GlobalLockHeld};
+use super::lock::{open_lock_target, with_locked_target, GlobalLockHeld};
 use super::{skuld_debug_eprintln, DB_DIR_HINT, SERIAL_ALL, SERIAL_NONE};
 use crate::label::{Label, LabelFilter};
 
@@ -121,16 +121,34 @@ fn or_panic<T, P: AsRef<Path>>(action: &str, path: impl FnOnce() -> P, result: i
     result.unwrap_or_else(|e| panic!("skuld: failed to {action} {:?}: {e} ({DB_DIR_HINT})", path().as_ref()))
 }
 
-/// `entry` is the registration's entry, when there is one yet.
-fn moved_message(coord_dir: &Path, entry: Option<&Path>, doing: &str) -> String {
+/// `entry` is the registration's entry, when there is one yet; `inspect_error`, why the mutex's
+/// target could not be inspected, when it could not.
+fn moved_message(coord_dir: &Path, entry: Option<&Path>, doing: &str, inspect_error: Option<&io::Error>) -> String {
     let lost = match entry {
         Some(entry) => format!("the mutex's target or the entry {entry:?}"),
         None => "the mutex's target".to_owned(),
     };
+    let (moved, why) = match inspect_error {
+        Some(e) => (
+            "moved or could not be inspected",
+            format!(" (inspecting the mutex's target failed: {e})"),
+        ),
+        None => ("moved", String::new()),
+    };
     format!(
-        "skuld: the coordination directory {coord_dir:?} moved while {doing}: {lost} was deleted, replaced, \
-         or its directory moved, so the mutex or the entries no longer guard what other tests see ({DB_DIR_HINT})"
+        "skuld: the coordination directory {coord_dir:?} {moved} while {doing}{why}: {lost} was deleted, \
+         replaced, or its directory moved, so the mutex or the entries no longer guard what other tests \
+         see ({DB_DIR_HINT})"
     )
+}
+
+/// Panic with [`moved_message`] if the mutex has split, or its target cannot be inspected.
+fn assert_not_split(held: &GlobalLockHeld<'_>, entry: Option<&Path>, doing: &str) {
+    match held.target_has_split() {
+        Ok(false) => {}
+        Ok(true) => panic!("{}", moved_message(held.coord_dir(), entry, doing, None)),
+        Err(e) => panic!("{}", moved_message(held.coord_dir(), entry, doing, Some(&e))),
+    }
 }
 
 // Warnings =====
@@ -244,15 +262,15 @@ fn entry_identity(held: &GlobalLockHeld<'_>, name: &str) -> io::Result<FileIdent
 /// `running/<name>` is no longer the file `identity` was taken of. An entry that cannot be
 /// inspected for any other reason panics with that error.
 fn assert_unmoved(held: &GlobalLockHeld<'_>, name: &str, identity: FileIdentity, doing: &str) {
-    let moved = held.target_has_split()
-        || match entry_identity(held, name) {
-            Ok(now) => now != identity,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => true,
-            Err(e) => or_panic("inspect", || entry_file(held, name), Err::<bool, _>(e)),
-        };
+    let path = || entry_file(held, name);
+    assert_not_split(held, Some(&path()), doing);
+    let moved = match entry_identity(held, name) {
+        Ok(now) => now != identity,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+        Err(e) => or_panic("inspect", path, Err::<bool, _>(e)),
+    };
     if moved {
-        let path = entry_file(held, name);
-        panic!("{}", moved_message(held.coord_dir(), Some(&path), doing));
+        panic!("{}", moved_message(held.coord_dir(), Some(&path()), doing, None));
     }
 }
 
@@ -599,28 +617,15 @@ impl Registration {
     }
 }
 
-/// Why a registration pass, which has written nothing yet, found the directories not as it had
-/// just made them.
-enum Cause {
-    /// The mutex target is gone, or `coord_dir` now names another directory.
-    Split,
-    /// `running/` is gone (the error is `NotFound`).
-    NoRunning(io::Error),
-}
-
-/// What one registration attempt came to.
-enum Attempt {
-    Registered(Registration),
-    /// Another test's constraints keep this one from starting now.
-    Blocked,
-    /// The directories changed after this attempt made them, before it wrote anything. The next
-    /// attempt makes them again.
-    Interrupted,
-}
-
-/// One attempt, under the mutex. Panics if `running/` names something that cannot become a
-/// directory (a dangling symlink), which no later attempt can fix.
-fn attempt(ids: &IdGenerator, coord_dir: &Path, name: &str, labels: &[Label], storage_filter: &str) -> Attempt {
+/// One attempt, under the mutex: `Some` if the test can start (now registered), `None` if other
+/// tests block it. Panics if the coordination directory moved or cannot be used.
+pub(super) fn try_register(
+    ids: &IdGenerator,
+    coord_dir: &Path,
+    name: &str,
+    labels: &[Label],
+    storage_filter: &str,
+) -> Option<Registration> {
     let running = running_dir(coord_dir);
     or_panic(
         "create the coordination directory",
@@ -629,76 +634,23 @@ fn attempt(ids: &IdGenerator, coord_dir: &Path, name: &str, labels: &[Label], st
     );
     #[cfg(test)]
     test_hooks::run_seam(Seam::RunningCreated);
-    match register_pass(ids, coord_dir, &running, name, labels, storage_filter) {
-        Ok(Some(registration)) => Attempt::Registered(registration),
-        Ok(None) => Attempt::Blocked,
-        Err(Cause::NoRunning(e)) if is_dangling(&running) => {
-            panic!("skuld: failed to list {running:?}: {e} ({DB_DIR_HINT})")
-        }
-        Err(Cause::Split | Cause::NoRunning(_)) => Attempt::Interrupted,
-    }
-}
-
-/// One attempt: `Some` if the test can start (now registered), `None` if other tests block it.
-/// Panics if the directories changed under it, which a test of blocking must not mistake for one.
-#[cfg(test)]
-pub(super) fn try_register(
-    ids: &IdGenerator,
-    coord_dir: &Path,
-    name: &str,
-    labels: &[Label],
-    storage_filter: &str,
-) -> Option<Registration> {
-    match attempt(ids, coord_dir, name, labels, storage_filter) {
-        Attempt::Registered(registration) => Some(registration),
-        Attempt::Blocked => None,
-        Attempt::Interrupted => panic!("the coordination directory changed during the attempt"),
-    }
-}
-
-/// `path` names something (a symlink, say) that does not resolve to a directory, so creating the
-/// directory there cannot succeed. Nothing at `path` is not dangling: it can be made.
-fn is_dangling(path: &Path) -> bool {
-    path.symlink_metadata().is_ok() && !path.is_dir()
-}
-
-/// [`attempt`] on directories that were in place a moment ago.
-fn register_pass(
-    ids: &IdGenerator,
-    coord_dir: &Path,
-    running: &Path,
-    name: &str,
-    labels: &[Label],
-    storage_filter: &str,
-) -> Result<Option<Registration>, Cause> {
-    let Some(mutex_target) = open_lock_target_if_present(coord_dir) else {
-        return Err(Cause::Split);
-    };
+    let mutex_target = open_lock_target(coord_dir);
     #[cfg(test)]
     test_hooks::run_seam(Seam::TargetOpened);
     let started = with_locked_target(coord_dir, &mutex_target, |held| {
-        if held.target_has_split() {
-            return Err(Cause::Split);
-        }
+        assert_not_split(held, None, "registering a test");
         #[cfg(test)]
         test_hooks::run_seam(Seam::Scanning);
-        let entries = match scan(held) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Cause::NoRunning(e)),
-            Err(e) => or_panic("list", || running, Err(e)),
-        };
-        if !can_start(&entries, labels, storage_filter) {
-            return Ok(None);
-        }
-        Ok(Some(publish(held, ids, name, labels, storage_filter)))
+        let entries = or_panic("list", || &running, scan(held));
+        can_start(&entries, labels, storage_filter).then(|| publish(held, ids, name, labels, storage_filter))
     });
-    Ok(started?.map(|(id, hold, entry_identity)| Registration {
+    started.map(|(id, hold, entry_identity)| Registration {
         coord_dir: coord_dir.to_path_buf(),
         id,
         hold: Some(hold),
         entry_identity,
         mutex_target,
-    }))
+    })
 }
 
 /// Create, hold and publish the entry, returning its id, held file and that file's identity. The
@@ -735,48 +687,34 @@ pub(super) fn register_with(
     labels: &[Label],
     storage_filter: &str,
 ) -> Registration {
-    let min_backoff = Duration::from_millis(10);
-    let mut backoff = min_backoff;
+    let mut backoff = Duration::from_millis(10);
     let max_backoff = Duration::from_millis(200);
     let warn_after = Duration::from_secs(60);
     let started = Instant::now();
     let mut warned = false;
     let mut logged_first_wait = false;
-    let mut logged_interrupted = false;
 
     loop {
-        let wait = match attempt(ids, coord_dir, name, labels, storage_filter) {
-            Attempt::Registered(registration) => return registration,
-            // Retried soon: the backoff paces waiting on other tests, which this was not.
-            Attempt::Interrupted => {
-                if !logged_interrupted {
-                    logged_interrupted = true;
-                    skuld_debug_eprintln!("coordination: {coord_dir:?} changed while {name} registered; trying again");
-                }
-                min_backoff
-            }
-            Attempt::Blocked => {
-                if !logged_first_wait {
-                    logged_first_wait = true;
-                    skuld_debug_eprintln!(
-                        "coordination: {name} is blocked on a serial constraint and will wait \
-                         (if this run used a generated nextest tool-config-file, this means \
-                         nextest scheduled it concurrently with a conflicting test anyway — the \
-                         config may be stale; re-run `cargo skuld nextest gen --check`)"
-                    );
-                }
-                let wait = backoff;
-                backoff = (backoff * 2).min(max_backoff);
-                wait
-            }
-        };
+        if let Some(registration) = try_register(ids, coord_dir, name, labels, storage_filter) {
+            return registration;
+        }
         #[cfg(test)]
         test_hooks::signal_retry();
+        if !logged_first_wait {
+            logged_first_wait = true;
+            skuld_debug_eprintln!(
+                "coordination: {name} is blocked on a serial constraint and will wait \
+                 (if this run used a generated nextest tool-config-file, this means \
+                 nextest scheduled it concurrently with a conflicting test anyway — the \
+                 config may be stale; re-run `cargo skuld nextest gen --check`)"
+            );
+        }
         if !warned && started.elapsed() > warn_after {
             warned = true;
-            skuld_debug_eprintln!("coordination: {name} has been waiting >60s to register");
+            skuld_debug_eprintln!("coordination: {name} has been waiting >60s for serial constraints");
         }
-        std::thread::sleep(wait);
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(max_backoff);
     }
 }
 

@@ -11,7 +11,7 @@ use super::lock::lock_exclusive;
 use super::lock::{open_lock_target, try_lock_exclusive};
 use super::registry::{register, register_with, running_dir, try_register, IdGenerator, Registration, PROCESS_IDS};
 use super::rendezvous::rendezvous;
-use super::test_hooks::{retry_rendezvous, set_test_retry_hook, set_test_seam_hook, Seam, SeamHookGuard};
+use super::test_hooks::{retry_rendezvous, set_test_retry_hook, set_test_seam_hook, Seam};
 use super::{SERIAL_ALL, SERIAL_NONE};
 use crate::label::Label;
 
@@ -1011,90 +1011,72 @@ fn unregister_panics_with_the_error_when_the_entry_cannot_be_inspected() {
     );
 }
 
-// Directories deleted between creation and locking =====
+// Directories changed between creation and locking =====
 
-/// `running/` deleted after an attempt created it is made again by the next attempt, not a panic.
+/// What `attempt` panicked with.
+fn attempt_panic(coord: &Path) -> String {
+    let payload = std::panic::catch_unwind(|| attempt(coord, "t", &[], SERIAL_NONE))
+        .err()
+        .expect("the attempt must panic");
+    crate::coordination::panic_payload_message(payload.as_ref()).to_owned()
+}
+
+/// `running/` deleted after the attempt created it: only something outside skuld does that, so
+/// the attempt fails naming the directory instead of registering where other tests may not look.
 #[test]
-fn a_running_dir_deleted_before_the_lock_is_recreated() {
+fn a_running_dir_deleted_before_the_lock_panics_naming_it() {
     let (_dir, coord) = temp_coord();
     let _hook = set_test_seam_hook(Seam::RunningCreated, {
         let coord = coord.clone();
         move || std::fs::remove_dir(running_dir(&coord)).unwrap()
     });
-    let mut reg = register(&coord, "t", &[], SERIAL_NONE);
-    assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
-    reg.unregister();
+    let msg = attempt_panic(&coord);
+    assert!(
+        msg.contains(&format!("{:?}", running_dir(&coord))) && msg.contains("SKULD_DB_DIR"),
+        "{msg}"
+    );
 }
 
-/// A `running/` that existed and is deleted on several passes in a row is made again each time,
-/// with no cap, and the test registers once the deletions stop.
+/// A coordination directory replaced between opening the mutex target and locking it panics
+/// naming the move, as a split anywhere else does.
 #[test]
-fn a_running_dir_deleted_on_consecutive_passes_is_recreated_each_time() {
-    use std::{cell::Cell, rc::Rc};
-
-    /// Delete `running/` at the next `RunningCreated`, re-arming until `left` deletions are done.
-    /// A re-armed hook's guard is forgotten; the test's guard clears the slot at its end.
-    fn delete_running(coord: PathBuf, left: usize, done: Rc<Cell<usize>>) -> SeamHookGuard {
-        set_test_seam_hook(Seam::RunningCreated, move || {
-            std::fs::remove_dir(running_dir(&coord)).unwrap();
-            done.set(done.get() + 1);
-            if left > 1 {
-                std::mem::forget(delete_running(coord, left - 1, done));
-            }
-        })
-    }
-
-    let (_dir, coord) = temp_coord();
-    std::fs::create_dir_all(running_dir(&coord)).unwrap();
-    let done = Rc::new(Cell::new(0));
-    let _hook = delete_running(coord.clone(), 3, done.clone());
-    let mut reg = register(&coord, "t", &[], SERIAL_NONE);
-    assert_eq!(done.get(), 3);
-    assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
-    reg.unregister();
-}
-
-/// A coordination directory replaced between opening the mutex target and locking it holds no
-/// registration yet, so the attempt starts over in the replacement instead of panicking.
-#[test]
-fn a_directory_replaced_before_the_lock_is_taken_is_retried() {
+fn a_directory_replaced_before_the_lock_is_taken_panics_naming_the_move() {
     let (_dir, coord, retarget) = linked_coord();
     let _hook = set_test_seam_hook(Seam::TargetOpened, retarget);
-    let mut reg = register(&coord, "t", &[], SERIAL_NONE);
-    assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
-    reg.unregister();
+    let msg = attempt_panic(&coord);
+    assert!(msg.contains("deleted, replaced, or its directory moved"), "{msg}");
 }
 
-/// A `running/` that can never be made (here a dangling symlink, which directory creation
-/// accepts as present) fails with the error instead of retrying forever.
+/// A `running/` that cannot be listed (here a dangling symlink, which directory creation accepts
+/// as present) fails with the error.
 #[cfg(unix)]
 #[test]
-fn a_running_dir_that_stays_missing_panics_instead_of_retrying_forever() {
+fn a_running_dir_that_is_a_dangling_symlink_panics_with_the_error() {
     let (_dir, coord) = temp_coord();
     std::fs::create_dir_all(&coord).unwrap();
     std::os::unix::fs::symlink(coord.join("nowhere"), running_dir(&coord)).unwrap();
 
-    let payload = std::panic::catch_unwind(|| attempt(&coord, "t", &[], SERIAL_NONE))
-        .err()
-        .expect("a permanently missing running/ must panic");
-    let msg = crate::coordination::panic_payload_message(payload.as_ref());
+    let msg = attempt_panic(&coord);
     assert!(
         msg.contains(&format!("{:?}", running_dir(&coord))) && msg.contains("No such file"),
         "{msg}"
     );
 }
 
-/// The same for the whole coordination directory.
+/// The whole coordination directory deleted after the attempt created it fails naming it.
 #[test]
-fn a_coordination_dir_deleted_before_the_lock_is_recreated() {
+fn a_coordination_dir_deleted_before_the_lock_panics_naming_it() {
     let (_dir, coord) = temp_coord();
     let _hook = set_test_seam_hook(Seam::RunningCreated, {
         let coord = coord.clone();
         move || std::fs::remove_dir_all(&coord).unwrap()
     });
-    let mut reg = register(&coord, "t", &[], SERIAL_NONE);
-    assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
-    reg.unregister();
+    let msg = attempt_panic(&coord);
+    let coord_shown = format!("{coord:?}");
+    assert!(
+        msg.contains(coord_shown.trim_end_matches('"')) && msg.contains("SKULD_DB_DIR"),
+        "{msg}"
+    );
 }
 
 /// A symlink ancestor of `coord` retargeted mid-run leaves the registration's entry behind the

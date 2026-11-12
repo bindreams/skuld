@@ -20,10 +20,8 @@
 //! implement `lock` on every Unix target it otherwise treats as `flock`-capable (Android is
 //! missing), and panics there. Windows uses `File::lock`/`try_lock` (`LockFileEx`).
 //!
-//! A target that does not exist (its directory is missing) is reported by
-//! [`open_lock_target_if_present`] as `None`, for a caller that creates the directory to do so and
-//! try again. Any other failure to open it (`EMFILE`, permissions) panics at once, naming the
-//! path, as does [`open_lock_target`] for a missing directory. So does a filesystem whose `flock`
+//! A failure to open the target (a missing directory, `EMFILE`, permissions) panics at once,
+//! naming the path. So does a filesystem whose `flock`
 //! refuses a directory (some network filesystems): there is no fallback mechanism. A failed unlock
 //! panics too (see [`report_unlock_failure`]).
 
@@ -78,45 +76,10 @@ impl<'a> GlobalLockHeld<'a> {
     /// file itself being deleted or renamed, but not a symlink or junction ancestor being
     /// retargeted.
     ///
-    /// A path that no longer leads to a lock target is a split too: nothing there, a file or a
-    /// symlink loop where a directory was, or (Windows) a lock file being deleted. Any other failure
-    /// to inspect it panics with the error.
-    pub(super) fn target_has_split(&self) -> bool {
-        let lock = lock_path(self.coord_dir);
-        match FileIdentity::try_of(&lock) {
-            Ok(fresh) => fresh != self.target_identity,
-            Err(e) if leads_nowhere(&lock, &e) => true,
-            Err(e) => panic!(
-                "skuld: failed to inspect the global lock {lock:?}: {e} ({})",
-                super::DB_DIR_HINT
-            ),
-        }
-    }
-}
-
-/// Whether `e`, from inspecting `lock`, means the path no longer leads to a lock target.
-fn leads_nowhere(lock: &Path, e: &std::io::Error) -> bool {
-    use std::io::ErrorKind::{NotADirectory, NotFound};
-
-    if matches!(e.kind(), NotFound | NotADirectory) {
-        return true;
-    }
-    #[cfg(unix)]
-    {
-        let _ = lock;
-        e.raw_os_error() == Some(libc::ELOOP)
-    }
-    // A delete-pending file refuses opens with `ERROR_ACCESS_DENIED`, like an ACL does.
-    #[cfg(windows)]
-    {
-        e.kind() == std::io::ErrorKind::PermissionDenied
-            && crate::win_nt::is_delete_pending(lock).unwrap_or_else(|pending| {
-                panic!(
-                    "skuld: failed to inspect the global lock {lock:?}: {e}; checking whether it is being \
-                     deleted failed too: {pending} ({})",
-                    super::DB_DIR_HINT
-                )
-            })
+    /// `Err` if the path could not be inspected: a caller treats that as a split too, since it
+    /// cannot show otherwise, and reports the error.
+    pub(super) fn target_has_split(&self) -> std::io::Result<bool> {
+        Ok(FileIdentity::try_of(&lock_path(self.coord_dir))? != self.target_identity)
     }
 }
 
@@ -203,16 +166,6 @@ pub(super) fn report_unlock_failure(coord_dir: &Path, e: &std::io::Error, unwind
 /// cannot be opened.
 pub(super) fn open_lock_target(coord_dir: &Path) -> File {
     open_target(coord_dir).unwrap_or_else(|e| open_failed(coord_dir, &e))
-}
-
-/// [`open_lock_target`], except that `None` means the target does not exist (its directory is
-/// missing), which a caller that creates the directory can retry.
-pub(super) fn open_lock_target_if_present(coord_dir: &Path) -> Option<File> {
-    match open_target(coord_dir) {
-        Ok(target) => Some(target),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => open_failed(coord_dir, &e),
-    }
 }
 
 fn open_failed(coord_dir: &Path, e: &std::io::Error) -> ! {

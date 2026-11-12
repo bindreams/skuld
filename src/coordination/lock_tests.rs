@@ -305,59 +305,10 @@ fn a_deleted_lock_target_reads_as_a_split() {
     let dir = tmp.path().join("d");
     std::fs::create_dir(&dir).unwrap();
     with_global_lock(&dir, |held| {
-        assert!(!held.target_has_split());
+        assert!(!held.target_has_split().unwrap());
         std::fs::remove_dir(&dir).unwrap();
-        assert!(held.target_has_split());
+        assert!(held.target_has_split().is_err());
     });
-}
-
-/// A file where a directory of the lock path was (`ENOTDIR`) leads nowhere: a split.
-#[cfg(unix)]
-#[test]
-fn a_lock_path_through_a_file_reads_as_a_split() {
-    let tmp = crate::TempDir::new().unwrap();
-    let real = tmp.path().join("real");
-    let link = tmp.path().join("link");
-    std::fs::create_dir_all(real.join("d")).unwrap();
-    std::fs::write(tmp.path().join("file"), b"").unwrap();
-    std::os::unix::fs::symlink(&real, &link).unwrap();
-    with_global_lock(&link.join("d"), |held| {
-        std::fs::remove_file(&link).unwrap();
-        std::os::unix::fs::symlink(tmp.path().join("file"), &link).unwrap();
-        assert!(held.target_has_split());
-    });
-}
-
-/// A lock target that is there but cannot be inspected is an I/O failure, not a split.
-#[cfg(unix)]
-#[test]
-fn a_lock_target_that_cannot_be_inspected_panics_with_the_error() {
-    use std::os::unix::fs::PermissionsExt;
-
-    assert_ne!(
-        // SAFETY: geteuid has no preconditions.
-        unsafe { libc::geteuid() },
-        0,
-        "root ignores the permission this test removes"
-    );
-    let tmp = crate::TempDir::new().unwrap();
-    let parent = tmp.path().join("p");
-    let dir = parent.join("d");
-    std::fs::create_dir_all(&dir).unwrap();
-    let payload = std::panic::catch_unwind(|| {
-        with_global_lock(&dir, |held| {
-            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
-            held.target_has_split()
-        })
-    })
-    .err();
-    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let payload = payload.expect("must panic");
-    let msg = crate::coordination::panic_payload_message(payload.as_ref());
-    assert!(
-        msg.contains("failed to inspect the global lock") && msg.contains("Permission denied"),
-        "{msg}"
-    );
 }
 
 // Splits =====
@@ -373,7 +324,7 @@ fn target_has_split_detects_a_wholesale_directory_replacement() {
     with_global_lock(&coord, |held| {
         std::fs::rename(&coord, outer.path().join("aside")).unwrap();
         std::fs::create_dir(&coord).unwrap();
-        split_detected = held.target_has_split();
+        split_detected = !matches!(held.target_has_split(), Ok(false));
     });
     assert!(
         split_detected,
@@ -391,7 +342,7 @@ fn target_has_split_detects_a_retargeted_link_ancestor() {
     let mut split_detected = false;
     with_global_lock(&coord, |held| {
         retarget();
-        split_detected = held.target_has_split();
+        split_detected = !matches!(held.target_has_split(), Ok(false));
     });
     assert!(
         split_detected,
