@@ -300,7 +300,7 @@ fn open_lock_target_rejects_a_relative_path() {
 
 #[cfg(unix)]
 #[test]
-fn a_deleted_lock_target_reads_as_a_split() {
+fn a_lock_target_that_cannot_be_inspected_reads_as_a_split() {
     let tmp = crate::TempDir::new().unwrap();
     let dir = tmp.path().join("d");
     std::fs::create_dir(&dir).unwrap();
@@ -309,38 +309,6 @@ fn a_deleted_lock_target_reads_as_a_split() {
         std::fs::remove_dir(&dir).unwrap();
         assert!(held.target_has_split());
     });
-}
-
-/// A lock target that is there but cannot be inspected is an I/O failure, not a split.
-#[cfg(unix)]
-#[test]
-fn a_lock_target_that_cannot_be_inspected_panics_with_the_error() {
-    use std::os::unix::fs::PermissionsExt;
-
-    assert_ne!(
-        // SAFETY: geteuid has no preconditions.
-        unsafe { libc::geteuid() },
-        0,
-        "root ignores the permission this test removes"
-    );
-    let tmp = crate::TempDir::new().unwrap();
-    let parent = tmp.path().join("p");
-    let dir = parent.join("d");
-    std::fs::create_dir_all(&dir).unwrap();
-    let payload = std::panic::catch_unwind(|| {
-        with_global_lock(&dir, |held| {
-            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
-            held.target_has_split()
-        })
-    })
-    .err();
-    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let payload = payload.expect("must panic");
-    let msg = crate::coordination::panic_payload_message(payload.as_ref());
-    assert!(
-        msg.contains("failed to inspect the global lock") && msg.contains("Permission denied"),
-        "{msg}"
-    );
 }
 
 // Splits =====

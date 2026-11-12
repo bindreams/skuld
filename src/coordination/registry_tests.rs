@@ -1013,7 +1013,7 @@ fn unregister_panics_with_the_error_when_the_entry_cannot_be_inspected() {
 
 // Directories deleted between creation and locking =====
 
-/// `running/` deleted after `try_register` created it is created again, not a panic.
+/// `running/` deleted after an attempt created it is made again by the next attempt, not a panic.
 #[test]
 fn a_running_dir_deleted_before_the_lock_is_recreated() {
     let (_dir, coord) = temp_coord();
@@ -1021,7 +1021,7 @@ fn a_running_dir_deleted_before_the_lock_is_recreated() {
         let coord = coord.clone();
         move || std::fs::remove_dir(running_dir(&coord)).unwrap()
     });
-    let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    let mut reg = register(&coord, "t", &[], SERIAL_NONE);
     assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
     reg.unregister();
 }
@@ -1048,7 +1048,7 @@ fn a_running_dir_deleted_on_consecutive_passes_is_recreated_each_time() {
     std::fs::create_dir_all(running_dir(&coord)).unwrap();
     let done = Rc::new(Cell::new(0));
     let _hook = delete_running(coord.clone(), 3, done.clone());
-    let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    let mut reg = register(&coord, "t", &[], SERIAL_NONE);
     assert_eq!(done.get(), 3);
     assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
     reg.unregister();
@@ -1060,7 +1060,7 @@ fn a_running_dir_deleted_on_consecutive_passes_is_recreated_each_time() {
 fn a_directory_replaced_before_the_lock_is_taken_is_retried() {
     let (_dir, coord, retarget) = linked_coord();
     let _hook = set_test_seam_hook(Seam::TargetOpened, retarget);
-    let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    let mut reg = register(&coord, "t", &[], SERIAL_NONE);
     assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
     reg.unregister();
 }
@@ -1092,7 +1092,7 @@ fn a_coordination_dir_deleted_before_the_lock_is_recreated() {
         let coord = coord.clone();
         move || std::fs::remove_dir_all(&coord).unwrap()
     });
-    let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    let mut reg = register(&coord, "t", &[], SERIAL_NONE);
     assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
     reg.unregister();
 }

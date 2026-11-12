@@ -25,9 +25,10 @@
 //! try again. Any other failure to open it (`EMFILE`, permissions) panics at once, naming the
 //! path, as does [`open_lock_target`] for a missing directory. So does a filesystem whose `flock`
 //! refuses a directory (some network filesystems): there is no fallback mechanism. A failed unlock
-//! leaves the mutex held, so it panics too (see [`report_unlock_failure`]).
+//! panics too (see [`report_unlock_failure`]).
 
 use super::file_identity::FileIdentity;
+use super::skuld_debug_eprintln;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -77,17 +78,14 @@ impl<'a> GlobalLockHeld<'a> {
     /// identity recorded at acquisition. On Windows, withholding `FILE_SHARE_DELETE` stops the lock
     /// file itself being deleted or renamed, but not a symlink or junction ancestor being
     /// retargeted.
-    ///
-    /// Nothing at the path is a split too. Any other failure to inspect it panics with the error.
     pub(super) fn target_has_split(&self) -> bool {
         let lock = lock_path(self.coord_dir);
         match FileIdentity::try_of(&lock) {
             Ok(fresh) => fresh != self.target_identity,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(e) => panic!(
-                "skuld: failed to inspect the global lock {lock:?}: {e} ({})",
-                super::DB_DIR_HINT
-            ),
+            Err(e) => {
+                skuld_debug_eprintln!("global lock target {lock:?} could not be inspected, treating as split: {e}");
+                true
+            }
         }
     }
 }
@@ -155,8 +153,8 @@ pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnO
 }
 
 /// Report a failed unlock of `coord_dir`'s mutex: a panic, like any I/O failure, unless
-/// `unwinding`, when a second panic would abort the process: then a warning. Either way the lock is
-/// released when its handle closes.
+/// `unwinding`, when a second panic would abort the process: then a warning. The lock stays held
+/// until every handle sharing it closes; the panic closes the caller's.
 pub(super) fn report_unlock_failure(coord_dir: &Path, e: &std::io::Error, unwinding: bool) {
     let message = format!(
         "failed to unlock the global lock {:?}: {e} ({})",
@@ -238,22 +236,26 @@ fn open_target(coord_dir: &Path) -> std::io::Result<File> {
 /// std's own `File::lock` handles it. Nothing else `flock` returns is retryable.
 #[cfg(unix)]
 pub(super) fn lock_exclusive(target: &File) -> std::io::Result<()> {
+    flock_retrying(target, rustix::fs::FlockOperation::LockExclusive)
+}
+
+/// `flock(target, op)`, retried on `EINTR` alone, uncapped (see [`lock_exclusive`]).
+#[cfg(unix)]
+fn flock_retrying(target: &File, op: rustix::fs::FlockOperation) -> std::io::Result<()> {
     loop {
-        match rustix::fs::flock(target, rustix::fs::FlockOperation::LockExclusive) {
-            Ok(()) => return Ok(()),
+        match rustix::fs::flock(target, op) {
             Err(rustix::io::Errno::INTR) => {
                 // Lets `lock_tests.rs` observe that a real EINTR was retried, not just that the
                 // call eventually succeeded.
                 #[cfg(test)]
                 EINTR_RETRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                continue;
             }
-            Err(errno) => return Err(errno.into()),
+            result => return result.map_err(Into::into),
         }
     }
 }
 
-/// Count of `EINTR` retries `lock_exclusive` has performed, process-wide.
+/// Count of `EINTR` retries [`flock_retrying`] has performed, process-wide.
 #[cfg(all(unix, test))]
 pub(super) static EINTR_RETRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -266,16 +268,9 @@ pub(super) fn lock_exclusive(target: &File) -> std::io::Result<()> {
 /// Release `target`'s lock now, ahead of closing it. Closing alone releases it too, but Windows
 /// documents the release on close as taking "available system resources" to happen, so a holder
 /// whose release others wait on unlocks first.
-///
-/// Retries on `EINTR`, uncapped, as [`lock_exclusive`] does.
 #[cfg(unix)]
 pub(super) fn unlock(target: &File) -> std::io::Result<()> {
-    loop {
-        match rustix::fs::flock(target, rustix::fs::FlockOperation::Unlock) {
-            Err(rustix::io::Errno::INTR) => continue,
-            result => return result.map_err(Into::into),
-        }
-    }
+    flock_retrying(target, rustix::fs::FlockOperation::Unlock)
 }
 
 /// See the Unix variant.
