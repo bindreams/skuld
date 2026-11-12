@@ -15,6 +15,9 @@ use super::test_hooks::{retry_rendezvous, set_test_retry_hook, set_test_seam_hoo
 use super::{SERIAL_ALL, SERIAL_NONE};
 use crate::label::Label;
 
+#[path = "../../tests/support/link.rs"]
+mod link;
+
 /// A fresh coordination directory, `<temp>/.skuld`, which does not exist yet.
 pub(super) fn temp_coord() -> (crate::TempDir, PathBuf) {
     let dir = crate::TempDir::new().unwrap();
@@ -29,12 +32,7 @@ pub(super) fn temp_coord() -> (crate::TempDir, PathBuf) {
 /// every platform: Windows refuses to delete a running test's entry, but not to retarget an
 /// ancestor.
 pub(super) fn linked_coord() -> (crate::TempDir, PathBuf, impl FnOnce()) {
-    fn link_dir(target: &Path, link: &Path) {
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(target, link).unwrap();
-        #[cfg(windows)]
-        junction::create(target, link).unwrap();
-    }
+    use link::{link_dir, retarget_dir};
 
     let dir = crate::TempDir::new().unwrap();
     let (real1, real2, link) = (
@@ -46,15 +44,7 @@ pub(super) fn linked_coord() -> (crate::TempDir, PathBuf, impl FnOnce()) {
     std::fs::create_dir(&real2).unwrap();
     link_dir(&real1, &link);
     let coord = link.join(".skuld");
-    let retarget = move || {
-        // A symlink is removed with `remove_file` on Unix, a junction with `remove_dir` on Windows;
-        // `link_dir` after either makes a fresh one.
-        #[cfg(unix)]
-        std::fs::remove_file(&link).unwrap();
-        #[cfg(windows)]
-        std::fs::remove_dir(&link).unwrap();
-        link_dir(&real2, &link);
-    };
+    let retarget = move || retarget_dir(&real2, &link);
     (dir, coord, retarget)
 }
 
@@ -344,30 +334,31 @@ fn register_with_uses_ids_from_its_generator() {
     reg.unregister();
 }
 
-/// What the Windows scan makes of a delete attempt on an entry and, when that was denied, of the
-/// delete-pending check.
+/// What the Windows scan makes of its read-only share-mode probe of an entry (opened with
+/// `FILE_SHARE_READ` only, so a write handle held by an owner refuses it) and, when that was
+/// denied, of the delete-pending check.
 #[cfg(windows)]
 #[test]
-fn delete_attempts_are_classified() {
-    use super::registry::{classify_delete, Verdict};
+fn probe_results_are_classified() {
+    use super::registry::{classify_probe, Verdict};
 
-    let os = |code| io::Error::from_raw_os_error(code);
-    let (denied, sharing) = (os(5), os(32));
+    let os = io::Error::from_raw_os_error;
     let not_found = || io::Error::from(io::ErrorKind::NotFound);
-    let unreached = || -> io::Result<bool> { panic!("the delete-pending check is only for a denied delete") };
+    let unreached = || -> io::Result<bool> { panic!("the delete-pending check is only for a denied open") };
 
-    assert!(matches!(classify_delete(Ok(()), unreached), Verdict::Gone));
-    assert!(matches!(classify_delete(Err(not_found()), unreached), Verdict::Gone));
-    assert!(matches!(classify_delete(Err(sharing), unreached), Verdict::Live));
-    assert!(matches!(classify_delete(Err(os(5)), || Ok(true)), Verdict::Gone));
-    // Denied and not delete-pending: the scanner may not delete it, which says nothing of its owner.
-    assert!(matches!(classify_delete(Err(os(5)), || Ok(false)), Verdict::Live));
-    // The last handle closed between the delete and the check.
-    assert!(matches!(
-        classify_delete(Err(os(5)), || Err(not_found())),
-        Verdict::Gone
-    ));
-    let Verdict::Fail(e) = classify_delete(Err(denied), || Err(os(1117))) else {
+    assert!(matches!(classify_probe(Ok(()), unreached), Verdict::Dead));
+    assert!(matches!(classify_probe(Err(not_found()), unreached), Verdict::Gone));
+    // Some handle has the entry open for writing: its owner.
+    assert!(matches!(classify_probe(Err(os(32)), unreached), Verdict::Live));
+    assert!(matches!(classify_probe(Err(os(5)), || Ok(true)), Verdict::Gone));
+    // Denied and not delete-pending: this account may not read it. Loud, never a silent wait.
+    let Verdict::Fail(e) = classify_probe(Err(os(5)), || Ok(false)) else {
+        panic!("an entry that cannot be read must fail the scan");
+    };
+    assert!(e.to_string().contains("os error 5"), "{e}");
+    // The last handle closed between the open and the check.
+    assert!(matches!(classify_probe(Err(os(5)), || Err(not_found())), Verdict::Gone));
+    let Verdict::Fail(e) = classify_probe(Err(os(5)), || Err(os(1117))) else {
         panic!("a failed check must fail the scan");
     };
     let msg = e.to_string();
@@ -375,10 +366,101 @@ fn delete_attempts_are_classified() {
         msg.contains("os error 5") && msg.contains("os error 1117"),
         "both errors must be named: {msg}"
     );
-    let Verdict::Fail(e) = classify_delete(Err(os(123)), unreached) else {
-        panic!("any other delete error fails the scan");
+    let Verdict::Fail(e) = classify_probe(Err(os(123)), unreached) else {
+        panic!("any other open error fails the scan");
     };
     assert!(e.to_string().contains("os error 123"), "{e}");
+}
+
+/// What the Windows scan, and unregistration, make of an attempt to delete an entry that has no
+/// write handle open.
+#[cfg(windows)]
+#[test]
+fn removal_results_are_classified() {
+    use super::registry::{classify_removal, Verdict};
+
+    let os = io::Error::from_raw_os_error;
+    let not_found = || io::Error::from(io::ErrorKind::NotFound);
+    let unreached = || -> io::Result<bool> { panic!("the delete-pending check is only for a denied delete") };
+
+    assert!(matches!(classify_removal(Ok(()), unreached), Verdict::Gone));
+    assert!(matches!(classify_removal(Err(not_found()), unreached), Verdict::Gone));
+    // Another program has it open: the entry is dead, and the next scan retries.
+    assert!(matches!(classify_removal(Err(os(32)), unreached), Verdict::Gone));
+    assert!(matches!(classify_removal(Err(os(5)), || Ok(true)), Verdict::Gone));
+    assert!(matches!(
+        classify_removal(Err(os(5)), || Err(not_found())),
+        Verdict::Gone
+    ));
+    // Denied and not delete-pending: another account's entry this one may not delete.
+    let Verdict::Fail(e) = classify_removal(Err(os(5)), || Ok(false)) else {
+        panic!("an entry that cannot be deleted must fail loudly");
+    };
+    assert!(e.to_string().contains("os error 5"), "{e}");
+    let Verdict::Fail(e) = classify_removal(Err(os(5)), || Err(os(1117))) else {
+        panic!("a failed check must fail");
+    };
+    let msg = e.to_string();
+    assert!(
+        msg.contains("os error 5") && msg.contains("os error 1117"),
+        "both errors must be named: {msg}"
+    );
+    let Verdict::Fail(e) = classify_removal(Err(os(123)), unreached) else {
+        panic!("any other delete error fails");
+    };
+    assert!(e.to_string().contains("os error 123"), "{e}");
+}
+
+/// Liveness is the owner's hold, not the file: while it is registered the entry blocks, and once
+/// the registration is dropped without unregistering (as a crash would leave it) the next scan
+/// finds it dead and removes it.
+#[test]
+fn a_dropped_registration_leaves_a_dead_entry_the_next_scan_removes() {
+    let (_dir, coord) = temp_coord();
+    let reg = running(&coord, "t", &[], SERIAL_NONE);
+    let entry = running_dir(&coord).join(format!("{}.json", reg.id()));
+    assert!(
+        attempt(&coord, "global", &[], SERIAL_ALL).is_none(),
+        "the held entry blocks"
+    );
+    assert!(entry.exists());
+
+    drop(reg);
+
+    assert!(can_start_now(&coord, &[], SERIAL_ALL), "the dead entry must not block");
+    assert!(!entry.exists(), "the scan removes it");
+}
+
+/// Another program with the entry open (an antivirus scanner, say) can stop its deletion, but
+/// that does not make a finished test fail: the entry has no write handle, so it is dead and the
+/// next scan removes it.
+#[cfg(windows)]
+#[test]
+fn unregister_leaves_an_entry_another_program_holds_open_to_the_next_scan() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let (_dir, coord) = temp_coord();
+    let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    let entry = running_dir(&coord).join(format!("{}.json", reg.id()));
+    let other_program = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(super::lock::WINDOWS_SHARE_MODE)
+        .open(&entry)
+        .unwrap();
+
+    reg.unregister();
+
+    assert!(
+        entry.exists(),
+        "it cannot be deleted while the other program has it open"
+    );
+    assert!(
+        can_start_now(&coord, &[], SERIAL_ALL),
+        "an entry nobody holds for writing is dead, so it does not block"
+    );
+    drop(other_program);
+    assert!(can_start_now(&coord, &[], SERIAL_ALL));
+    assert!(!entry.exists(), "the next scan removes it");
 }
 
 /// A forked child shares its parent's open file description, so closing the parent's descriptor
@@ -386,23 +468,11 @@ fn delete_attempts_are_classified() {
 #[cfg(unix)]
 #[test]
 fn dropping_a_registration_unlocks_its_entry_though_the_description_is_shared() {
-    use std::os::unix::io::FromRawFd;
-
-    use super::file_identity::FileIdentity;
-
     let (_dir, coord) = temp_coord();
     let reg = running(&coord, "t", &[], SERIAL_NONE);
     let entry = running_dir(&coord).join(format!("{}.json", reg.id()));
-    let identity = FileIdentity::of(&entry).unwrap();
-    let hold_fd = (0..4096)
-        .find(|&fd| FileIdentity::of_fd(fd).ok() == Some(identity))
-        .expect("the registration holds its entry open");
-    // Safety: `dup` of a descriptor this process holds; the result is owned by the `File`.
-    let shared = unsafe {
-        let fd = libc::dup(hold_fd);
-        assert!(fd >= 0, "dup: {}", std::io::Error::last_os_error());
-        File::from_raw_fd(fd)
-    };
+    // `try_clone` is a `dup`: the same open file description, as a forked child's copy is.
+    let shared = reg.hold().try_clone().unwrap();
 
     drop(reg);
 
@@ -410,6 +480,28 @@ fn dropping_a_registration_unlocks_its_entry_though_the_description_is_shared() 
     assert!(
         try_lock_exclusive(&probe).is_ok(),
         "the entry must be unlocked once its registration is dropped"
+    );
+    drop(shared);
+}
+
+/// A forked child holds a copy of its parent's `Registration`; dropping that copy must not unlock
+/// the parent's live entry. `pretend_forked` makes the registration look like one inherited from
+/// another process: the drop then leaves the lock to whoever still holds the description.
+#[cfg(unix)]
+#[test]
+fn dropping_an_inherited_registration_leaves_the_entry_locked() {
+    let (_dir, coord) = temp_coord();
+    let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    let entry = running_dir(&coord).join(format!("{}.json", reg.id()));
+    let shared = reg.hold().try_clone().unwrap();
+    reg.pretend_forked();
+
+    drop(reg);
+
+    let probe = File::open(&entry).unwrap();
+    assert!(
+        matches!(try_lock_exclusive(&probe), Err(std::fs::TryLockError::WouldBlock)),
+        "the parent's entry must stay locked"
     );
     drop(shared);
 }

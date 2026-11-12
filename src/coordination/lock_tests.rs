@@ -321,7 +321,7 @@ fn target_has_split_detects_a_wholesale_directory_replacement() {
 /// A symlink or junction ancestor retargeted underneath the held lock target splits the lock on every
 /// platform. On Windows it is the only way: the lock file itself cannot be deleted while held.
 #[test]
-fn target_has_split_detects_a_retargeted_symlink_ancestor() {
+fn target_has_split_detects_a_retargeted_link_ancestor() {
     let (_dir, coord, retarget) = linked_coord();
     std::fs::create_dir(&coord).unwrap();
 
@@ -332,6 +332,6 @@ fn target_has_split_detects_a_retargeted_symlink_ancestor() {
     });
     assert!(
         split_detected,
-        "a retargeted symlink ancestor must read as a split while the lock is held"
+        "a retargeted link (symlink or junction) ancestor must read as a split while the lock is held"
     );
 }
