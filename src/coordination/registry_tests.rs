@@ -1076,7 +1076,7 @@ fn an_uninspectable_mutex_target_fails_unregistration_naming_the_error() {
         msg.contains("could not be checked")
             && msg.contains("Permission denied")
             && msg.contains("SKULD_DB_DIR")
-            && !msg.contains("moved"),
+            && !msg.contains(" moved while"),
         "{msg}"
     );
 }

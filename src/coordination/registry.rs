@@ -121,33 +121,37 @@ fn or_panic<T, P: AsRef<Path>>(action: &str, path: impl FnOnce() -> P, result: i
     result.unwrap_or_else(|e| panic!("skuld: failed to {action} {:?}: {e} ({DB_DIR_HINT})", path().as_ref()))
 }
 
-/// `entry` is the registration's entry, when there is one yet; `inspect_error`, why the mutex's
-/// target could not be inspected, when it could not.
-fn moved_message(coord_dir: &Path, entry: Option<&Path>, doing: &str, inspect_error: Option<&io::Error>) -> String {
+/// `entry` is the registration's entry, when there is one yet.
+fn moved_message(coord_dir: &Path, entry: Option<&Path>, doing: &str) -> String {
     let lost = match entry {
         Some(entry) => format!("the mutex's target or the entry {entry:?}"),
         None => "the mutex's target".to_owned(),
     };
-    let consequence = "the mutex or the entries no longer guard what other tests see";
-    match inspect_error {
-        None => format!(
-            "skuld: the coordination directory {coord_dir:?} moved while {doing}: {lost} was deleted, \
-             replaced, or its directory moved, so {consequence} ({DB_DIR_HINT})"
-        ),
-        Some(e) => format!(
-            "skuld: the coordination directory {coord_dir:?} could not be checked while {doing}: \
-             inspecting the mutex's target {:?} failed: {e} ({DB_DIR_HINT})",
-            super::lock::lock_path(coord_dir)
-        ),
-    }
+    format!(
+        "skuld: the coordination directory {coord_dir:?} moved while {doing}: {lost} was deleted, \
+         replaced, or its directory moved, so the mutex or the entries no longer guard what other tests \
+         see ({DB_DIR_HINT})"
+    )
 }
 
-/// Panic with [`moved_message`] if the mutex has split, or its target cannot be inspected.
+/// Why `coord_dir`'s mutex could not be shown intact: inspecting its target failed with `e`.
+/// `entry` is the registration's entry, when there is one yet.
+fn unchecked_message(coord_dir: &Path, entry: Option<&Path>, doing: &str, e: &io::Error) -> String {
+    let entry = entry.map(|entry| format!(" (entry {entry:?})")).unwrap_or_default();
+    format!(
+        "skuld: the coordination directory {coord_dir:?} could not be checked while {doing}{entry}: \
+         inspecting the mutex's target {:?} failed: {e} ({DB_DIR_HINT})",
+        super::lock::lock_path(coord_dir)
+    )
+}
+
+/// Panic if the mutex has split ([`moved_message`]) or its target cannot be inspected
+/// ([`unchecked_message`]).
 fn assert_not_split(held: &GlobalLockHeld<'_>, entry: Option<&Path>, doing: &str) {
     match held.target_has_split() {
         Ok(false) => {}
-        Ok(true) => panic!("{}", moved_message(held.coord_dir(), entry, doing, None)),
-        Err(e) => panic!("{}", moved_message(held.coord_dir(), entry, doing, Some(&e))),
+        Ok(true) => panic!("{}", moved_message(held.coord_dir(), entry, doing)),
+        Err(e) => panic!("{}", unchecked_message(held.coord_dir(), entry, doing, &e)),
     }
 }
 
@@ -270,7 +274,7 @@ fn assert_unmoved(held: &GlobalLockHeld<'_>, name: &str, identity: FileIdentity,
         Err(e) => or_panic("inspect", || &path, Err::<bool, _>(e)),
     };
     if moved {
-        panic!("{}", moved_message(held.coord_dir(), Some(&path), doing, None));
+        panic!("{}", moved_message(held.coord_dir(), Some(&path), doing));
     }
 }
 
