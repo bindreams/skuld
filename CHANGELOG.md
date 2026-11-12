@@ -15,9 +15,10 @@ All notable changes to this project are documented in this file.
 ### Fixed
 
 - **A dead test's stale entry is no longer fooled by PID reuse, PID
-  namespaces or Windows `Access denied`** (#66). Staleness is whether the dead
-  test's lock can be taken, not a PID lookup, so a reused PID can no longer
-  hang a later serial test.
+  namespaces or Windows `Access denied`** (#66). Whether a test is alive is
+  whether its owner still holds its entry (a lock on Unix, a write handle on
+  Windows), not a PID lookup, so a reused PID can no longer hang a later serial
+  test.
 
 ### Changed
 
@@ -28,9 +29,10 @@ All notable changes to this project are documented in this file.
   tests that start in the new copy meanwhile may run alongside the old ones. A
   deliberate swap that is restored before a test next checks is not detected.
 - **A running test is one file, `.skuld/running/<id>.json`.** On Unix a test is
-  alive while it holds a lock on its entry; on Windows, while it holds the entry
-  open, which refuses deletion. On Windows, another program that keeps a dead
-  test's entry open delays other tests until it closes it.
+  alive while it holds a lock on its entry; on Windows, while it holds a write
+  handle on it, which also stops the entry being deleted. A crashed test's entry
+  is removed by the next test to look; on Windows, an entry that another account
+  may not delete fails the run, naming the path.
 - **The `skuld` crate needs no C compiler to build or cross-compile.** The
   bundled SQLite (`rusqlite`) is gone, so musl and other targets without a C
   toolchain build it.
