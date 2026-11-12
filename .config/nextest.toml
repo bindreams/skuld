@@ -12,7 +12,7 @@ default-filter = "not binary(=integration)"
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 [[profile.default.overrides]]
-# The coordination tests block on rendezvous points, retry-hook acks and SQLite locks. The slowest
+# The coordination tests block on rendezvous points, retry-hook acks and file locks. The slowest
 # takes about a second locally, so 10s x 3 leaves ample headroom while a hang fails within 30s,
 # naming the test.
 filter = 'binary(=skuld) & test(/^coordination::/)'

@@ -47,15 +47,28 @@ Labels used in serial expressions must be `Label` constants in scope (defined wi
 
 ## How coordination works
 
-Serial tests are coordinated through a SQLite database, automatically managed by skuld. This works across multiple test processes — if two test binaries run concurrently, their serial constraints are respected across process boundaries.
+Serial tests are coordinated through OS file locks in a `.skuld/` directory, automatically managed by skuld. This works across multiple test processes — if two test binaries run concurrently, their serial constraints are respected across process boundaries.
 
-The database is `.skuld.db`, located at run time from the test executable's path, so a moved or archived test binary keeps working:
+`.skuld/` holds a global lock and `running/`, which has one file per running test: `<id>.json`, which records its name, labels and serial filter, and which the test holds for as long as it runs. On Unix the hold is a lock on the entry; on Windows it is the test's write handle on the entry, which a waiting test detects by trying to open the entry with a share mode that a write handle refuses. A test that must wait holds nothing. The kernel releases the hold when its owner dies, so a crashed test never blocks others; the next test to look removes its leftover file. On Windows, another program that holds a running or dead test's entry open can delay other tests until it closes it; see also the account requirement below.
 
-- `SKULD_DB_DIR`, if set, names the directory (absolute; created world-writable if missing).
+`.skuld/` is created inside a directory located at run time from the test executable's path, so a moved or archived test binary keeps working:
+
+- `SKULD_DB_DIR`, if set, names that directory (absolute; created world-writable if missing).
 - Otherwise the directory is the build profile directory (`target/<profile>/`): the parent of `deps/` or `examples/`, or the profile directory of cargo's `build/<pkg>/<hash>/out/` layout. This step up happens only with a positive cargo marker: a cargo-hashed executable name (`name-<16 hex digits>`), a `.fingerprint` directory in the profile directory, or a `CACHEDIR.TAG` beside it. A binary anywhere else, such as a copy, uses its own directory.
 - The path is resolved once per process, from the canonicalized executable path.
 
-Only binaries that resolve to the same directory coordinate with each other, and every run sharing a `SKULD_DB_DIR` shares coordination, including unrelated workspaces and mixed skuld versions. The directory must exist and be readable and writable (for example, not a read-only mount); otherwise the run panics naming the directory and `SKULD_DB_DIR`. Directories skuld creates for `SKULD_DB_DIR` are published atomically at mode 0777, whatever the umask. Skuld never falls back to per-process coordination.
+Only binaries that resolve to the same directory coordinate with each other, and every run sharing a `SKULD_DB_DIR` shares coordination, including unrelated workspaces. A skuld that coordinated through SQLite (0.6.0 and earlier) does not coordinate with this one; see the upgrade note in the changelog. The directory must exist and be readable and writable (for example, not a read-only mount); otherwise the run panics naming the directory and `SKULD_DB_DIR`. Directories skuld creates for `SKULD_DB_DIR` are published atomically at mode 0777, whatever the umask. Skuld never falls back to per-process coordination.
+
+On Unix, `.skuld/` and `running/` are mode 0777 and the entries in them 0644, whatever the umask, so runs under several uids can share one directory. On Windows, every account sharing the directory must be able to read and delete the files the others create in it, and to write `global.lock`, which every test opens for writing; otherwise skuld fails, naming the file.
+
+### Moving or deleting `.skuld/` during a run
+
+Deleting or replacing `.skuld/` while tests run is prevented on Windows and only detected on Unix:
+
+- **Windows:** a running test's entry cannot be deleted, so deleting the directory (for example `cargo clean`) fails while tests run.
+- **Unix:** if `.skuld/` or `running/` is deleted or replaced mid-run, each test registered in the old copy panics when it finishes, which fails the run. Until then, tests that start in the new copy do not see the old ones and may run alongside them.
+- **Both:** a test that is starting to register when `.skuld/` or `running/` is deleted or replaced may panic, naming the directory.
+- **Not detected:** a deliberate swap that is restored before a test next checks.
 
 ## Serial fixtures
 

@@ -1,24 +1,27 @@
-//! Tests for the coordination DB init lock ([`super::lock`]).
+//! Tests for the global mutex ([`super::lock`]).
 
-#[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering::SeqCst};
 
-#[cfg(windows)]
-use super::lock::lock_path;
 #[cfg(unix)]
 use super::lock::{lock_exclusive, EINTR_RETRIES};
-use super::lock::{open_lock_target, try_lock_exclusive, with_init_lock};
+use super::lock::{lock_path, open_lock_target, report_unlock_failure, try_lock_exclusive, with_global_lock};
+use super::registry_tests::linked_coord;
 use super::rendezvous::rendezvous;
 
-#[cfg(windows)]
+/// The path the mutex locks, which every message about it names.
 #[test]
-fn lock_path_appends_dot_lock_to_the_full_db_path_verbatim() {
-    let db_path = PathBuf::from(r"C:\some\dir\.skuld.db");
-    assert_eq!(lock_path(&db_path), PathBuf::from(r"C:\some\dir\.skuld.db.lock"));
+fn lock_path_is_the_directory_on_unix_and_global_lock_in_it_on_windows() {
+    let coord = PathBuf::from("some").join("dir");
+    let expected = if cfg!(windows) {
+        coord.join("global.lock")
+    } else {
+        coord.clone()
+    };
+    assert_eq!(lock_path(&coord), expected);
 }
 
-/// `with_init_lock` must be a *mutual exclusion* primitive, not just "don't
+/// `with_global_lock` must be a *mutual exclusion* primitive, not just "don't
 /// panic under concurrency": many threads race to enter the same critical
 /// section at once, lined up on a rendezvous so they all arrive together —
 /// maximizing the chance a missing exclusion would show up — and each
@@ -29,13 +32,13 @@ fn lock_path_appends_dot_lock_to_the_full_db_path_verbatim() {
 /// this either catches a real violation or it doesn't run into one — there
 /// is nothing timing-dependent about what counts as a failure.
 #[test]
-fn with_init_lock_serializes_concurrent_callers() {
+fn with_global_lock_serializes_concurrent_callers() {
     const THREADS: usize = 32;
     const ROUNDS: usize = 20;
 
     for _ in 0..ROUNDS {
         let dir = crate::TempDir::new().unwrap();
-        let db_path = dir.path().join(".skuld.db");
+        let coord = dir.path();
         let in_critical_section = AtomicI64::new(0);
         let max_seen = AtomicI64::new(0);
         let points = rendezvous(THREADS);
@@ -44,7 +47,7 @@ fn with_init_lock_serializes_concurrent_callers() {
             for point in points {
                 s.spawn(|| {
                     point.wait();
-                    with_init_lock(&db_path, |_token| {
+                    with_global_lock(coord, |_token| {
                         let now = in_critical_section.fetch_add(1, SeqCst) + 1;
                         max_seen.fetch_max(now, SeqCst);
                         // Give any missing exclusion room to show up: real
@@ -65,32 +68,32 @@ fn with_init_lock_serializes_concurrent_callers() {
         assert_eq!(
             max_seen.load(SeqCst),
             1,
-            "with_init_lock let more than one thread into the critical section at once"
+            "with_global_lock let more than one thread into the critical section at once"
         );
     }
 }
 
 /// Two lock files racing to be created (`OpenOptions::create(true)`, not
-/// `create_new`) is the concurrency shape a `<db path>.lock` file itself is
-/// exposed to on every real call, since [`with_init_lock`] never
+/// `create_new`) is the concurrency shape a `global.lock` file itself is
+/// exposed to on every real call, since [`with_global_lock`] never
 /// pre-creates it ahead of time. Proven the same way as above: real
 /// concurrent creation, checked for exclusivity, not just absence of a
 /// panic.
 ///
 /// Windows-only: Unix has no lock file to race a `create(true)` open
-/// against — it locks `db_path`'s parent directory, which already exists
-/// before [`with_init_lock`] is ever called (see `lock.rs`'s module doc) —
+/// against — it locks `base`'s parent directory, which already exists
+/// before [`with_global_lock`] is ever called (see `lock.rs`'s module doc) —
 /// so this scenario doesn't arise there; the general concurrent-callers
 /// test above already covers Unix's actual concurrency shape.
 #[cfg(windows)]
 #[test]
-fn with_init_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet() {
+fn with_global_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet() {
     const THREADS: usize = 32;
 
     let dir = crate::TempDir::new().unwrap();
-    let db_path = dir.path().join(".skuld.db");
+    let coord = dir.path();
     assert!(
-        !lock_path(&db_path).exists(),
+        !lock_path(coord).exists(),
         "test precondition: lock file must not pre-exist"
     );
 
@@ -102,7 +105,7 @@ fn with_init_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet()
         for point in points {
             s.spawn(|| {
                 point.wait();
-                with_init_lock(&db_path, |_token| {
+                with_global_lock(coord, |_token| {
                     let now = in_critical_section.fetch_add(1, SeqCst) + 1;
                     max_seen.fetch_max(now, SeqCst);
                     in_critical_section.fetch_sub(1, SeqCst);
@@ -114,50 +117,49 @@ fn with_init_lock_serializes_even_when_the_lock_file_itself_does_not_exist_yet()
     assert_eq!(
         max_seen.load(SeqCst),
         1,
-        "with_init_lock let more than one thread into the critical section at once"
+        "with_global_lock let more than one thread into the critical section at once"
     );
 }
 
 /// Deterministic counterpart to the two statistical tests above: rather than
 /// racing many threads and checking they never overlap, this holds
-/// `with_init_lock` open and, from *inside* it, `try_lock`s a completely
+/// `with_global_lock` open and, from *inside* it, `try_lock`s a completely
 /// fresh handle on the same lock file. `flock`/`LockFileEx` locks are scoped
 /// to the open file description/handle, not the process or thread, so a
 /// second, independently-opened handle contending the same lock — even from
 /// the same thread — must report `WouldBlock`, not silently succeed. This
 /// can't flake: there is no timing window to miss, since the fresh `try_lock`
-/// only ever runs while `with_init_lock`'s own lock is provably still held.
+/// only ever runs while `with_global_lock`'s own lock is provably still held.
 #[test]
-fn a_fresh_try_lock_reports_would_block_while_with_init_lock_holds_the_lock() {
+fn a_fresh_try_lock_reports_would_block_while_with_global_lock_holds_the_lock() {
     let dir = crate::TempDir::new().unwrap();
-    let db_path = dir.path().join(".skuld.db");
 
-    with_init_lock(&db_path, |_token| {
-        let fresh = open_lock_target(&db_path);
+    with_global_lock(dir.path(), |_token| {
+        let fresh = open_lock_target(dir.path());
         match try_lock_exclusive(&fresh) {
             Err(std::fs::TryLockError::WouldBlock) => {}
             other => panic!(
-                "a fresh handle's try_lock() must report WouldBlock while with_init_lock \
+                "a fresh handle's try_lock() must report WouldBlock while with_global_lock \
                  already holds the exclusive lock, got {other:?}"
             ),
         }
     });
 }
 
-/// Regression guard: a missing parent directory must panic `with_init_lock`
+/// Regression guard: a missing parent directory must panic `with_global_lock`
 /// immediately, not spin forever treating "can't open" as "try again."
 /// `open_lock_target` has no retry loop, so a missing directory can't
 /// resolve itself by trying the open again.
 #[test]
-fn with_init_lock_panics_immediately_when_the_profile_directory_does_not_exist_instead_of_spinning() {
+fn with_global_lock_panics_immediately_when_the_coordination_directory_does_not_exist_instead_of_spinning() {
     let dir = crate::TempDir::new().unwrap();
-    let db_path = dir.path().join("nonexistent-subdir").join(".skuld.db");
+    let coord = dir.path().join("nonexistent-subdir");
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| with_init_lock(&db_path, |_token| {})));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| with_global_lock(&coord, |_token| {})));
 
     assert!(
         result.is_err(),
-        "with_init_lock must panic when db_path's parent directory doesn't exist, not hang"
+        "with_global_lock must panic when the coordination directory doesn't exist, not hang"
     );
 }
 
@@ -207,23 +209,23 @@ fn lock_exclusive_retries_past_eintr_from_a_non_restarting_handler() {
     }
 
     let dir = crate::TempDir::new().unwrap();
-    let db_path = dir.path().join(".skuld.db");
 
-    let holder = open_lock_target(&db_path);
+    let holder = open_lock_target(dir.path());
     lock_exclusive(&holder).expect("uncontended lock must succeed immediately");
-    let waiter = open_lock_target(&db_path);
+    let waiter = open_lock_target(dir.path());
 
     let (tid_tx, tid_rx) = std::sync::mpsc::channel();
     let waiter_thread = std::thread::spawn(move || {
         // Report this thread's own id before doing anything blocking, so
         // the main thread never has to guess whether the id it has is
-        // still valid.
+        // still valid. Sent as usize: pthread_t is a raw pointer on musl,
+        // which is not Send.
         tid_tx
-            .send(unsafe { libc::pthread_self() })
+            .send(unsafe { libc::pthread_self() } as usize)
             .expect("main thread must still be waiting to receive the pthread id");
         lock_exclusive(&waiter)
     });
-    let waiter_pthread = tid_rx.recv().expect("waiter thread must report its pthread id");
+    let waiter_pthread = tid_rx.recv().expect("waiter thread must report its pthread id") as libc::pthread_t;
 
     // Bombard the blocked thread with the non-restarting signal until
     // there's direct evidence — lock_exclusive's own retry counter moving —
@@ -262,36 +264,88 @@ fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
         .expect("panic payload is a string")
 }
 
-#[cfg(unix)]
+/// The message names what the open actually tried: the directory on Unix, `global.lock` in it on
+/// Windows.
 #[test]
-fn open_lock_target_failure_names_the_override() {
+fn open_lock_target_failure_names_the_real_path_and_the_override() {
     let tmp = crate::TempDir::new().unwrap();
-    let file = tmp.path().join("file");
-    std::fs::write(&file, b"").unwrap();
+    let missing = tmp.path().join("missing");
     let msg = panic_message(|| {
-        open_lock_target(&file.join(".skuld.db"));
+        open_lock_target(&missing);
     });
+    assert!(msg.contains(&format!("{:?}", lock_path(&missing))), "{msg}");
     assert!(msg.contains("SKULD_DB_DIR"), "{msg}");
+}
+
+/// A failed unlock leaves the mutex held, so it panics, naming the lock and the override; while
+/// already unwinding it only warns, as a second panic would abort.
+#[test]
+fn an_unlock_failure_panics_unless_already_unwinding() {
+    let dir = std::path::Path::new("coord");
+    let err = std::io::Error::other("boom");
+    let msg = panic_message(std::panic::AssertUnwindSafe(|| report_unlock_failure(dir, &err, false)));
+    assert!(
+        msg.contains(&format!("{:?}", lock_path(dir))) && msg.contains("boom") && msg.contains("SKULD_DB_DIR"),
+        "{msg}"
+    );
+    report_unlock_failure(dir, &err, true);
 }
 
 #[cfg(all(unix, debug_assertions))]
 #[test]
 #[should_panic(expected = "must be absolute")]
 fn open_lock_target_rejects_a_relative_path() {
-    open_lock_target(std::path::Path::new(".skuld.db"));
+    open_lock_target(std::path::Path::new("coord"));
 }
 
 #[cfg(unix)]
 #[test]
-fn a_failed_stat_of_the_lock_target_is_reported_not_swallowed() {
+fn a_deleted_lock_target_reads_as_a_split() {
     let tmp = crate::TempDir::new().unwrap();
     let dir = tmp.path().join("d");
     std::fs::create_dir(&dir).unwrap();
-    with_init_lock(&dir.join(".skuld.db"), |held| {
-        assert!(held.stat_target().is_ok());
+    with_global_lock(&dir, |held| {
+        assert!(!held.target_has_split().unwrap());
         std::fs::remove_dir(&dir).unwrap();
-        let err = held.stat_target().unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        assert!(held.target_has_split());
+        assert!(held.target_has_split().unwrap());
     });
+}
+
+// Splits =====
+
+#[cfg(unix)]
+#[test]
+fn target_has_split_detects_a_wholesale_directory_replacement() {
+    let outer = crate::TempDir::new().unwrap();
+    let coord = outer.path().join(".skuld");
+    std::fs::create_dir(&coord).unwrap();
+
+    let mut split_detected = false;
+    with_global_lock(&coord, |held| {
+        std::fs::rename(&coord, outer.path().join("aside")).unwrap();
+        std::fs::create_dir(&coord).unwrap();
+        split_detected = !matches!(held.target_has_split(), Ok(false));
+    });
+    assert!(
+        split_detected,
+        "a replaced directory must read as a split while the lock is held"
+    );
+}
+
+/// A symlink or junction ancestor retargeted underneath the held lock target splits the lock on every
+/// platform. On Windows it is the only way: the lock file itself cannot be deleted while held.
+#[test]
+fn target_has_split_detects_a_retargeted_link_ancestor() {
+    let (_dir, coord, retarget) = linked_coord();
+    std::fs::create_dir(&coord).unwrap();
+
+    let mut split_detected = false;
+    with_global_lock(&coord, |held| {
+        retarget();
+        split_detected = !matches!(held.target_has_split(), Ok(false));
+    });
+    assert!(
+        split_detected,
+        "a retargeted link (symlink or junction) ancestor must read as a split while the lock is held"
+    );
 }

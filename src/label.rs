@@ -33,7 +33,7 @@ impl Label {
         validate_label_name(name);
         // Canonical-lowercase invariant is a hard contract, not a sanity
         // check: the `#[skuld::label]` macro lowercases at expansion time,
-        // and label matching everywhere else (SQL, hash buckets, filter
+        // and label matching everywhere else (hash buckets, filter
         // parsing) assumes stored names are already lowercase. A stray
         // uppercase name silently matches nothing — fail loud in release
         // builds too.
@@ -322,21 +322,6 @@ pub(crate) fn matches_expr(expr: &LabelExpr, labels: &[Label]) -> bool {
     expr.evaluate_with(|t: &String| labels.iter().any(|l| l.name() == t))
 }
 
-/// Compile `expr` to a SQL WHERE fragment for correlated subqueries on the
-/// `running` table (alias `r`) and `labels` table.
-pub(crate) fn to_sql_expr(expr: &LabelExpr) -> String {
-    match expr {
-        Expr::Terminal(name) => {
-            format!("EXISTS (SELECT 1 FROM labels WHERE running_id = r.id AND label = '{name}')")
-        }
-        Expr::Const(true) => "1=1".to_string(),
-        Expr::Const(false) => "1=0".to_string(),
-        Expr::Not(inner) => format!("NOT ({})", to_sql_expr(inner)),
-        Expr::And(a, b) => format!("({} AND {})", to_sql_expr(a), to_sql_expr(b)),
-        Expr::Or(a, b) => format!("({} OR {})", to_sql_expr(a), to_sql_expr(b)),
-    }
-}
-
 /// Write `expr` in human-readable form, adding parentheses only where required
 /// by operator precedence (OR=0, AND=1, NOT/leaf=2).
 fn fmt_expr(expr: &LabelExpr, f: &mut std::fmt::Formatter<'_>, min_prec: u8) -> std::fmt::Result {
@@ -583,16 +568,6 @@ impl LabelFilter {
         self.expr.evaluate_with(|t: &String| names.contains(&t.as_str()))
     }
 
-    /// Compile the filter to a SQL WHERE fragment for correlated subqueries.
-    ///
-    /// The result is a SQL expression suitable for:
-    /// ```sql
-    /// SELECT EXISTS (SELECT 1 FROM running r WHERE <result>)
-    /// ```
-    pub fn to_sql(&self) -> String {
-        to_sql_expr(&self.expr)
-    }
-
     /// Whether the canonical form of this filter is `Const(true)` — i.e. the
     /// filter is satisfied by every possible label set. Used by
     /// `coordination::to_storage` to collapse tautologies into the `*` sentinel.
@@ -627,7 +602,7 @@ impl From<Label> for LabelFilter {
 
 // Compile-time assertion that LabelFilter remains thread-safe across crate
 // upgrades. The runtime carries filters across thread boundaries (test
-// runner, coordination DB queries) and must not silently lose Send/Sync.
+// runner, coordination registry) and must not silently lose Send/Sync.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<LabelFilter>();

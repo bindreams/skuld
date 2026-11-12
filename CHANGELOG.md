@@ -4,6 +4,45 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Breaking
+
+- **Update every skuld at once.** Serial-test coordination moved from a SQLite
+  database to OS file locks, and an old (SQLite) skuld and a new one running at
+  the same time do not exclude each other. Coordination now lives in `.skuld/`
+  next to where `.skuld.db` was (`SKULD_DB_DIR` still names that directory).
+  Leftover `.skuld.db*` files are unused and can be deleted.
+- **`LabelFilter::to_sql` is removed.** skuld no longer uses SQL.
+
+### Fixed
+
+- **A dead test's stale entry is no longer fooled by PID reuse, PID
+  namespaces or Windows `Access denied`** (#66). Whether a test is alive is
+  whether its owner still holds its entry (a lock on Unix, a write handle on
+  Windows), not a PID lookup, so a reused PID can no longer hang a later serial
+  test.
+
+### Changed
+
+- **Deleting or replacing `.skuld/` mid-run is prevented on Windows and only
+  detected on Unix.** On Windows, a running test's entry (`.skuld/running/<id>.json`)
+  cannot be deleted, so deleting the directory fails while tests run. On Unix, each
+  test registered in the old copy panics when it finishes, which fails the run;
+  tests that start in the new copy meanwhile may run alongside the old ones. On
+  both, a test starting to register at that moment may panic, naming the directory. A
+  deliberate swap that is restored before a test next checks is not detected.
+- **A running test is one file, `.skuld/running/<id>.json`.** On Unix a test is
+  alive while it holds a lock on its entry; on Windows, while it holds a write
+  handle on it, which also stops the entry being deleted. A crashed test's entry
+  is removed by the next test to look. On Windows, accounts sharing the directory
+  must be able to read and delete each other's files in it and to write
+  `global.lock`, or the run fails naming the file, and another program holding a
+  running or dead test's entry open can delay other tests until it closes it.
+- **The `skuld` crate needs no C compiler to build or cross-compile.** The
+  bundled SQLite (`rusqlite`) is gone, so musl and other targets without a C
+  toolchain build it.
+- **On Unix, `.skuld/` and `running/` are mode 0777 and the entries in them 0644**,
+  whatever the umask, so runs under several uids can share one directory.
+
 ## [0.6.0] - 2026-10-01
 
 ### Breaking

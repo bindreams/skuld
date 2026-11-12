@@ -37,10 +37,8 @@ serde_json = "1"
 # Cross-platform anonymous pipe primitive, used by the per-test FD capture in
 # src/capture.rs. Avoids reimplementing pipe()/CreatePipe() ourselves.
 os_pipe = "1.2"
-# Canonicalize without Windows verbatim (`\\?\`) prefixes, for the DB directory.
+# Canonicalize without Windows verbatim (`\\?\`) prefixes, for the coordination directory.
 dunce = "1"
-# Cross-process test coordination database for serial test scheduling.
-rusqlite = { version = "0.40", features = ["bundled"] }
 pest = "2"
 pest_derive = "2"
 # Boolean algebra primitives backing the canonical form of LabelFilter (BDD-based
@@ -68,10 +66,10 @@ rustix = { version = "1", features = ["fs"] }
 libc = "0.2"
 windows = { version = "0.62", features = [
     "Win32_System_Console",
-    "Win32_System_Threading",
-    # FILE_SHARE_READ/FILE_SHARE_WRITE, for src/coordination/lock.rs's
-    # Windows init lock file: opened without FILE_SHARE_DELETE so it can
-    # never be deleted or renamed out from under a holder.
+    # FILE_SHARE_READ/FILE_SHARE_WRITE, for the global lock and per-test lock
+    # files (src/coordination/lock.rs, registry.rs): opened without
+    # FILE_SHARE_DELETE so a holder's file can never be deleted or renamed
+    # out from under it.
     "Win32_Storage_FileSystem",
     # NtCreateFile (src/win_nt.rs) reports STATUS_DELETE_PENDING, which
     # CreateFileW folds into ERROR_ACCESS_DENIED.
@@ -81,6 +79,10 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_System_IO",
 ] }
+
+# Tests retarget a directory ancestor with a junction, which needs no privilege on Windows.
+[target.'cfg(windows)'.dev-dependencies]
+junction = "2.1.0"
 
 [dev-dependencies]
 skuld = { path = ".", features = ["tokio"] }
@@ -113,7 +115,7 @@ harness = false
 name = "capture_cli"
 path = "tests/capture_cli.rs"
 
-# A moved or archived skuld binary locates `.skuld.db` from its own path.
+# A moved or archived skuld binary locates `.skuld/` from its own path.
 [[test]]
 name = "relocated_binary_cli"
 path = "tests/relocated_binary_cli.rs"
@@ -284,10 +286,10 @@ path = "tests/support_bins/duplicate_names_ignored/main.rs"
 test = false
 doc = false
 
-# See tests/support_bins/publish_probe/main.rs's module doc.
+# See tests/support_bins/register_probe/main.rs's module doc.
 [[bin]]
-name = "publish_probe"
-path = "tests/support_bins/publish_probe/main.rs"
+name = "register_probe"
+path = "tests/support_bins/register_probe/main.rs"
 test = false
 doc = false
 
@@ -323,11 +325,5 @@ doc = false
 [[bin]]
 name = "lock_emfile_probe"
 path = "tests/support_bins/lock_emfile_probe/main.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "shared_cache_probe"
-path = "tests/support_bins/shared_cache_probe/main.rs"
 test = false
 doc = false

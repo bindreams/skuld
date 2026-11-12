@@ -1,367 +1,275 @@
-//! Blocking cross-process advisory lock serializing creation, publication,
-//! and schema initialization of the coordination database.
+//! The global mutex of the coordination directory `.skuld/`: a blocking, exclusive advisory lock
+//! that every test taking part in coordination holds while it creates or deletes anything in it.
 //!
-//! Whoever holds a blocking, exclusive advisory lock on the lock target
-//! below is the only actor in the whole system allowed to create, publish,
-//! or initialize `.skuld.db` at that instant; every other
-//! [`super::connect`]/[`super::open_db`] call blocks until it releases. That
-//! removes the specific create/publish and cold-start-negotiation races
-//! those two functions document, not all waiting: SQLite's own locking still
-//! applies to work done *while* this lock is held, against connections that
-//! never take this lock at all (e.g. another process's `BEGIN EXCLUSIVE`
-//! inside `coordinate`), which `super::retry_busy` handles.
+//! It is taken for the coordination directory `coord_dir`, on the path [`lock_path`] returns. Unix
+//! locks `coord_dir` itself, opened `O_RDONLY | O_DIRECTORY`: `flock` works on a read-only
+//! directory fd, so there is no lock file, and deleting files inside the directory cannot split
+//! the lock. Windows locks `coord_dir/global.lock`, opened without `FILE_SHARE_DELETE` so it cannot
+//! be deleted or renamed while held. Opening it needs read permission on the directory (Unix) or
+//! create permission (Windows).
 //!
-//! The lock itself is `flock` on Unix, `LockFileEx` on Windows — but the two
-//! platforms reach it through different code. Windows goes through
-//! [`std::fs::File`]'s own native `lock`/`try_lock` (stable since Rust
-//! 1.89.0). Unix goes through [`rustix::fs::flock`] instead of that same
-//! `std::fs::File` API: std only implements `lock`/`try_lock` on a subset of
-//! the Unix targets it otherwise treats as `flock`-capable, and Android is
-//! missing from that subset — calling `std`'s version there panics
-//! `"lock() not supported"` on every `open_db` call instead of ever
-//! acquiring anything. `rustix::fs::flock` calls the same underlying
-//! syscall directly on every Unix this crate supports, Android included.
+//! An open that succeeds is already the lock every other caller contends for, as long as the
+//! handle stays open, so acquisition is one open and one lock, with no retry loop. What can still
+//! go wrong is the target being replaced wholesale while held: the directory renamed away and a
+//! fresh one made (Unix), or a symlink or junction ancestor retargeted (both platforms). The
+//! holder then excludes nobody a fresh opener would. [`GlobalLockHeld::target_has_split`] compares
+//! the identity recorded at acquisition with what the path resolves to now; callers check it
+//! before and after they write.
 //!
-//! **The lock target can't be deleted or replaced by anything short of
-//! recreating the directory (Unix) or the file (Windows) it lives at.** That
-//! is what lets [`with_init_lock`]'s own acquisition be a single
-//! open-then-lock with no retry loop: an open that succeeds is already the
-//! lock every other caller will contend, permanently, for as long as this
-//! handle stays open — *unless* something outside this crate replaces the
-//! lock target's directory entry wholesale while that handle is open (see
-//! the Unix bullet below), which does still need checking for, and does get
-//! checked — see [`InitLockHeld::target_has_split`] — everywhere a caller
-//! goes on to do uncapped-retry writes while holding this lock, not at
-//! acquisition alone.
+//! Unix goes through [`rustix::fs::flock`] rather than [`std::fs::File::lock`]: std does not
+//! implement `lock` on every Unix target it otherwise treats as `flock`-capable (Android is
+//! missing), and panics there. Windows uses `File::lock`/`try_lock` (`LockFileEx`).
 //!
-//! - **Unix** locks `db_path`'s parent directory — the directory
-//!   holding `.skuld.db` — opened `O_RDONLY | O_DIRECTORY | O_CLOEXEC` (the
-//!   `CLOEXEC` bit is redundant here — `std` already sets it on every
-//!   `File::open` regardless — and is listed only for parity with
-//!   `O_DIRECTORY`, since both are passed through the same `custom_flags`
-//!   call).
-//!   `flock` works directly on a directory fd opened read-only, so there is
-//!   no separate lock file and nothing here ever needs write access to
-//!   anything; opening the directory at all still needs ordinary *read*
-//!   permission on it, not just the search (execute) permission that's
-//!   enough to merely reach `.skuld.db` inside it by name. An ordinary
-//!   delete of `.skuld.db` (or its `-wal`/`-shm` companions) can't split the
-//!   lock: the directory itself is untouched by deleting a file inside it,
-//!   `ENOTEMPTY` still blocks a plain `rmdir` while any of them remain, and
-//!   nothing in this crate ever removes the directory itself, only files
-//!   inside it. **Wholesale replacement of the directory does still split
-//!   it** — the same "path now means something else" hazard [`super::connect`]'s
-//!   doc covers for `.skuld.db` itself, not a risk this crate accepts:
-//!   renaming the directory aside and `mkdir`ing a fresh one at the same
-//!   path, or emptying it, `rmdir`ing it, and `mkdir`ing it again, both
-//!   leave the holder locking its old (now-detached) directory while every
-//!   new opener locks the fresh one instead. [`InitLockHeld::target_has_split`]
-//!   is what tells the two groups apart: it records the held directory's
-//!   own `fstat` identity at acquisition and compares it against a fresh
-//!   `stat` of the same path on each check, the same dev+ino comparison
-//!   `super::moved_db::FileIdentity` does for the DB file itself — a mismatch means
-//!   this handle no longer locks what a fresh opener would.
-//! - **Windows** locks a sibling [`lock_path`] file, opened with
-//!   `share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)` and, deliberately, no
-//!   `FILE_SHARE_DELETE`. Windows refuses to delete or rename the lock file
-//!   *itself* out from under any handle that didn't grant that share flag —
-//!   but a symlink or junction ancestor of `db_path` being retargeted
-//!   changes what [`lock_path`] resolves to for a *new* opener without
-//!   touching the held file at all, the same split as the Unix bullet
-//!   above, by a different mechanism. [`InitLockHeld::target_has_split`]
-//!   checks for it on Windows too, the same dev/file-index comparison
-//!   technique.
-//!
-//! Any failure to open the lock target — a missing parent directory,
-//! file-descriptor-table exhaustion (`EMFILE`), a permissions problem,
-//! anything at all — panics immediately, naming the path. None of those
-//! conditions resolve themselves by trying the same open again, so there is
-//! nothing to retry. On Unix specifically, a filesystem whose `flock` refuses
-//! to operate on a directory at all (some network filesystems' emulated
-//! `flock`, NFS's included) surfaces the same way: the `open` above still
-//! succeeds, but the subsequent acquire in [`with_init_lock`] fails and
-//! panics, naming the path — there is no fallback to a different locking
-//! mechanism.
+//! A failure to open the target (a missing directory, `EMFILE`, permissions) panics at once,
+//! naming the path. So does a filesystem whose `flock` refuses a directory (some network
+//! filesystems): there is no fallback mechanism. A failed unlock panics too (see
+//! [`report_unlock_failure`]).
 
-use super::skuld_debug_eprintln;
+use super::file_identity::FileIdentity;
 use std::fs::{File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+/// The share mode of every file the coordination directory holds open: no `FILE_SHARE_DELETE`, so
+/// none can be deleted or renamed while open.
 #[cfg(windows)]
-use std::path::PathBuf;
+pub(super) const WINDOWS_SHARE_MODE: u32 =
+    windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0 | windows::Win32::Storage::FileSystem::FILE_SHARE_WRITE.0;
 
-/// The sibling lock file guarding `db_path`'s creation, publication, and
-/// schema initialization on Windows: `db_path` with `.lock` appended
-/// verbatim (not [`Path::with_extension`], which would replace
-/// `.skuld.db`'s existing `db` extension instead of appending), so
-/// `.skuld.db` gets `.skuld.db.lock`. Unix has no lock file — it locks
-/// `db_path`'s parent directory directly instead, see the module doc — so
-/// this only exists on Windows.
-#[cfg(windows)]
-pub(super) fn lock_path(db_path: &Path) -> PathBuf {
-    let mut name = db_path.as_os_str().to_owned();
-    name.push(".lock");
-    PathBuf::from(name)
+/// What the mutex of `coord_dir` locks: `coord_dir` itself on Unix, `coord_dir/global.lock` on
+/// Windows. The path every message about the lock names.
+pub(super) fn lock_path(coord_dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        coord_dir.join("global.lock")
+    } else {
+        coord_dir.to_path_buf()
+    }
 }
 
-/// Proof that some init lock is held, carrying the path it was taken for.
-/// Obtainable only inside [`with_init_lock`]'s closure. Call sites
-/// `debug_assert_eq!` that the path matches; the type cannot enforce it, so a
-/// caller holding the wrong path's lock still compiles and fails loudly in debug
-/// builds.
-pub(super) struct InitLockHeld<'a> {
-    path: &'a Path,
-    /// `fstat`-derived dev+ino (Unix) or `GetFileInformationByHandle`-derived
-    /// volume serial + file index (Windows) of the lock target `File` this
-    /// token's lock is actually held on, recorded once at acquisition —
-    /// see [`Self::target_has_split`].
+/// Proof that the global mutex is held, carrying the coordination directory it was taken for.
+/// Obtainable only inside [`with_global_lock`]'s closure.
+pub(super) struct GlobalLockHeld<'a> {
+    coord_dir: &'a Path,
+    /// The open lock target, which on Unix is `coord_dir` itself: what the holder does inside the
+    /// directory goes through it, so a holder whose lock has split cannot touch the replacement.
     #[cfg(unix)]
-    target_identity: (u64, u64),
-    #[cfg(windows)]
-    target_identity: (u32, u64),
+    target: &'a File,
+    /// Of the lock target this token's lock is held on, recorded at acquisition; see
+    /// [`Self::target_has_split`].
+    target_identity: FileIdentity,
 }
 
-impl<'a> InitLockHeld<'a> {
-    /// The path [`with_init_lock`] acquired this token's lock for.
-    pub(super) fn path(&self) -> &Path {
-        self.path
+impl<'a> GlobalLockHeld<'a> {
+    pub(super) fn coord_dir(&self) -> &'a Path {
+        self.coord_dir
     }
 
-    /// True once the lock target this token holds no longer matches what
-    /// [`Self::path`] resolves to on disk: the lock has been "split", so a new
-    /// opener locks the replacement while this handle only excludes callers of
-    /// the detached original. Unix compares the parent directory's identity
-    /// (recorded at acquisition) against a fresh `stat`; see the module doc's
-    /// "Wholesale replacement" bullet.
+    /// The open directory `coord_dir` was when the lock was taken, whatever its path names now.
     #[cfg(unix)]
-    pub(super) fn target_has_split(&self) -> bool {
-        match self.stat_target() {
-            Ok(identity) => identity != self.target_identity,
-            Err(e) => {
-                skuld_debug_eprintln!(
-                    "init lock target of {:?} could not be inspected, treating as split: {e}",
-                    self.path
-                );
-                true
-            }
+    pub(super) fn dir(&self) -> &'a File {
+        self.target
+    }
+
+    /// True once the lock target this token holds no longer matches what `coord_dir` resolves to:
+    /// the lock has split, so a new opener locks the replacement while this handle only excludes
+    /// callers of the detached original. Resolves [`lock_path`] afresh and compares it with the
+    /// identity recorded at acquisition. On Windows, withholding `FILE_SHARE_DELETE` stops the lock
+    /// file itself being deleted or renamed, but not a symlink or junction ancestor being
+    /// retargeted.
+    ///
+    /// Nothing at the path is a split. `Err` if the path could not be inspected for another reason:
+    /// the caller cannot show the lock is intact, so it fails, reporting the error.
+    pub(super) fn target_has_split(&self) -> std::io::Result<bool> {
+        match FileIdentity::try_of(&lock_path(self.coord_dir)) {
+            Ok(fresh) => Ok(fresh != self.target_identity),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e),
         }
     }
-
-    /// Fresh dev+ino of the lock target directory, for comparison with the identity recorded
-    /// at acquisition.
-    #[cfg(unix)]
-    pub(super) fn stat_target(&self) -> std::io::Result<(u64, u64)> {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(lock_dir(self.path)).map(|m| (m.dev(), m.ino()))
-    }
-
-    /// Windows: withholding `FILE_SHARE_DELETE` stops the lock file itself
-    /// being deleted or renamed while held, but not a symlink or junction
-    /// ancestor of `db_path` being retargeted, which changes what [`lock_path`]
-    /// resolves to for a new opener. So this compares a fresh open of
-    /// [`lock_path`], via `GetFileInformationByHandle`, against the identity
-    /// recorded at acquisition.
-    #[cfg(windows)]
-    pub(super) fn target_has_split(&self) -> bool {
-        use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
-
-        let fresh = match std::fs::File::open(lock_path(self.path)) {
-            Ok(f) => f,
-            Err(e) => {
-                skuld_debug_eprintln!(
-                    "init lock file of {:?} could not be reopened, treating as split: {e}",
-                    self.path
-                );
-                return true;
-            }
-        };
-        let handle = windows::Win32::Foundation::HANDLE(fresh.as_raw_handle());
-        let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        // Safety: `handle` is a valid, currently-open handle for as long as
-        // `fresh` is alive, which outlives this call; `&mut info` is a
-        // valid `*mut BY_HANDLE_FILE_INFORMATION` for the call to write
-        // into.
-        if let Err(e) = unsafe { GetFileInformationByHandle(handle, &mut info) } {
-            skuld_debug_eprintln!(
-                "init lock file of {:?} could not be inspected, treating as split: {e}",
-                self.path
-            );
-            return true;
-        }
-        let current = (
-            info.dwVolumeSerialNumber,
-            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-        );
-        current != self.target_identity
-    }
 }
 
-/// Run `f` while holding a blocking, exclusive advisory lock on `db_path`'s
-/// lock target (see the module doc). Blocks with no timeout on the
-/// `flock`/`LockFileEx` call itself.
-///
-/// Releasing the lock is not a separate step this function performs: the
-/// held `File` going out of scope — on `f`'s normal return *and* on an
-/// unwinding panic from `f`, since Rust always runs destructors during
-/// unwind — closes the underlying fd/handle, and both `flock` and
-/// `LockFileEx` release their lock unconditionally when the last handle to
-/// it closes. A panic inside `f` (a genuinely broken DB path, for example)
-/// therefore can never leave the lock held.
-pub(super) fn with_init_lock<T>(db_path: &Path, f: impl FnOnce(&InitLockHeld<'_>) -> T) -> T {
-    let target = open_lock_target(db_path);
-    lock_exclusive(&target)
-        .unwrap_or_else(|e| panic!("skuld: failed to acquire coordination DB init lock for {db_path:?}: {e}"));
-    #[cfg(unix)]
-    let target_identity = {
-        use std::os::unix::fs::MetadataExt;
-        target.metadata().map(|m| (m.dev(), m.ino())).unwrap_or_else(|e| {
-            panic!("skuld: failed to inspect coordination DB init lock target for {db_path:?}: {e}")
-        })
-    };
-    #[cfg(windows)]
-    let target_identity = {
-        use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+/// Run `f` while holding the global mutex of `coord_dir` (see the module doc). Blocks with no
+/// timeout. The lock is released on `f`'s return and on a panic in it, and when the handle closes.
+pub(super) fn with_global_lock<T>(coord_dir: &Path, f: impl FnOnce(&GlobalLockHeld<'_>) -> T) -> T {
+    with_locked_target(coord_dir, &open_lock_target(coord_dir), f)
+}
 
-        let handle = windows::Win32::Foundation::HANDLE(target.as_raw_handle());
-        let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        // Safety: `handle` is a valid, currently-open handle for as long as
-        // `target` is alive, which outlives this call; `&mut info` is a
-        // valid `*mut BY_HANDLE_FILE_INFORMATION` for the call to write
-        // into.
-        unsafe { GetFileInformationByHandle(handle, &mut info) }.unwrap_or_else(|e| {
-            panic!("skuld: failed to inspect coordination DB init lock target for {db_path:?}: {e}")
-        });
-        (
-            info.dwVolumeSerialNumber,
-            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+/// [`with_global_lock`] on a `target` the caller already opened with [`open_lock_target`] and
+/// keeps: the mutex is released by unlocking `target`, not closing it, when `f` returns or
+/// panics, so the caller can lock it again later without opening anything. A registration holds
+/// its `target` for that, because a test that has used up its file descriptors must still be able
+/// to unregister. `target` must not be locked already. An unlock that fails panics after `f`
+/// returns; see [`report_unlock_failure`].
+pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnOnce(&GlobalLockHeld<'_>) -> T) -> T {
+    lock_exclusive(target).unwrap_or_else(|e| {
+        panic!(
+            "skuld: failed to acquire the global lock {:?}: {e}",
+            lock_path(coord_dir)
         )
+    });
+    /// Unlocks on drop, so a panic in `f` does not leave the mutex held by a handle that outlives
+    /// it. [`Self::release`] unlocks on `f`'s return instead.
+    struct Unlock<'a> {
+        target: &'a File,
+        coord_dir: &'a Path,
+        released: bool,
+    }
+    impl Unlock<'_> {
+        fn release(&mut self) {
+            self.released = true;
+            if let Err(e) = unlock(self.target) {
+                report_unlock_failure(self.coord_dir, &e, std::thread::panicking());
+            }
+        }
+    }
+    impl Drop for Unlock<'_> {
+        fn drop(&mut self) {
+            if !self.released {
+                self.release();
+            }
+        }
+    }
+    let mut release = Unlock {
+        target,
+        coord_dir,
+        released: false,
     };
-    f(&InitLockHeld {
-        path: db_path,
+    let target_identity = FileIdentity::of_file(target).unwrap_or_else(|e| {
+        panic!(
+            "skuld: failed to inspect the global lock {:?}: {e} ({})",
+            lock_path(coord_dir),
+            super::DB_DIR_HINT
+        )
+    });
+    let result = f(&GlobalLockHeld {
+        coord_dir,
+        #[cfg(unix)]
+        target,
         target_identity,
-    })
+    });
+    release.release();
+    result
 }
 
-/// The directory holding `db_path`, which the Unix lock is taken on. `db_path` is always
-/// absolute (see `db_path()`), so it always has a non-empty parent.
-#[cfg(unix)]
-fn lock_dir(db_path: &Path) -> &Path {
-    debug_assert!(
-        db_path.is_absolute(),
-        "coordination DB path must be absolute: {db_path:?}"
+/// Report a failed unlock of `coord_dir`'s mutex: a panic, like any I/O failure, unless
+/// `unwinding`, when a second panic would abort the process: then a warning. The lock stays held
+/// until its handle closes (a registration's when the registration drops).
+pub(super) fn report_unlock_failure(coord_dir: &Path, e: &std::io::Error, unwinding: bool) {
+    let message = format!(
+        "failed to unlock the global lock {:?}: {e} ({})",
+        lock_path(coord_dir),
+        super::DB_DIR_HINT
     );
-    db_path.parent().expect("an absolute path has a parent")
+    if unwinding {
+        eprintln!("[skuld] warning: {message}");
+    } else {
+        panic!("skuld: {message}");
+    }
 }
 
-/// Open `db_path`'s lock target, ready to be locked or try-locked (via
-/// [`lock_exclusive`]/[`try_lock_exclusive`]): `db_path`'s parent directory
-/// on Unix, [`lock_path`]'s file on Windows (see the module doc for why
-/// either one is safe to open once and never recheck, and why a failed open
-/// here panics immediately instead of retrying).
-pub(super) fn open_lock_target(db_path: &Path) -> File {
+/// Open `coord_dir`'s lock target ([`lock_path`]), ready to be locked or try-locked. Panics if it
+/// cannot be opened.
+pub(super) fn open_lock_target(coord_dir: &Path) -> File {
+    open_target(coord_dir).unwrap_or_else(|e| open_failed(coord_dir, &e))
+}
+
+fn open_failed(coord_dir: &Path, e: &std::io::Error) -> ! {
+    let what = if cfg!(windows) {
+        "the global lock file"
+    } else {
+        "the coordination directory"
+    };
+    panic!(
+        "skuld: failed to open {what} {:?} for locking: {e} ({})",
+        lock_path(coord_dir),
+        super::DB_DIR_HINT
+    )
+}
+
+fn open_target(coord_dir: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
 
-        let dir = lock_dir(db_path);
+        debug_assert!(
+            coord_dir.is_absolute(),
+            "coordination directory must be absolute: {coord_dir:?}"
+        );
         OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(dir)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "skuld: failed to open coordination DB directory {dir:?} for locking: {e} ({})",
-                    super::DB_DIR_HINT
-                )
-            })
+            .open(coord_dir)
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-        let path = lock_path(db_path);
         OpenOptions::new()
             .create(true)
             .write(true)
-            // Explicit, not the default: the lock file's contents are never
-            // read or written by this module (only its identity as a
-            // lockable object matters), so truncating it on open would just
-            // be pointless I/O against a file every other concurrent caller
-            // may also be opening right now.
+            // Only the lock's identity matters, never its contents; other callers may be
+            // opening the file right now.
             .truncate(false)
             .read(true)
-            // Deliberately excludes FILE_SHARE_DELETE: see the module doc
-            // for why that's what keeps this lock target from being
-            // deleted or renamed out from under a holder.
-            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
-            .open(&path)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "skuld: failed to open coordination DB init lock file {path:?}: {e} ({})",
-                    super::DB_DIR_HINT
-                )
-            })
+            // No FILE_SHARE_DELETE: keeps the file from being deleted or renamed while held.
+            .share_mode(WINDOWS_SHARE_MODE)
+            .open(lock_path(coord_dir))
     }
 }
 
-/// Block until `target`'s exclusive advisory lock is acquired. See the
-/// module doc for why Unix goes through [`rustix::fs::flock`] here instead
-/// of `std::fs::File::lock` — std's version isn't implemented on every Unix
-/// target this crate supports.
+/// Block until `target`'s exclusive advisory lock is acquired. See the module doc for why Unix
+/// uses [`rustix::fs::flock`] instead of `std::fs::File::lock`.
 ///
-/// Retries on `EINTR` alone, uncapped: a blocking `flock` is interruptible
-/// by any signal delivered to this thread, including ones this crate has no
-/// control over — a test process installs its own handlers for all sorts of
-/// reasons — and a handler registered without `SA_RESTART` makes the kernel
-/// hand back `EINTR` instead of resuming the wait. That is not a real
-/// failure (the lock is neither held nor denied), so this loops back into
-/// the same blocking call rather than surfacing it as one; std's own
-/// `File::lock` makes the identical choice for the targets it supports.
-/// Nothing else this function can receive from `flock` is retryable.
+/// Retries on `EINTR` alone, uncapped: a signal handler registered without `SA_RESTART` makes the
+/// kernel return `EINTR` from a blocking `flock` that neither acquired nor denied the lock, as
+/// std's own `File::lock` handles it. Nothing else `flock` returns is retryable.
 #[cfg(unix)]
 pub(super) fn lock_exclusive(target: &File) -> std::io::Result<()> {
+    flock_retrying(target, rustix::fs::FlockOperation::LockExclusive)
+}
+
+/// `flock(target, op)`, retried on `EINTR` alone, uncapped (see [`lock_exclusive`]).
+#[cfg(unix)]
+fn flock_retrying(target: &File, op: rustix::fs::FlockOperation) -> std::io::Result<()> {
     loop {
-        match rustix::fs::flock(target, rustix::fs::FlockOperation::LockExclusive) {
-            Ok(()) => return Ok(()),
+        match rustix::fs::flock(target, op) {
             Err(rustix::io::Errno::INTR) => {
-                // Test-only: lets `lock_tests.rs` observe that a real EINTR
-                // was retried here, rather than just asserting the overall
-                // call eventually succeeded — which could pass even if the
-                // signal never actually landed inside this syscall. No
-                // effect on the retry itself; compiled out entirely in
-                // non-test builds.
+                // Lets `lock_tests.rs` observe that a real EINTR was retried, not just that the
+                // call eventually succeeded.
                 #[cfg(test)]
                 EINTR_RETRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                continue;
             }
-            Err(errno) => return Err(errno.into()),
+            result => return result.map_err(Into::into),
         }
     }
 }
 
-/// Count of `EINTR` retries `lock_exclusive` has performed, process-wide.
-/// Test-only instrumentation — see the `#[cfg(test)]` increment site inside
-/// `lock_exclusive` above.
+/// Count of `EINTR` retries [`flock_retrying`] has performed, process-wide.
 #[cfg(all(unix, test))]
 pub(super) static EINTR_RETRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Block until `target`'s exclusive advisory lock is acquired, via
-/// `std::fs::File::lock` (`LockFileEx` under the hood) — Windows has no gap
-/// for this to work around, see the module doc.
+/// Block until `target`'s exclusive advisory lock is acquired (`LockFileEx`).
 #[cfg(windows)]
-fn lock_exclusive(target: &File) -> std::io::Result<()> {
+pub(super) fn lock_exclusive(target: &File) -> std::io::Result<()> {
     target.lock()
 }
 
-/// Attempt to acquire `target`'s exclusive advisory lock without blocking,
-/// reporting [`std::fs::TryLockError::WouldBlock`] if another handle
-/// already holds it rather than waiting. Used only by this crate's own test
-/// probes (`super::probe_try_init_lock`, and the in-process `try_lock` tests
-/// in `lock_tests.rs`) — `with_init_lock` itself always blocks via
-/// [`lock_exclusive`].
+/// Release `target`'s lock now, ahead of closing it. Closing alone releases it too, but Windows
+/// documents the release on close as taking "available system resources" to happen, so a holder
+/// whose release others wait on unlocks first.
+#[cfg(unix)]
+pub(super) fn unlock(target: &File) -> std::io::Result<()> {
+    flock_retrying(target, rustix::fs::FlockOperation::Unlock)
+}
+
+/// See the Unix variant.
+#[cfg(windows)]
+pub(super) fn unlock(target: &File) -> std::io::Result<()> {
+    target.unlock()
+}
+
+/// Attempt to acquire `target`'s exclusive advisory lock without blocking, reporting
+/// [`std::fs::TryLockError::WouldBlock`] if another handle holds it. The registry's scan uses it
+/// to test whether a test's lock is still held.
 #[cfg(unix)]
 pub(super) fn try_lock_exclusive(target: &File) -> Result<(), std::fs::TryLockError> {
     match rustix::fs::flock(target, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
@@ -377,9 +285,7 @@ pub(super) fn try_lock_exclusive(target: &File) -> Result<(), std::fs::TryLockEr
     }
 }
 
-/// Attempt to acquire `target`'s exclusive advisory lock without blocking,
-/// via `std::fs::File::try_lock` (`LockFileEx` under the hood) — Windows has
-/// no gap for this to work around, see the module doc.
+/// See the Unix variant (`LockFileEx`).
 #[cfg(windows)]
 pub(super) fn try_lock_exclusive(target: &File) -> Result<(), std::fs::TryLockError> {
     target.try_lock()

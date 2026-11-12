@@ -1,9 +1,8 @@
-//! Thread-scoped test seams for the coordination retry loops.
+//! Thread-scoped test seams for the coordination retry loop and registry steps.
 //!
-//! Thread-local, not process-wide: `retry_busy` also runs in every
-//! `TestRegistration`'s drop, and libtest runs those concurrently, so a global
-//! signal could wake a test before its own call retried. Each seam is
-//! installed by a single-purpose worker thread and reset by an RAII guard.
+//! Thread-local, not process-wide: libtest runs coordination tests concurrently, so a global
+//! signal could wake a test before its own call retried. Each seam is installed by a
+//! single-purpose worker thread and reset by an RAII guard.
 
 use std::cell::RefCell;
 use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
@@ -49,7 +48,7 @@ impl RetryTest {
     pub(crate) fn wait_for_retry(&self) {
         self.signal
             .recv()
-            .expect("the worker exited without hitting a retryable busy error — test setup is broken");
+            .expect("the worker exited without backing off to retry — test setup is broken");
     }
 
     /// Call after the final [`Self::release`], before joining the worker: the
@@ -138,18 +137,21 @@ pub(super) fn signal_retry() {
 /// change: the one place no contention can open deterministically.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Seam {
-    /// `coordinate`, right after its COMMIT succeeded.
-    Commit,
-    /// `TestRegistration::drop`, right after its DELETE succeeded.
-    Delete,
-    /// `open_db`, right after the connection opened, before identity is recorded.
-    Open,
-    /// Recording the main identity, between reading the connection's own fd and
-    /// the path stats it is validated against.
-    #[cfg(unix)]
-    Fd,
-    /// `open_db`, right after schema init, before the companions are recorded.
-    SchemaInit,
+    /// `registry::try_register`, once `running/` exists and before the mutex target is opened.
+    RunningCreated,
+    /// `registry::try_register`, once the mutex target is open and before it is locked.
+    TargetOpened,
+    /// `registry::try_register`, with the mutex held and the first split check passed, before the
+    /// scan.
+    Scanning,
+    /// `registry::register`, once the entry (on Unix, its `.json.tmp`) exists and before it is
+    /// written or locked.
+    Created,
+    /// `registry::register`, after the entry is in place and before the final split check, mutex
+    /// still held.
+    Published,
+    /// `Registration::unregister`, after the mutex is taken and before the checks.
+    Unregistering,
 }
 
 type SeamHook = (Seam, Box<dyn FnOnce()>);

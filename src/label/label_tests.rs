@@ -489,54 +489,6 @@ fn label_filter_mixed_types() {
     assert!(filter2.matches(&[b]));
 }
 
-// LabelFilter: to_sql -----
-
-#[test]
-fn label_filter_to_sql_label() {
-    let f = LabelFilter::parse("docker").unwrap();
-    assert_eq!(
-        f.to_sql(),
-        "EXISTS (SELECT 1 FROM labels WHERE running_id = r.id AND label = 'docker')"
-    );
-}
-
-#[test]
-fn label_filter_to_sql_not() {
-    let f = LabelFilter::parse("!docker").unwrap();
-    assert_eq!(
-        f.to_sql(),
-        "NOT (EXISTS (SELECT 1 FROM labels WHERE running_id = r.id AND label = 'docker'))"
-    );
-}
-
-#[test]
-fn label_filter_to_sql_and() {
-    let f = LabelFilter::parse("a & b").unwrap();
-    let sql = f.to_sql();
-    assert!(sql.contains("AND"), "expected AND in SQL: {sql}");
-    assert!(sql.contains("label = 'a'"));
-    assert!(sql.contains("label = 'b'"));
-}
-
-#[test]
-fn label_filter_to_sql_or() {
-    let f = LabelFilter::parse("a | b").unwrap();
-    let sql = f.to_sql();
-    assert!(sql.contains("OR"), "expected OR in SQL: {sql}");
-}
-
-#[test]
-fn label_filter_to_sql_complex() {
-    let f = LabelFilter::parse("(docker | integration) & !slow").unwrap();
-    let sql = f.to_sql();
-    assert!(sql.contains("AND"));
-    assert!(sql.contains("OR"));
-    assert!(sql.contains("NOT"));
-    assert!(sql.contains("label = 'docker'"));
-    assert!(sql.contains("label = 'integration'"));
-    assert!(sql.contains("label = 'slow'"));
-}
-
 // Case-insensitive filter parsing -----
 
 #[test]
@@ -851,24 +803,6 @@ fn matches_names_tautology_ignores_names() {
     let filter = LabelFilter::parse("true").unwrap();
     assert!(filter.matches_names(&[]));
     assert!(filter.matches_names(&["anything"]));
-}
-
-// SQL for constants -----
-
-#[test]
-fn canon_sql_true() {
-    let sql = LabelFilter::parse("true").unwrap().to_sql();
-    assert_eq!(sql, "1=1");
-    assert!(
-        !sql.contains("label = 'true'"),
-        "true literal must not leak as a label name in SQL"
-    );
-}
-
-#[test]
-fn canon_sql_false() {
-    let sql = LabelFilter::parse("false").unwrap().to_sql();
-    assert_eq!(sql, "1=0");
 }
 
 // validate_serial_filters with constants -----

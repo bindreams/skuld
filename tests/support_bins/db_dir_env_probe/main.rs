@@ -2,7 +2,7 @@
 //!
 //! Two sequential trials: the first sets `SKULD_DB_DIR` (from `PROBE_OTHER_DB_DIR`) in its own
 //! body, the second starts afterwards. The driver asserts the second trial did not register in
-//! the DB that variable names.
+//! the coordination directory that variable names.
 
 fn main() {
     let other = std::env::var("PROBE_OTHER_DB_DIR").expect("driver must set PROBE_OTHER_DB_DIR");

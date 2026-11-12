@@ -1,4 +1,4 @@
-//! Run-time location of the directory holding `.skuld.db`.
+//! Run-time location of the directory holding the coordination directory `.skuld/`.
 //!
 //! `SKULD_DB_DIR` wins when set. Otherwise the directory is derived from the canonicalized
 //! executable, so it travels with the binary (relocated build trees, extracted nextest
@@ -13,10 +13,9 @@
 //! profile directory, or a `CACHEDIR.TAG` beside it. Without one, `/opt/app/deps/t` is just a
 //! directory named `deps`.
 //!
-//! The database is created on first use, so the directory must let the caller create files. On
-//! Unix it must also be readable and searchable, since the lock opens the directory itself; on
-//! Windows the lock is a file. [`resolve`] checks this once and fails with one message naming the
-//! directory and `SKULD_DB_DIR`.
+//! `.skuld/` is created on first use, so the directory must let the caller create entries, and on
+//! Unix be readable and searchable. [`resolve`] checks this once and fails with one message naming
+//! the directory and `SKULD_DB_DIR`.
 
 use std::ffi::OsStr;
 use std::io;
@@ -51,20 +50,20 @@ pub(super) fn resolve(
         }
         None => {
             let exe = exe().map_err(|e| {
-                format!("cannot locate the coordination DB: current_exe() failed: {e}; set {DB_DIR_ENV} to an absolute directory")
+                format!("cannot locate the coordination directory: current_exe() failed: {e}; set {DB_DIR_ENV} to an absolute directory")
             })?;
             let exe = canonical_exe(&exe).map_err(|e| {
                 format!("cannot canonicalize executable {exe:?}: {e}; set {DB_DIR_ENV} to an absolute directory")
             })?;
             layout_dir(&exe, has_cargo_marker).ok_or_else(|| {
-                format!("cannot derive the coordination DB directory from executable {exe:?}; set {DB_DIR_ENV} to an absolute directory")
+                format!("cannot derive the coordination directory from executable {exe:?}; set {DB_DIR_ENV} to an absolute directory")
             })?
         }
     };
     check_usable(&dir).map_err(|e| {
-        format!("coordination DB directory {dir:?} is unusable: {e}; set {DB_DIR_ENV} to a writable absolute path")
+        format!("coordination directory {dir:?} is unusable: {e}; set {DB_DIR_ENV} to a writable absolute path")
     })?;
-    created.map_err(|e| format!("cannot create coordination DB directory {dir:?} (from {DB_DIR_ENV}): {e}"))?;
+    created.map_err(|e| format!("cannot create coordination directory {dir:?} (from {DB_DIR_ENV}): {e}"))?;
     Ok(dir)
 }
 
@@ -110,7 +109,7 @@ fn is_cargo_hashed(exe: &Path) -> bool {
 
 /// Canonicalize `exe`. Only Linux's `<path> (deleted)` form, which names a binary replaced
 /// mid-run, falls back to canonicalizing the parent; any other failure is an error, since
-/// resolving a dangling symlink through its own directory would pick the wrong database.
+/// resolving a dangling symlink through its own directory would pick the wrong directory.
 fn canonical_exe(exe: &Path) -> io::Result<PathBuf> {
     match dunce::canonicalize(exe) {
         Err(e) if e.kind() == io::ErrorKind::NotFound && cfg!(target_os = "linux") => {
@@ -127,9 +126,9 @@ fn canonical_exe(exe: &Path) -> io::Result<PathBuf> {
     }
 }
 
-/// `create_dir_all`, but every directory it creates is mode 0777 regardless of umask (as
-/// `publish.rs` does for the DB), so whichever uid gets there first does not lock out the rest.
-fn create_dir_all_open(dir: &Path) -> io::Result<()> {
+/// `create_dir_all`, but every directory it creates is mode 0777 regardless of umask, so
+/// whichever uid gets there first does not lock out the rest.
+pub(super) fn create_dir_all_open(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         create_dir_all_open_with(dir, |_, _| {})
