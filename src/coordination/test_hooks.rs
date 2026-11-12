@@ -139,6 +139,8 @@ pub(super) fn signal_retry() {
 pub(crate) enum Seam {
     /// `registry::try_register`, once `running/` exists and before the mutex target is opened.
     RunningCreated,
+    /// `registry::try_register`, once the mutex target is open and before it is locked.
+    TargetOpened,
     /// `registry::try_register`, with the mutex held and the first split check passed, before the
     /// scan.
     Scanning,

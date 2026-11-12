@@ -116,8 +116,9 @@ pub(super) static PROCESS_IDS: LazyLock<IdGenerator> = LazyLock::new(IdGenerator
 
 // Failures =====
 
-fn or_panic<T>(action: &str, path: &Path, result: io::Result<T>) -> T {
-    result.unwrap_or_else(|e| panic!("skuld: failed to {action} {path:?}: {e} ({DB_DIR_HINT})"))
+/// `result`'s value, or a panic naming `action` and the file; `path` is built only on a failure.
+fn or_panic<T, P: AsRef<Path>>(action: &str, path: impl FnOnce() -> P, result: io::Result<T>) -> T {
+    result.unwrap_or_else(|e| panic!("skuld: failed to {action} {:?}: {e} ({DB_DIR_HINT})", path().as_ref()))
 }
 
 /// `entry` is the registration's entry, when there is one yet.
@@ -179,26 +180,6 @@ fn create_new_file_at(dir: &File, path: &str) -> io::Result<File> {
     Ok(File::from(fd))
 }
 
-/// Delete `running/<name>` if it is there.
-#[cfg(unix)]
-fn remove_if_exists(held: &GlobalLockHeld<'_>, name: &str) {
-    use rustix::fs::{unlinkat, AtFlags};
-
-    match unlinkat(held.dir(), rel(name), AtFlags::empty()) {
-        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-        Err(e) => or_panic("remove", &entry_file(held, name), Err::<(), _>(e.into())),
-    }
-}
-
-#[cfg(windows)]
-fn remove_if_exists(held: &GlobalLockHeld<'_>, name: &str) {
-    let path = entry_file(held, name);
-    match std::fs::remove_file(&path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => or_panic("remove", &path, Err::<(), _>(e)),
-        _ => {}
-    }
-}
-
 /// Create the entry of `id` in `running/` holding `bytes`, and keep it held. `AlreadyExists` if the
 /// id is taken.
 ///
@@ -207,7 +188,6 @@ fn remove_if_exists(held: &GlobalLockHeld<'_>, name: &str) {
 /// race-free because every creator holds the mutex.
 fn create_entry_file(held: &GlobalLockHeld<'_>, id: &str, bytes: &[u8]) -> io::Result<File> {
     let name = entry_name(id);
-    let path = entry_file(held, &name);
     #[cfg(unix)]
     let (mut file, written) = {
         use rustix::fs::{statat, AtFlags};
@@ -221,16 +201,16 @@ fn create_entry_file(held: &GlobalLockHeld<'_>, id: &str, bytes: &[u8]) -> io::R
         (create_new_file_at(held.dir(), &rel(&tmp))?, tmp)
     };
     #[cfg(windows)]
-    let (mut file, written) = (create_new_file(&path)?, name.clone());
+    let (mut file, written) = (create_new_file(&entry_file(held, &name))?, name.clone());
 
     #[cfg(test)]
     test_hooks::run_seam(Seam::Created);
-    or_panic("write", &entry_file(held, &written), file.write_all(bytes));
+    or_panic("write", || entry_file(held, &written), file.write_all(bytes));
     #[cfg(unix)]
     {
-        or_panic("lock", &entry_file(held, &written), lock_exclusive(&file));
+        or_panic("lock", || entry_file(held, &written), lock_exclusive(&file));
         let renamed = rustix::fs::renameat(held.dir(), rel(&written), held.dir(), rel(&name));
-        or_panic("publish", &path, renamed.map_err(io::Error::from));
+        or_panic("publish", || entry_file(held, &name), renamed.map_err(io::Error::from));
     }
     Ok(file)
 }
@@ -243,7 +223,7 @@ fn create_entry(held: &GlobalLockHeld<'_>, ids: &IdGenerator, entry: &Entry) -> 
         match create_entry_file(held, &id, &bytes) {
             Ok(file) => return (id, file),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => or_panic("create", &entry_file(held, &entry_name(&id)), Err(e)),
+            Err(e) => or_panic("create", || entry_file(held, &entry_name(&id)), Err(e)),
         }
     }
 }
@@ -264,14 +244,14 @@ fn entry_identity(held: &GlobalLockHeld<'_>, name: &str) -> io::Result<FileIdent
 /// `running/<name>` is no longer the file `identity` was taken of. An entry that cannot be
 /// inspected for any other reason panics with that error.
 fn assert_unmoved(held: &GlobalLockHeld<'_>, name: &str, identity: FileIdentity, doing: &str) {
-    let path = entry_file(held, name);
     let moved = held.target_has_split()
         || match entry_identity(held, name) {
             Ok(now) => now != identity,
             Err(e) if e.kind() == io::ErrorKind::NotFound => true,
-            Err(e) => or_panic("inspect", &path, Err::<bool, _>(e)),
+            Err(e) => or_panic("inspect", || entry_file(held, name), Err::<bool, _>(e)),
         };
     if moved {
+        let path = entry_file(held, name);
         panic!("{}", moved_message(held.coord_dir(), Some(&path), doing));
     }
 }
@@ -320,10 +300,10 @@ fn read_if_live(held: &GlobalLockHeld<'_>, name: &str) -> Option<Entry> {
     use rustix::fs::{openat, Mode, OFlags};
     use std::io::Read;
 
-    let path = entry_file(held, name);
+    let path = || entry_file(held, name);
     let mut file = match openat(held.dir(), rel(name), OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()) {
         Err(rustix::io::Errno::NOENT) => return None,
-        Err(e) => or_panic("open", &path, Err(e.into())),
+        Err(e) => or_panic("open", path, Err(e.into())),
         Ok(fd) => File::from(fd),
     };
     match try_lock_exclusive(&file) {
@@ -333,16 +313,20 @@ fn read_if_live(held: &GlobalLockHeld<'_>, name: &str) -> Option<Entry> {
         }
         Err(std::fs::TryLockError::WouldBlock) => {
             let mut bytes = Vec::new();
-            or_panic("read", &path, file.read_to_end(&mut bytes));
-            Some(parse_entry(&path, &bytes))
+            or_panic("read", path, file.read_to_end(&mut bytes));
+            Some(parse_entry(path, &bytes))
         }
-        Err(std::fs::TryLockError::Error(e)) => or_panic("try-lock", &path, Err(e)),
+        Err(std::fs::TryLockError::Error(e)) => or_panic("try-lock", path, Err(e)),
     }
 }
 
-fn parse_entry(path: &Path, bytes: &[u8]) -> Entry {
-    serde_json::from_slice(bytes)
-        .unwrap_or_else(|e| panic!("skuld: unparseable coordination entry {path:?}: {e} ({DB_DIR_HINT})"))
+fn parse_entry<P: AsRef<Path>>(path: impl FnOnce() -> P, bytes: &[u8]) -> Entry {
+    serde_json::from_slice(bytes).unwrap_or_else(|e| {
+        panic!(
+            "skuld: unparseable coordination entry {:?}: {e} ({DB_DIR_HINT})",
+            path().as_ref()
+        )
+    })
 }
 
 /// What the Windows scan concludes about an entry.
@@ -443,9 +427,9 @@ pub(super) fn classify_removal(result: io::Result<()>, pending: impl FnOnce() ->
     classify(result, Verdict::Gone, Verdict::Gone, pending)
 }
 
-/// Delete the entry `running/<name>`, which has no write handle open: its registration closed its
-/// hold, or its owner died. Another program holding it open (an antivirus scanner, say) is not a
-/// failure: the entry is dead all the same and the next scan deletes it.
+/// Delete `running/<name>`, which has no owner: its registration closed its hold, or its owner
+/// died. Already gone is fine. Windows: another program holding it open (an antivirus scanner,
+/// say) is not a failure either: the entry is dead all the same and the next scan deletes it.
 #[cfg(windows)]
 fn remove_entry(held: &GlobalLockHeld<'_>, name: &str) {
     use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
@@ -456,7 +440,7 @@ fn remove_entry(held: &GlobalLockHeld<'_>, name: &str) {
         skuld_debug_eprintln!("{path:?} is held open by another program, so it stays until the next scan");
     }
     if let Verdict::Fail(e) = classify_removal(result, || crate::win_nt::is_delete_pending(&path)) {
-        or_panic("remove", &path, Err::<(), _>(e));
+        or_panic("remove", || &path, Err::<(), _>(e));
     }
 }
 
@@ -464,8 +448,10 @@ fn remove_entry(held: &GlobalLockHeld<'_>, name: &str) {
 fn remove_entry(held: &GlobalLockHeld<'_>, name: &str) {
     use rustix::fs::{unlinkat, AtFlags};
 
-    let removed = unlinkat(held.dir(), rel(name), AtFlags::empty());
-    or_panic("remove", &entry_file(held, name), removed.map_err(io::Error::from));
+    match unlinkat(held.dir(), rel(name), AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+        Err(e) => or_panic("remove", || entry_file(held, name), Err::<(), _>(e.into())),
+    }
 }
 
 /// See the Unix variant. Windows: probe the entry with a share mode that a write handle refuses
@@ -491,18 +477,18 @@ fn read_if_live(held: &GlobalLockHeld<'_>, name: &str) -> Option<Entry> {
     match classify_probe(probe, || crate::win_nt::is_delete_pending(path)) {
         Verdict::Gone => None,
         Verdict::Live => match std::fs::read(path) {
-            Ok(bytes) => Some(parse_entry(path, &bytes)),
+            Ok(bytes) => Some(parse_entry(|| path, &bytes)),
             Err(e) if is_os_error(&e, ERROR_SHARING_VIOLATION) || is_os_error(&e, ERROR_LOCK_VIOLATION) => {
                 warn_once(unreadable_warning(path));
                 Some(Entry::unreadable(path))
             }
-            Err(e) => or_panic("read", path, Err(e)),
+            Err(e) => or_panic("read", || path, Err(e)),
         },
         Verdict::Dead => {
             remove_entry(held, name);
             None
         }
-        Verdict::Fail(e) => or_panic("open", path, Err(e)),
+        Verdict::Fail(e) => or_panic("open", || path, Err(e)),
     }
 }
 
@@ -513,7 +499,7 @@ fn scan(held: &GlobalLockHeld<'_>) -> io::Result<Vec<Entry>> {
     for name in list_names(held)? {
         if name.ends_with(".tmp") {
             // Only an owner holding the mutex has one, so a scan seeing it means a crash left it.
-            remove_if_exists(held, &name);
+            remove_entry(held, &name);
         } else if name.ends_with(".json") {
             live.extend(read_if_live(held, &name));
         }
@@ -613,8 +599,36 @@ impl Registration {
     }
 }
 
+/// Why a registration pass, which has written nothing yet, found the directories not as it had
+/// just made them.
+enum Cause {
+    /// The mutex target is gone, or `coord_dir` now names another directory.
+    Split,
+    /// `running/` is gone (the error is `NotFound`).
+    NoRunning(io::Error),
+}
+
+/// A pass that was cut short by `cause`, having opened the mutex target of identity `seen`.
+struct Interrupted {
+    seen: Option<FileIdentity>,
+    cause: Cause,
+}
+
+impl Interrupted {
+    fn give_up(self, coord_dir: &Path, running: &Path) -> ! {
+        match self.cause {
+            Cause::Split => panic!("{}", moved_message(coord_dir, None, "registering a test")),
+            Cause::NoRunning(e) => panic!("skuld: failed to list {running:?}: {e} ({DB_DIR_HINT})"),
+        }
+    }
+}
+
 /// One attempt, under the mutex: `Some` if the test can start (now registered), `None` if it
 /// must wait.
+///
+/// A directory deleted or replaced after this call made it, before anything is written, is made
+/// again and the attempt repeated. A repeat that created nothing and opened the same directory
+/// as the pass before it cannot do better, so it fails with the cause instead.
 pub(super) fn try_register(
     ids: &IdGenerator,
     coord_dir: &Path,
@@ -623,44 +637,73 @@ pub(super) fn try_register(
     storage_filter: &str,
 ) -> Option<Registration> {
     let running = running_dir(coord_dir);
+    let mut previous: Option<Option<FileIdentity>> = None;
     loop {
+        let existed = running.symlink_metadata().is_ok();
         or_panic(
             "create the coordination directory",
-            &running,
+            || &running,
             super::db_dir::create_dir_all_open(&running),
         );
+        let created = !existed && running.is_dir();
         #[cfg(test)]
         test_hooks::run_seam(Seam::RunningCreated);
-        // Deleted or replaced since: made again, until a pass finds them in place.
-        let Some(mutex_target) = open_lock_target_if_present(coord_dir) else {
-            continue;
-        };
-        let attempt: io::Result<Option<_>> = with_locked_target(coord_dir, &mutex_target, |held| {
-            if held.target_has_split() {
-                panic!("{}", moved_message(coord_dir, None, "registering a test"));
+        match register_pass(ids, coord_dir, &running, name, labels, storage_filter) {
+            Ok(registered) => return registered,
+            Err(interrupted) => {
+                if !created && previous == Some(interrupted.seen) {
+                    interrupted.give_up(coord_dir, &running);
+                }
+                previous = Some(interrupted.seen);
             }
-            #[cfg(test)]
-            test_hooks::run_seam(Seam::Scanning);
-            let entries = scan(held)?;
-            if !can_start(&entries, labels, storage_filter) {
-                return Ok(None);
-            }
-            Ok(Some(publish(held, ids, name, labels, storage_filter)))
-        });
-        match attempt {
-            Ok(Some((id, hold, entry_identity))) => {
-                return Some(Registration {
-                    coord_dir: coord_dir.to_path_buf(),
-                    id,
-                    hold: Some(hold),
-                    entry_identity,
-                    mutex_target,
-                })
-            }
-            Ok(None) => return None,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => or_panic("list", &running, Err(e)),
         }
+    }
+}
+
+/// [`try_register`]'s attempt on directories that were in place a moment ago.
+fn register_pass(
+    ids: &IdGenerator,
+    coord_dir: &Path,
+    running: &Path,
+    name: &str,
+    labels: &[Label],
+    storage_filter: &str,
+) -> Result<Option<Registration>, Interrupted> {
+    let Some(mutex_target) = open_lock_target_if_present(coord_dir) else {
+        return Err(Interrupted {
+            seen: None,
+            cause: Cause::Split,
+        });
+    };
+    #[cfg(test)]
+    test_hooks::run_seam(Seam::TargetOpened);
+    let seen = FileIdentity::of_file(&mutex_target).ok();
+    let started = with_locked_target(coord_dir, &mutex_target, |held| {
+        if held.target_has_split() {
+            return Err(Cause::Split);
+        }
+        #[cfg(test)]
+        test_hooks::run_seam(Seam::Scanning);
+        let entries = match scan(held) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Cause::NoRunning(e)),
+            Err(e) => or_panic("list", || running, Err(e)),
+        };
+        if !can_start(&entries, labels, storage_filter) {
+            return Ok(None);
+        }
+        Ok(Some(publish(held, ids, name, labels, storage_filter)))
+    });
+    match started {
+        Ok(Some((id, hold, entry_identity))) => Ok(Some(Registration {
+            coord_dir: coord_dir.to_path_buf(),
+            id,
+            hold: Some(hold),
+            entry_identity,
+            mutex_target,
+        })),
+        Ok(None) => Ok(None),
+        Err(cause) => Err(Interrupted { seen, cause }),
     }
 }
 
@@ -684,9 +727,9 @@ fn publish(
 
     // A split after `try_register`'s check would have put the entry in a directory the mutex no
     // longer guards.
-    let path = entry_file(held, &entry_name(&id));
-    let identity = or_panic("inspect", &path, FileIdentity::of_file(&file));
-    assert_unmoved(held, &entry_name(&id), identity, "registering a test");
+    let name = entry_name(&id);
+    let identity = or_panic("inspect", || entry_file(held, &name), FileIdentity::of_file(&file));
+    assert_unmoved(held, &name, identity, "registering a test");
     (id, file, identity)
 }
 

@@ -204,7 +204,9 @@ const UNPARSEABLE_WARNING: &str = "skipping unparseable serial_filter";
 #[test]
 #[ignore = "a child body: run by an_unparseable_filter_warns_once_per_process"]
 fn unparseable_filter_child() {
-    let coord = PathBuf::from(std::env::var_os(WARN_CHILD_DIR_ENV).expect("run by its parent test"));
+    let Some(coord) = std::env::var_os(WARN_CHILD_DIR_ENV).map(PathBuf::from) else {
+        return;
+    };
     let json = hand_made(&coord, "legacy.json", &entry_json("((("));
     let _owner = hold(&json);
     for _ in 0..3 {
@@ -571,7 +573,8 @@ const CHILD_DIR_ENV: &str = "SKULD_REGISTRY_TEST_CHILD_DIR";
 const CHILD_UMASK_ENV: &str = "SKULD_REGISTRY_TEST_CHILD_UMASK";
 
 /// This test binary, set to run the ignored child body `test` of this module and nothing else.
-/// Child bodies are `#[ignore]`d so that they never run as tests of their own.
+/// Child bodies are `#[ignore]`d so that they never run as tests of their own, and return at once
+/// without their environment variable, so `--include-ignored` runs stay green.
 fn child_command(test: &str) -> std::process::Command {
     let module = module_path!().split_once("::").expect("module path has a crate").1;
     let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
@@ -586,7 +589,9 @@ fn child_command(test: &str) -> std::process::Command {
 fn registered_child() {
     use std::io::{BufRead, Write};
 
-    let dir = std::env::var_os(CHILD_DIR_ENV).expect("run by spawn_registered_child");
+    let Some(dir) = std::env::var_os(CHILD_DIR_ENV) else {
+        return;
+    };
     #[cfg(unix)]
     if let Ok(mask) = std::env::var(CHILD_UMASK_ENV) {
         // Safety: `umask` only sets this process's creation mask.
@@ -669,7 +674,9 @@ const FD_CHILD_DONE: &str = "child-unregistered";
 #[test]
 #[ignore = "a child body: run by unregister_needs_no_new_file_descriptor"]
 fn unregistering_child() {
-    let dir = std::env::var_os(FD_CHILD_DIR_ENV).expect("run by unregister_needs_no_new_file_descriptor");
+    let Some(dir) = std::env::var_os(FD_CHILD_DIR_ENV) else {
+        return;
+    };
     let mut reg = register(Path::new(&dir), "child", &[], SERIAL_NONE);
     assert_eq!(running_files(Path::new(&dir)).len(), 1, "registered: one entry");
 
@@ -1017,6 +1024,36 @@ fn a_running_dir_deleted_before_the_lock_is_recreated() {
     let mut reg = running(&coord, "t", &[], SERIAL_NONE);
     assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
     reg.unregister();
+}
+
+/// A coordination directory replaced between opening the mutex target and locking it holds no
+/// registration yet, so the attempt starts over in the replacement instead of panicking.
+#[test]
+fn a_directory_replaced_before_the_lock_is_taken_is_retried() {
+    let (_dir, coord, retarget) = linked_coord();
+    let _hook = set_test_seam_hook(Seam::TargetOpened, retarget);
+    let mut reg = running(&coord, "t", &[], SERIAL_NONE);
+    assert_eq!(running_files(&coord), vec![format!("{}.json", reg.id())]);
+    reg.unregister();
+}
+
+/// A `running/` that can never be made (here a dangling symlink, which directory creation
+/// accepts as present) fails with the error instead of retrying forever.
+#[cfg(unix)]
+#[test]
+fn a_running_dir_that_stays_missing_panics_instead_of_retrying_forever() {
+    let (_dir, coord) = temp_coord();
+    std::fs::create_dir_all(&coord).unwrap();
+    std::os::unix::fs::symlink(coord.join("nowhere"), running_dir(&coord)).unwrap();
+
+    let payload = std::panic::catch_unwind(|| attempt(&coord, "t", &[], SERIAL_NONE))
+        .err()
+        .expect("a permanently missing running/ must panic");
+    let msg = crate::coordination::panic_payload_message(payload.as_ref());
+    assert!(
+        msg.contains(&format!("{:?}", running_dir(&coord))) && msg.contains("No such file"),
+        "{msg}"
+    );
 }
 
 /// The same for the whole coordination directory.
