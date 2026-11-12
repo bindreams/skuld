@@ -11,8 +11,10 @@
 //! - Windows: liveness is the owner's write handle on the entry, opened with `FILE_SHARE_READ |
 //!   FILE_SHARE_WRITE` only, so the entry cannot be deleted while the test runs. A scan tells by
 //!   opening the entry for reading with `FILE_SHARE_READ` only, which a write handle refuses; an
-//!   open that succeeds means the owner is gone, and the scan deletes the entry. There is no lock:
-//!   Windows locks are mandatory and would block a scan's read.
+//!   open that succeeds means no handle has it open for writing, and the scan deletes the entry.
+//!   A refusal is taken for an owner, so another program holding an entry open with no sharing
+//!   also reads as one (see `read_if_live`). There is no lock: Windows locks are mandatory and
+//!   would block a scan's read.
 //!
 //! Everything that creates or deletes in `running/` does so holding the mutex. A waiting test
 //! holds no files. See the "Layout", "Register" and "Unregister" sections of the spec for why each
@@ -28,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::file_identity::FileIdentity;
 #[cfg(unix)]
-use super::lock::{lock_exclusive, try_lock_exclusive, unlock};
+use super::lock::{lock_exclusive, try_lock_exclusive};
 use super::lock::{open_lock_target, with_locked_target, GlobalLockHeld};
 use super::{skuld_debug_eprintln, DB_DIR_HINT, SERIAL_ALL, SERIAL_NONE};
 use crate::label::{Label, LabelFilter};
@@ -188,13 +190,13 @@ fn create_entry(ids: &IdGenerator, running: &Path, entry: &Entry) -> (String, Fi
 
 // Scan =====
 
-/// The bytes of the entry at `path` if its owner is alive; if it is dead, delete it and return
-/// `None`. The caller holds the mutex.
+/// The entry at `path` if its owner is alive; if it is dead, delete it and return `None`. The
+/// caller holds the mutex. An entry that does not parse panics, naming the file.
 ///
 /// Unix: open read-only (so another uid's 0644 entry works too) and try-lock; only a dead owner's
 /// entry can be locked.
 #[cfg(unix)]
-fn read_if_live(path: &Path) -> Option<Vec<u8>> {
+fn read_if_live(path: &Path) -> Option<Entry> {
     use std::io::Read;
 
     let mut file = match File::open(path) {
@@ -210,17 +212,23 @@ fn read_if_live(path: &Path) -> Option<Vec<u8>> {
         Err(std::fs::TryLockError::WouldBlock) => {
             let mut bytes = Vec::new();
             or_panic("read", path, file.read_to_end(&mut bytes));
-            Some(bytes)
+            Some(parse_entry(path, &bytes))
         }
         Err(std::fs::TryLockError::Error(e)) => or_panic("try-lock", path, Err(e)),
     }
 }
 
+fn parse_entry(path: &Path, bytes: &[u8]) -> Entry {
+    serde_json::from_slice(bytes)
+        .unwrap_or_else(|e| panic!("skuld: unparseable coordination entry {path:?}: {e} ({DB_DIR_HINT})"))
+}
+
 /// What the Windows scan concludes about an entry.
 #[cfg(windows)]
 pub(super) enum Verdict {
-    /// No owner and no entry (or one being torn down, or one another program stops us deleting,
-    /// which the next scan retries): not live.
+    /// Not live: no entry, one being torn down, or a dead one that another program stops us
+    /// deleting (still present, and the next scan retries). Not the access-denied case, which is
+    /// a `Fail`.
     Gone,
     /// An owner holds it for writing: read and parse it.
     Live,
@@ -230,74 +238,60 @@ pub(super) enum Verdict {
     Fail(io::Error),
 }
 
-/// `denied` is an `ERROR_ACCESS_DENIED`: either the entry is delete-pending (deleted, but some
-/// process still has it open), which `pending` tells, so it is being torn down; or this account
-/// has no permission, which fails loudly.
-#[cfg(windows)]
-fn denied_verdict(denied: io::Error, pending: impl FnOnce() -> io::Result<bool>) -> Verdict {
-    match pending() {
-        Ok(true) => Verdict::Gone,
-        Ok(false) => Verdict::Fail(denied),
-        // The last handle closed since the denial.
-        Err(check) if check.kind() == io::ErrorKind::NotFound => Verdict::Gone,
-        Err(check) => Verdict::Fail(io::Error::other(format!(
-            "{denied}; checking whether it is delete-pending: {check}"
-        ))),
-    }
-}
-
 #[cfg(windows)]
 fn is_os_error(e: &io::Error, code: windows::Win32::Foundation::WIN32_ERROR) -> bool {
     e.raw_os_error() == Some(code.0 as i32)
 }
 
-/// Classify `opened`, the result of opening an entry with read access and `FILE_SHARE_READ` only.
-/// That share mode refuses while any handle has the entry open for writing, which only a live
-/// owner does, with a sharing violation: so a refusal is a live owner, and an open that succeeds
-/// proves there is none.
+/// Classify `result`, the result of one filesystem attempt on an entry: the scan's probe, an open
+/// for reading with `FILE_SHARE_READ` only (a write handle, which only a live owner has, refuses
+/// it with a sharing violation, so an `Ok` proves there is no owner), or the delete of an entry
+/// with no owner. `on_ok` and `on_sharing_violation` say what those mean for the attempt at hand.
+///
+/// `ERROR_ACCESS_DENIED` is either an entry that is delete-pending (deleted, but some process
+/// still has it open), which `pending` tells, so it is being torn down and gone; or this account
+/// has no permission to the entry, which fails loudly.
 #[cfg(windows)]
-pub(super) fn classify_probe(opened: io::Result<()>, pending: impl FnOnce() -> io::Result<bool>) -> Verdict {
+pub(super) fn classify(
+    result: io::Result<()>,
+    on_ok: Verdict,
+    on_sharing_violation: Verdict,
+    pending: impl FnOnce() -> io::Result<bool>,
+) -> Verdict {
     use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
 
-    let e = match opened {
-        Ok(()) => return Verdict::Dead,
+    let e = match result {
+        Ok(()) => return on_ok,
         Err(e) => e,
     };
     if e.kind() == io::ErrorKind::NotFound {
         Verdict::Gone
     } else if is_os_error(&e, ERROR_SHARING_VIOLATION) {
-        Verdict::Live
+        on_sharing_violation
     } else if is_os_error(&e, ERROR_ACCESS_DENIED) {
-        denied_verdict(e, pending)
+        match pending() {
+            Ok(true) => Verdict::Gone,
+            Ok(false) => Verdict::Fail(e),
+            // The last handle closed since the denial.
+            Err(check) if check.kind() == io::ErrorKind::NotFound => Verdict::Gone,
+            Err(check) => Verdict::Fail(io::Error::other(format!(
+                "{e}; checking whether it is delete-pending: {check}"
+            ))),
+        }
     } else {
         Verdict::Fail(e)
     }
 }
 
-/// Classify `removed`, the result of deleting an entry that has no write handle open. Another
-/// program holding it open (an antivirus scanner, say) refuses with a sharing violation; the
-/// entry is dead all the same, and the next scan deletes it.
-#[cfg(windows)]
-pub(super) fn classify_removal(removed: io::Result<()>, pending: impl FnOnce() -> io::Result<bool>) -> Verdict {
-    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
-
-    let e = match removed {
-        Ok(()) => return Verdict::Gone,
-        Err(e) => e,
-    };
-    if e.kind() == io::ErrorKind::NotFound || is_os_error(&e, ERROR_SHARING_VIOLATION) {
-        Verdict::Gone
-    } else if is_os_error(&e, ERROR_ACCESS_DENIED) {
-        denied_verdict(e, pending)
-    } else {
-        Verdict::Fail(e)
-    }
-}
-
-/// Delete the entry `path` of a registration that has closed its hold.
+/// Delete the entry `path`, which has no write handle open: its registration closed its hold, or
+/// its owner died. Another program holding it open (an antivirus scanner, say) is not a failure:
+/// the entry is dead all the same and the next scan deletes it.
 #[cfg(windows)]
 fn remove_entry(path: &Path) {
-    if let Verdict::Fail(e) = classify_removal(std::fs::remove_file(path), || crate::win_nt::is_delete_pending(path)) {
+    let removed = classify(std::fs::remove_file(path), Verdict::Gone, Verdict::Gone, || {
+        crate::win_nt::is_delete_pending(path)
+    });
+    if let Verdict::Fail(e) = removed {
         or_panic("remove", path, Err::<(), _>(e));
     }
 }
@@ -308,27 +302,41 @@ fn remove_entry(path: &Path) {
 }
 
 /// See the Unix variant. Windows: probe the entry with a share mode that a write handle refuses
-/// ([`classify_probe`]). The owner's is the only write handle, so the entry of a crashed owner
-/// opens, is deleted, and is gone; a live owner's is read and parsed.
+/// (see [`classify`]). An owner's write handle is what makes an entry live, so the entry of a
+/// crashed owner opens and is deleted; a live one is read and parsed.
+///
+/// Another program may hold an entry open with no sharing, which refuses the probe like an owner
+/// does and refuses the read too. Its constraints are unknown, so it counts as a live
+/// global-serial entry until that program closes it.
 #[cfg(windows)]
-fn read_if_live(path: &Path) -> Option<Vec<u8>> {
+fn read_if_live(path: &Path) -> Option<Entry> {
     use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
     use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
-    let pending = || crate::win_nt::is_delete_pending(path);
     let probe = OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ.0)
         .open(path)
         // Closed here, before the delete.
         .map(drop);
-    match classify_probe(probe, pending) {
+    match classify(probe, Verdict::Dead, Verdict::Live, || {
+        crate::win_nt::is_delete_pending(path)
+    }) {
         Verdict::Gone => None,
-        Verdict::Live => Some(or_panic("read", path, std::fs::read(path))),
-        Verdict::Dead => match classify_removal(std::fs::remove_file(path), pending) {
-            Verdict::Fail(e) => or_panic("remove", path, Err(e)),
-            _ => None,
+        Verdict::Live => match std::fs::read(path) {
+            Ok(bytes) => Some(parse_entry(path, &bytes)),
+            Err(e) if is_os_error(&e, ERROR_SHARING_VIOLATION) => Some(Entry {
+                name: path.display().to_string(),
+                labels: Vec::new(),
+                filter: SERIAL_ALL.to_owned(),
+            }),
+            Err(e) => or_panic("read", path, Err(e)),
         },
+        Verdict::Dead => {
+            remove_entry(path);
+            None
+        }
         Verdict::Fail(e) => or_panic("open", path, Err(e)),
     }
 }
@@ -347,11 +355,7 @@ fn scan(running: &Path) -> Vec<Entry> {
             // Only an owner holding the mutex has one, so a scan seeing it means a crash left it.
             remove_if_exists(&path);
         } else if name.ends_with(".json") {
-            if let Some(bytes) = read_if_live(&path) {
-                let entry = serde_json::from_slice(&bytes)
-                    .unwrap_or_else(|e| panic!("skuld: unparseable coordination entry {path:?}: {e} ({DB_DIR_HINT})"));
-                live.push(entry);
-            }
+            live.extend(read_if_live(&path));
         }
     }
     live
@@ -409,16 +413,14 @@ fn can_start(entries: &[Entry], my_labels: &[Label], my_serial_filter: &str) -> 
 
 // Registration =====
 
-/// A registered test. [`Self::unregister`] ends it; dropping without it releases the hold, which
-/// marks the entry dead for the next scan.
+/// A registered test. [`Self::unregister`] ends it; dropping without it closes the hold, which
+/// marks the entry dead for the next scan: closing the file is the only release, so a forked
+/// child's copy, dropped, cannot release its parent's live entry.
 pub(super) struct Registration {
     coord_dir: PathBuf,
     id: String,
     /// The entry, held open (and on Unix locked); `None` once unregistered.
     hold: Option<File>,
-    /// The process that registered, so that a forked child's copy does not unlock its parent's entry.
-    #[cfg(unix)]
-    pid: u32,
     /// Of the file `hold` has open, for checking that `running/<id>.json` is still that file.
     entry_identity: FileIdentity,
     /// The mutex's lock target, held open (and unlocked) since registration so that
@@ -431,17 +433,6 @@ impl Registration {
     #[cfg(test)]
     pub(super) fn id(&self) -> &str {
         &self.id
-    }
-
-    #[cfg(all(test, unix))]
-    pub(super) fn hold(&self) -> &File {
-        self.hold.as_ref().expect("not yet unregistered")
-    }
-
-    /// Make this registration look inherited from another process, as a forked child's copy is.
-    #[cfg(all(test, unix))]
-    pub(super) fn pretend_forked(&mut self) {
-        self.pid = self.pid.wrapping_add(1);
     }
 
     /// Remove the entry, under the mutex. Panics, saying the coordination directory moved, if the
@@ -465,21 +456,6 @@ impl Registration {
             drop(self.hold.take().expect("checked above"));
             remove_entry(&entry);
         });
-    }
-}
-
-impl Drop for Registration {
-    fn drop(&mut self) {
-        // Never panics. Closing the file releases its lock only if no other descriptor shares the
-        // open file description (a forked child's copy does), so unlock first, but only in the
-        // process that took the lock: a forked child dropping its copy of the registration must
-        // leave its parent's entry locked. Windows has no lock: closing the handle is the release.
-        #[cfg(unix)]
-        if let (Some(hold), true) = (&self.hold, self.pid == std::process::id()) {
-            if let Err(e) = unlock(hold) {
-                skuld_debug_eprintln!("could not unlock entry {} of a dropped registration: {e}", self.id);
-            }
-        }
     }
 }
 
@@ -513,8 +489,6 @@ pub(super) fn try_register(
         coord_dir: coord_dir.to_path_buf(),
         id,
         hold: Some(hold),
-        #[cfg(unix)]
-        pid: std::process::id(),
         entry_identity,
         mutex_target,
     })
