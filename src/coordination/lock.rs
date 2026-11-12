@@ -28,7 +28,6 @@
 //! panics too (see [`report_unlock_failure`]).
 
 use super::file_identity::FileIdentity;
-use super::skuld_debug_eprintln;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -78,15 +77,46 @@ impl<'a> GlobalLockHeld<'a> {
     /// identity recorded at acquisition. On Windows, withholding `FILE_SHARE_DELETE` stops the lock
     /// file itself being deleted or renamed, but not a symlink or junction ancestor being
     /// retargeted.
+    ///
+    /// A path that no longer leads to a lock target is a split too: nothing there, a file or a
+    /// symlink loop where a directory was, or (Windows) a lock file being deleted. Any other failure
+    /// to inspect it panics with the error.
     pub(super) fn target_has_split(&self) -> bool {
         let lock = lock_path(self.coord_dir);
         match FileIdentity::try_of(&lock) {
             Ok(fresh) => fresh != self.target_identity,
-            Err(e) => {
-                skuld_debug_eprintln!("global lock target {lock:?} could not be inspected, treating as split: {e}");
-                true
-            }
+            Err(e) if leads_nowhere(&lock, &e) => true,
+            Err(e) => panic!(
+                "skuld: failed to inspect the global lock {lock:?}: {e} ({})",
+                super::DB_DIR_HINT
+            ),
         }
+    }
+}
+
+/// Whether `e`, from inspecting `lock`, means the path no longer leads to a lock target.
+fn leads_nowhere(lock: &Path, e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{NotADirectory, NotFound};
+
+    if matches!(e.kind(), NotFound | NotADirectory) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        let _ = lock;
+        e.raw_os_error() == Some(libc::ELOOP)
+    }
+    // A delete-pending file refuses opens with `ERROR_ACCESS_DENIED`, like an ACL does.
+    #[cfg(windows)]
+    {
+        e.kind() == std::io::ErrorKind::PermissionDenied
+            && crate::win_nt::is_delete_pending(lock).unwrap_or_else(|pending| {
+                panic!(
+                    "skuld: failed to inspect the global lock {lock:?}: {e}; checking whether it is being \
+                     deleted failed too: {pending} ({})",
+                    super::DB_DIR_HINT
+                )
+            })
     }
 }
 
@@ -138,8 +168,9 @@ pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnO
     };
     let target_identity = FileIdentity::of_file(target).unwrap_or_else(|e| {
         panic!(
-            "skuld: failed to inspect the global lock {:?}: {e}",
-            lock_path(coord_dir)
+            "skuld: failed to inspect the global lock {:?}: {e} ({})",
+            lock_path(coord_dir),
+            super::DB_DIR_HINT
         )
     });
     let result = f(&GlobalLockHeld {
@@ -154,7 +185,7 @@ pub(super) fn with_locked_target<T>(coord_dir: &Path, target: &File, f: impl FnO
 
 /// Report a failed unlock of `coord_dir`'s mutex: a panic, like any I/O failure, unless
 /// `unwinding`, when a second panic would abort the process: then a warning. The lock stays held
-/// until every handle sharing it closes; the panic closes the caller's.
+/// until its handle closes (a registration's when the registration drops).
 pub(super) fn report_unlock_failure(coord_dir: &Path, e: &std::io::Error, unwinding: bool) {
     let message = format!(
         "failed to unlock the global lock {:?}: {e} ({})",

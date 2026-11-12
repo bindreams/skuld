@@ -639,7 +639,8 @@ fn attempt(ids: &IdGenerator, coord_dir: &Path, name: &str, labels: &[Label], st
     }
 }
 
-/// One attempt: `Some` if the test can start (now registered), `None` if it must try again.
+/// One attempt: `Some` if the test can start (now registered), `None` if other tests block it.
+/// Panics if the directories changed under it, which a test of blocking must not mistake for one.
 #[cfg(test)]
 pub(super) fn try_register(
     ids: &IdGenerator,
@@ -650,7 +651,8 @@ pub(super) fn try_register(
 ) -> Option<Registration> {
     match attempt(ids, coord_dir, name, labels, storage_filter) {
         Attempt::Registered(registration) => Some(registration),
-        Attempt::Blocked | Attempt::Interrupted => None,
+        Attempt::Blocked => None,
+        Attempt::Interrupted => panic!("the coordination directory changed during the attempt"),
     }
 }
 
@@ -733,35 +735,48 @@ pub(super) fn register_with(
     labels: &[Label],
     storage_filter: &str,
 ) -> Registration {
-    let mut backoff = Duration::from_millis(10);
+    let min_backoff = Duration::from_millis(10);
+    let mut backoff = min_backoff;
     let max_backoff = Duration::from_millis(200);
     let warn_after = Duration::from_secs(60);
     let started = Instant::now();
     let mut warned = false;
     let mut logged_first_wait = false;
+    let mut logged_interrupted = false;
 
     loop {
-        match attempt(ids, coord_dir, name, labels, storage_filter) {
+        let wait = match attempt(ids, coord_dir, name, labels, storage_filter) {
             Attempt::Registered(registration) => return registration,
+            // Retried soon: the backoff paces waiting on other tests, which this was not.
             Attempt::Interrupted => {
-                skuld_debug_eprintln!("coordination: {coord_dir:?} changed while {name} registered; trying again")
+                if !logged_interrupted {
+                    logged_interrupted = true;
+                    skuld_debug_eprintln!("coordination: {coord_dir:?} changed while {name} registered; trying again");
+                }
+                min_backoff
             }
-            Attempt::Blocked if !logged_first_wait => {
-                logged_first_wait = true;
-                skuld_debug_eprintln!(
-                    "coordination: {name} is blocked on a serial constraint and will wait                      (if this run used a generated nextest tool-config-file, this means                      nextest scheduled it concurrently with a conflicting test anyway — the                      config may be stale; re-run `cargo skuld nextest gen --check`)"
-                );
+            Attempt::Blocked => {
+                if !logged_first_wait {
+                    logged_first_wait = true;
+                    skuld_debug_eprintln!(
+                        "coordination: {name} is blocked on a serial constraint and will wait \
+                         (if this run used a generated nextest tool-config-file, this means \
+                         nextest scheduled it concurrently with a conflicting test anyway — the \
+                         config may be stale; re-run `cargo skuld nextest gen --check`)"
+                    );
+                }
+                let wait = backoff;
+                backoff = (backoff * 2).min(max_backoff);
+                wait
             }
-            Attempt::Blocked => {}
-        }
+        };
         #[cfg(test)]
         test_hooks::signal_retry();
         if !warned && started.elapsed() > warn_after {
             warned = true;
             skuld_debug_eprintln!("coordination: {name} has been waiting >60s to register");
         }
-        std::thread::sleep(backoff);
-        backoff = (backoff * 2).min(max_backoff);
+        std::thread::sleep(wait);
     }
 }
 
